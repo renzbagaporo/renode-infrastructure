@@ -12,7 +12,7 @@ namespace Antmicro.Renode.Peripherals.Memory
 {
     // 1 KiB APB data RAM with the standard atomic aliases. Instruction fetch
     // is disconnected from the peripheral bus, including the boot RAM.
-    public sealed class RP2350_BootRAM : RP2APBPeripheral
+    public sealed class RP2350_BootRAM : RP2APBPeripheral, IBytePeripheral, IWordPeripheral
     {
         public RP2350_BootRAM(IMachine machine, RP2350_AccessControl accessControl = null) : base(machine)
         {
@@ -27,6 +27,32 @@ namespace Antmicro.Renode.Peripherals.Memory
             {
                 writeOnce[0] = writeOnce[1] = 0;
                 unclaimedLocks = 0xff;
+            }
+        }
+
+        // The RAM array samples byte enables, including on atomic aliases.
+        // The control registers use the peripheral bridge's replicated data.
+        public new void WriteByte(long offset, byte value)
+        {
+            if((offset & 0xfff) >= 0x400) { base.WriteByte(offset, value); return; }
+            WriteRAMLanes(offset, value, 0xff);
+        }
+
+        public new void WriteWord(long offset, ushort value)
+        {
+            if((offset & 0xfff) >= 0x400) { base.WriteWord(offset, value); return; }
+            WriteRAMLanes(offset & ~1L, value, 0xffff);
+        }
+
+        private void WriteRAMLanes(long offset, uint value, uint mask)
+        {
+            lock(SyncRoot)
+            {
+                RequireSecureAccess();
+                if(ResetHeld) return;
+                var shift = (int)(offset & 3) * 8;
+                var index = (offset & 0x3ff) / 4;
+                words[index] = ApplyOperation(words[index], value << shift, (AtomicOperation)((offset >> 12) & 3), mask << shift);
             }
         }
 
