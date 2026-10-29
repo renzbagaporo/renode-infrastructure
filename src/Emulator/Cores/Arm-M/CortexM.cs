@@ -120,7 +120,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                         TryInitVTOR();
                         InitPCAndSP();
                     }
-                    HaltedByDebugger = catchReset;
+                    RequestExternalDebugControl();
                 }
 
                 IsHalted = isCpuWaitSet;

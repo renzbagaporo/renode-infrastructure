@@ -2,6 +2,9 @@
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
 //
+using System;
+using System.Threading;
+
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Peripherals.Bus;
 using Antmicro.Renode.Peripherals.CPU;
@@ -43,12 +46,14 @@ namespace Antmicro.Renode.PeripheralsTests
             nvic.WriteDoubleWord(0xdf0, 0xa05f0002);
             Assert.IsFalse(cpu.HaltedByDebugger);
             nvic.WriteDoubleWord(0xdf0, 0xa05f0003);
+            WaitForHalt();
             Assert.IsTrue(cpu.HaltedByDebugger);
             Assert.IsTrue(cpu.ExternalDebugEnabled);
             Assert.AreEqual(0x30003, nvic.ReadDoubleWord(0xdf0) & 0x30003);
             nvic.WriteDoubleWord(0xdf0, 0xa05f0001);
-            Assert.IsFalse(cpu.HaltedByDebugger);
             Assert.AreNotEqual(0, nvic.ReadDoubleWord(0xdf0) & 0x4000000);
+            WaitForHalt(false);
+            Assert.IsFalse(cpu.HaltedByDebugger);
             Assert.AreEqual(0, nvic.ReadDoubleWord(0xdf0) & 0x4000000);
         }
 
@@ -73,12 +78,15 @@ namespace Antmicro.Renode.PeripheralsTests
         public void ShouldTransferActualCoreRegisters(int selector)
         {
             nvic.WriteDoubleWord(0xdf0, 0xa05f0003);
+            WaitForHalt();
             nvic.WriteDoubleWord(0xdf8, 0x12345670);
             nvic.WriteDoubleWord(0xdf4, (uint)(selector | 0x10000));
+            WaitForRegisterTransfer();
             var index = selector <= 15 ? selector : selector == 17 ? (int)CortexMRegisters.MSPCURR : (int)CortexMRegisters.PSPCURR;
             Assert.AreEqual(0x12345670, (uint)cpu.GetRegister(index));
             cpu.SetRegister(index, 0xabcdef00);
             nvic.WriteDoubleWord(0xdf4, (uint)selector);
+            WaitForRegisterTransfer();
             Assert.AreEqual(0xabcdef00, nvic.ReadDoubleWord(0xdf8));
         }
 
@@ -97,13 +105,16 @@ namespace Antmicro.Renode.PeripheralsTests
         public void ShouldTransferThePackedSpecialRegisters()
         {
             nvic.WriteDoubleWord(0xdf0, 0xa05f0003);
+            WaitForHalt();
             nvic.WriteDoubleWord(0xdf8, 0x01014001);
             nvic.WriteDoubleWord(0xdf4, 0x10014);
+            WaitForRegisterTransfer();
             Assert.AreEqual(1, (uint)cpu.GetRegister((int)CortexMRegisters.PRIMASK));
             Assert.AreEqual(0x40, (uint)cpu.GetRegister((int)CortexMRegisters.BasePri));
             Assert.AreEqual(1, (uint)cpu.GetRegister((int)CortexMRegisters.FAULTMASK));
             Assert.AreEqual(1, (uint)cpu.GetRegister((int)CortexMRegisters.Control));
             nvic.WriteDoubleWord(0xdf4, 20);
+            WaitForRegisterTransfer();
             Assert.AreEqual(0x01014001, nvic.ReadDoubleWord(0xdf8));
         }
 
@@ -140,18 +151,21 @@ namespace Antmicro.Renode.PeripheralsTests
             ram.WriteWord(0x102, 0xe7fd);
             cpu.InitVectorTableOffset = 0x20000000;
             nvic.WriteDoubleWord(0xdf0, 0xa05f0003);
+            WaitForHalt();
             nvic.WriteDoubleWord(0xdfc, 0x01000001);
             cpu.Reset();
+            Assert.AreNotEqual(0, nvic.ReadDoubleWord(0xdf0) & 0x2000000);
+            WaitForHalt();
             Assert.IsTrue(cpu.HaltedByDebugger);
             Assert.AreEqual(0x20000100, (uint)cpu.PC & ~1u);
             Assert.AreEqual(0x20001000, (uint)cpu.GetRegister(13));
             Assert.AreEqual(8, nvic.ReadDoubleWord(0xd30));
-            Assert.AreNotEqual(0, nvic.ReadDoubleWord(0xdf0) & 0x2000000);
             EmulationManager.Instance.CurrentEmulation.RunFor(TimeInterval.FromMicroseconds(100));
             Assert.AreEqual(0, cpu.ExecutedInstructions);
             Assert.AreEqual(0x01000001, nvic.ReadDoubleWord(0xdfc));
             nvic.WriteDoubleWord(0xdfc, 0);
             cpu.Reset();
+            WaitForHalt(false);
             Assert.IsFalse(cpu.HaltedByDebugger);
             Assert.AreEqual(0, nvic.ReadDoubleWord(0xdf0) & 2);
             EmulationManager.Instance.CurrentEmulation.RunFor(TimeInterval.FromMicroseconds(100));
@@ -201,6 +215,7 @@ namespace Antmicro.Renode.PeripheralsTests
             nvic.WriteDoubleWord(0xdf0, 0xa05f000b);
             Assert.IsNull(nvic.FindPendingInterrupt());
             nvic.WriteDoubleWord(0xdf0, 0xa05f0003);
+            WaitForHalt();
             Assert.IsNotNull(nvic.FindPendingInterrupt());
         }
 
@@ -214,6 +229,7 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.IsNull(nvic.FindPendingInterrupt());
             Assert.AreEqual(1, nvic.ReadDoubleWord(0x200, true) & 1);
             nvic.WriteDoubleWord(0xdf0, 0xa05f0003);
+            WaitForHalt();
             Assert.AreEqual(16, nvic.FindPendingInterrupt());
         }
 
@@ -239,8 +255,10 @@ namespace Antmicro.Renode.PeripheralsTests
             foreach(var ap in new uint[] { 0x2000, 0x4000 })
             {
                 port.WriteMemory(ap, 0xe000edf0, 0xa05f0003);
+                Assert.IsTrue(SpinWait.SpinUntil(() => (port.ReadMemory(ap, 0xe000edf0) & 0x30000) == 0x30000, TimeSpan.FromSeconds(5)));
                 port.WriteMemory(ap, 0xe000edf8, ap);
                 port.WriteMemory(ap, 0xe000edf4, 0x10000);
+                Assert.IsTrue(SpinWait.SpinUntil(() => (port.ReadMemory(ap, 0xe000edf0) & 0x10000) != 0, TimeSpan.FromSeconds(5)));
             }
             Assert.AreEqual(0x2000, (uint)cpu.GetRegister(0));
             Assert.AreEqual(0x4000, (uint)cpu1.GetRegister(0));
@@ -324,26 +342,16 @@ namespace Antmicro.Renode.PeripheralsTests
                 nvic.WriteDoubleWord(0xdf0, 0xa05f0001);
                 emulation.RunFor(TimeInterval.FromMicroseconds(100));
                 Assert.Greater((uint)cpu.GetRegister(0), 0, "CPU must execute the RAM loop before the foreign halt callback");
-                var sawHalt = false;
-                var sawResume = false;
-                uint haltedCount = 0;
                 probe.ScheduleAction(TimeInterval.FromMicroseconds(5), _ =>
-                {
-                    nvic.WriteDoubleWord(0xdf0, 0xa05f0003);
-                    TestContext.WriteLine($"HALT master={emulation.MasterTimeSource.ElapsedVirtualTime}, target={machine.ElapsedVirtualTime.TimeElapsed}, probe={probe.ElapsedVirtualTime.TimeElapsed}, handle={cpu.TimeHandle.Enabled}/{cpu.TimeHandle.DeferredEnabled}, instructions={cpu.ExecutedInstructions}");
-                    sawHalt = cpu.HaltedByDebugger && (nvic.ReadDoubleWord(0xdf0) & 0x20000) != 0;
-                    haltedCount = (uint)cpu.GetRegister(0);
-                    probe.ScheduleAction(TimeInterval.FromMicroseconds(5), __ =>
-                    {
-                        nvic.WriteDoubleWord(0xdf0, 0xa05f0001);
-                        TestContext.WriteLine($"RESUME master={emulation.MasterTimeSource.ElapsedVirtualTime}, target={machine.ElapsedVirtualTime.TimeElapsed}, probe={probe.ElapsedVirtualTime.TimeElapsed}, handle={cpu.TimeHandle.Enabled}/{cpu.TimeHandle.DeferredEnabled}, instructions={cpu.ExecutedInstructions}");
-                        sawResume = !cpu.HaltedByDebugger;
-                    }, "resume_target");
-                }, "halt_target");
+                    nvic.WriteDoubleWord(0xdf0, 0xa05f0003), "halt_target");
                 emulation.RunFor(TimeInterval.FromMicroseconds(100));
-                Assert.IsTrue(sawHalt);
-                Assert.IsTrue(sawResume);
-                Assert.IsFalse(cpu.HaltedByDebugger);
+                WaitForHalt();
+                var haltedCount = (uint)cpu.GetRegister(0);
+                probe.ScheduleAction(TimeInterval.FromMicroseconds(5), _ =>
+                    nvic.WriteDoubleWord(0xdf0, 0xa05f0001), "resume_target");
+                emulation.RunFor(TimeInterval.FromMicroseconds(100));
+                WaitForHalt(false);
+                emulation.RunFor(TimeInterval.FromMicroseconds(100));
                 Assert.Greater(probeCpu.ExecutedInstructions, 0);
                 Assert.Greater(haltedCount, 0);
                 Assert.Greater((uint)cpu.GetRegister(0), haltedCount,
@@ -354,6 +362,40 @@ namespace Antmicro.Renode.PeripheralsTests
                 emulation.RemoveMachine(probe);
                 emulation.MasterTimeSource.Quantum = previousQuantum;
             }
+        }
+
+        [TestCase(false)]
+        [TestCase(true)]
+        public void ShouldDiscardQueuedRegisterWritesSupersededByResumeOrReset(bool resetCore)
+        {
+            nvic.WriteDoubleWord(0xdf0, 0xa05f0003);
+            WaitForHalt();
+            cpu.SetRegister(0, 0x11223344);
+            var schedulerMonitor = typeof(CortexM).GetField("debugWorkerSync",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic).GetValue(cpu);
+            lock(schedulerMonitor)
+            {
+                nvic.WriteDoubleWord(0xdf8, 0x55667788);
+                nvic.WriteDoubleWord(0xdf4, 0x10000);
+                if(resetCore) cpu.Reset();
+                else nvic.WriteDoubleWord(0xdf0, 0xa05f0001);
+            }
+            WaitForHalt(false);
+            Assert.AreEqual(resetCore ? 0u : 0x11223344u, (uint)cpu.GetRegister(0));
+            Assert.AreEqual(0, nvic.ReadDoubleWord(0xdf0) & 0x10000);
+        }
+
+        private void WaitForHalt(bool halted = true)
+        {
+            Assert.IsTrue(SpinWait.SpinUntil(() =>
+                ((nvic.ReadDoubleWord(0xdf0) & 0x20000) != 0) == halted
+                && cpu.HaltedByDebugger == halted, TimeSpan.FromSeconds(5)), "Actual DHCSR halt acknowledgement timed out");
+        }
+
+        private void WaitForRegisterTransfer()
+        {
+            Assert.IsTrue(SpinWait.SpinUntil(() => (nvic.ReadDoubleWord(0xdf0) & 0x10000) != 0,
+                TimeSpan.FromSeconds(5)), "DCRSR transfer acknowledgement timed out");
         }
 
         private Machine machine;

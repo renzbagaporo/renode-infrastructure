@@ -2,6 +2,9 @@
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
 //
+using System.Collections.Generic;
+using System.Linq;
+
 using Antmicro.Renode.Peripherals.CPU;
 
 namespace Antmicro.Renode.Peripherals.IRQControllers
@@ -50,10 +53,83 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             lock(debugSync)
             {
                 if(generation != debugRequestGeneration || !EnableMemoryMappedDebug || (debugControl & 7) != 5) return false;
+                debugRequestGeneration++;
                 debugFaultStatus |= 1;
                 debugControl |= 2;
                 return true;
             }
+        }
+
+        internal bool GetExternalDebugControlRequest(out uint generation, out bool halt)
+        {
+            lock(debugSync)
+            {
+                generation = debugRequestGeneration;
+                halt = EnableMemoryMappedDebug && (debugControl & 3) == 3;
+                return EnableMemoryMappedDebug;
+            }
+        }
+
+        internal bool BeginExternalDebugControl(uint generation, bool halt)
+        {
+            lock(debugSync)
+            {
+                if(generation != debugRequestGeneration || halt != (EnableMemoryMappedDebug && (debugControl & 3) == 3)) return false;
+                if(!halt)
+                {
+                    // Do not expose register readiness once the worker can
+                    // release the PE, including a one-instruction C_STEP.
+                    debugHaltAcknowledged = false;
+                    debugRegisterReady = false;
+                }
+                return true;
+            }
+        }
+
+        internal void CompleteExternalDebugControl(uint generation, bool halt)
+        {
+            lock(debugSync)
+            {
+                if(generation != debugRequestGeneration || halt != (EnableMemoryMappedDebug && (debugControl & 3) == 3)) return;
+                debugHaltAcknowledged = halt;
+                debugRegisterReady = halt && !debugRegisterTransfers.Any(t => t.Generation == generation);
+            }
+        }
+
+        internal bool TryDequeueExternalDebugRegisterTransfer(out DebugRegisterTransfer transfer)
+        {
+            lock(debugSync)
+            {
+                if(debugRegisterTransfers.Count == 0) { transfer = null; return false; }
+                transfer = debugRegisterTransfers.Dequeue();
+                return true;
+            }
+        }
+
+        internal bool CanApplyExternalDebugRegisterTransfer(uint generation)
+        {
+            lock(debugSync)
+            {
+                return generation == debugRequestGeneration && debugHaltAcknowledged
+                    && EnableMemoryMappedDebug && (debugControl & 3) == 3;
+            }
+        }
+
+        internal void CompleteExternalDebugRegisterTransfer(uint generation, uint value, bool write)
+        {
+            lock(debugSync)
+            {
+                if(!CanApplyExternalDebugRegisterTransfer(generation)) return;
+                if(!write) debugData = value;
+                debugRegisterReady = !debugRegisterTransfers.Any(t => t.Generation == generation);
+            }
+        }
+
+        internal sealed class DebugRegisterTransfer
+        {
+            public uint Generation, Value;
+            public int Selector;
+            public bool Write;
         }
 
         public bool CatchCoreReset
@@ -67,6 +143,9 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             {
                 var catchReset = CatchCoreReset;
                 debugRequestGeneration++;
+                debugHaltAcknowledged = false;
+                debugRegisterReady = false;
+                debugRegisterTransfers.Clear();
                 debugResetStatus = true;
                 debugRestartStatus = false;
                 debugData = 0;
@@ -76,13 +155,15 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             }
         }
 
-        public void ReportExternalDebugBreakpoint()
+        public bool ReportExternalDebugBreakpoint()
         {
             lock(debugSync)
             {
+                if(!EnableMemoryMappedDebug || (debugControl & 1) == 0) return false;
                 debugRequestGeneration++;
                 debugFaultStatus |= 2;
                 debugControl |= 2;
+                return true;
             }
         }
 
@@ -98,7 +179,8 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
                 lock(debugSync)
                 {
                     value = debugControl;
-                    if(cpu.HaltedByDebugger) value |= 0x30000;
+                    if(debugHaltAcknowledged) value |= 0x20000;
+                    if(debugRegisterReady) value |= 0x10000;
                     if(InSleep.IsSet) value |= 0x40000;
                     if(Lockup.IsSet) value |= 0x80000;
                     if(cpu.TrustZoneEnabled) value |= 0x100000;
@@ -108,7 +190,9 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
                 }
                 return true;
             case 0xdf4: return true; // DCRSR is write-only.
-            case 0xdf8: value = debugData; return true;
+            case 0xdf8:
+                lock(debugSync) value = debugData;
+                return true;
             case 0xdfc:
                 lock(debugSync) value = debugExceptionControl;
                 return true;
@@ -135,45 +219,39 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
                 return true;
             case 0xdf0:
                 if((value >> 16) != 0xa05f) return true;
-                var wasHalted = cpu.HaltedByDebugger;
                 lock(debugSync)
                 {
+                    var wasHalted = debugHaltAcknowledged;
                     debugRequestGeneration++;
                     debugControl = value & 0x2f;
+                    debugRegisterTransfers.Clear();
                     if(!wasHalted && (value & 3) == 3) debugFaultStatus |= 1;
                     if(wasHalted && (value & 3) != 3) debugRestartStatus = true;
                 }
-                // Re-evaluate IRQ eligibility before releasing the PE. No debug
-                // or IRQ lock is held while the CPU acknowledges halt/resume.
-                FindPendingInterrupt();
-                cpu.HaltedByDebugger = (value & 3) == 3;
+                // MMIO owns the SystemBus peripheral-access lock. The worker
+                // performs stop/resume independently of this MMIO call.
+                cpu.RequestExternalDebugControl();
                 return true;
             case 0xdf4:
-                if((debugControl & 1) == 0 || !cpu.HaltedByDebugger) return true;
-                var selector = (int)(value & 0x7f);
-                var write = (value & 0x10000) != 0;
-                if(selector == 20)
+                lock(debugSync)
                 {
-                    // CONTROL, FAULTMASK, BASEPRI, PRIMASK share the CFBP transfer.
-                    if(write)
+                    if((debugControl & 1) == 0 || !debugHaltAcknowledged) return true;
+                    var selector = (int)(value & 0x7f);
+                    if(selector != 20 && DebugRegisterIndex(selector) < 0) return true;
+                    debugRegisterReady = false;
+                    debugRegisterTransfers.Enqueue(new DebugRegisterTransfer
                     {
-                        cpu.SetRegister((int)CortexMRegisters.PRIMASK, debugData & 1);
-                        cpu.SetRegister((int)CortexMRegisters.BasePri, (debugData >> 8) & 0xff);
-                        cpu.SetRegister((int)CortexMRegisters.FAULTMASK, (debugData >> 16) & 1);
-                        cpu.SetRegister((int)CortexMRegisters.Control, (debugData >> 24) & 7);
-                    }
-                    else debugData = (uint)cpu.GetRegister((int)CortexMRegisters.PRIMASK)
-                        | ((uint)cpu.GetRegister((int)CortexMRegisters.BasePri) << 8)
-                        | ((uint)cpu.GetRegister((int)CortexMRegisters.FAULTMASK) << 16)
-                        | ((uint)cpu.GetRegister((int)CortexMRegisters.Control) << 24);
-                    return true;
+                        Generation = debugRequestGeneration,
+                        Selector = selector,
+                        Write = (value & 0x10000) != 0,
+                        Value = debugData,
+                    });
                 }
-                var register = DebugRegisterIndex(selector);
-                if(register < 0) return true;
-                if(write) cpu.SetRegister(register, debugData);
-                else debugData = (uint)cpu.GetRegister(register);
+                cpu.RequestExternalDebugControl();
                 return true;
-            case 0xdf8: debugData = value; return true;
+            case 0xdf8:
+                lock(debugSync) debugData = value;
+                return true;
             case 0xdfc:
                 lock(debugSync) debugExceptionControl = value & 0x01000001;
                 return true;
@@ -181,7 +259,7 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             }
         }
 
-        private static int DebugRegisterIndex(int selector)
+        internal static int DebugRegisterIndex(int selector)
         {
             if(selector <= 15) return selector;
             if(selector >= 64 && selector <= 95) return (int)CortexMRegisters.S0 + selector - 64;
@@ -201,6 +279,8 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
 
         private uint debugControl, debugData, debugFaultStatus, debugExceptionControl;
         private uint debugRequestGeneration;
+        private bool debugHaltAcknowledged, debugRegisterReady;
+        private readonly Queue<DebugRegisterTransfer> debugRegisterTransfers = new Queue<DebugRegisterTransfer>();
         private readonly object debugSync = new object();
         private bool debugResetStatus, debugRestartStatus;
     }

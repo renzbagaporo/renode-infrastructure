@@ -41,10 +41,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         [Export]
         private uint TryHaltOnFlashPatchBreakpoint()
         {
-            if(HaltedByDebugger || !ExternalDebugEnabled) return 0;
-            nvic.ReportExternalDebugBreakpoint();
-            HaltedByDebugger = true;
-            return 1;
+            return TryHaltOnDebugBreakpoint();
         }
 
         [PostDeserialization]

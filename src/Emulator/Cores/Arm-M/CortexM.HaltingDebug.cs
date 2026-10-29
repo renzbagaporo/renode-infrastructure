@@ -12,6 +12,12 @@ namespace Antmicro.Renode.Peripherals.CPU
         public override ExecutionResult ExecuteInstructions(ulong numberOfInstructionsToExecute, out ulong numberOfExecutedInstructions)
         {
             ApplyFlashPatchBreakpoints();
+            if(nvic.ExternalDebugHaltRequested)
+            {
+                RequestExternalDebugControl();
+                numberOfExecutedInstructions = 0;
+                return ExecutionResult.Interrupted;
+            }
             var step = nvic.TryGetExternalDebugStepRequest(out var generation);
             if(step && numberOfInstructionsToExecute != 0)
             {
@@ -24,12 +30,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             if(step && numberOfExecutedInstructions != 0 && !HaltedByDebugger && !nvic.Lockup.IsSet
                 && result != ExecutionResult.Aborted && nvic.ReportExternalDebugStep(generation))
             {
-                HaltedByDebugger = true;
-                // A newer debugger command wins over this step's completion.
-                if(nvic.ExternalDebugRequestGeneration != generation)
-                {
-                    HaltedByDebugger = nvic.ExternalDebugHaltRequested;
-                }
+                RequestExternalDebugControl();
             }
             return result;
         }
@@ -37,12 +38,11 @@ namespace Antmicro.Renode.Peripherals.CPU
         [Export]
         private uint TryHaltOnDebugBreakpoint()
         {
-            if(!ExternalDebugEnabled)
+            if(!nvic.ReportExternalDebugBreakpoint())
             {
                 return 0;
             }
-            nvic.ReportExternalDebugBreakpoint();
-            HaltedByDebugger = true;
+            RequestExternalDebugControl();
             return 1;
         }
     }
