@@ -15,18 +15,20 @@ using Antmicro.Renode.Time;
 
 namespace Antmicro.Renode.Peripherals.SPI
 {
-    // W25Q16JV serial command set. ISPIPeripheral exchanges bytes in wire order;
+    // W25Q16JV/W25Q32JV serial command set. ISPIPeripheral exchanges bytes in wire order;
     // the controller handles the serial/dual/quad lane widths and dummy clocks.
     public sealed class WinbondW25QFlash : ISPIPeripheral, IGPIOReceiver
     {
         public WinbondW25QFlash(IMachine machine, MappedMemory underlyingMemory, ulong uniqueId = 0x0123456789abcdef,
             byte memoryType = 0x40, bool quadEnabled = true)
         {
-            if(underlyingMemory.Size != 2 * 1024 * 1024)
+            if(underlyingMemory.Size != 2 * 1024 * 1024 && underlyingMemory.Size != 4 * 1024 * 1024)
             {
-                throw new ConstructionException("W25Q16JV requires a 2 MiB underlying memory");
+                throw new ConstructionException("W25Q16JV/W25Q32JV requires a 2 MiB or 4 MiB underlying memory");
             }
             this.underlyingMemory = underlyingMemory;
+            AddressMask = (int)underlyingMemory.Size - 1;
+            capacityId = underlyingMemory.Size == 2 * 1024 * 1024 ? (byte)0x15 : (byte)0x16;
             this.uniqueId = uniqueId;
             this.memoryType = memoryType;
             underlyingMemory.ResetByte = 0xff;
@@ -73,7 +75,7 @@ namespace Antmicro.Renode.Peripherals.SPI
             case 0x15:
                 return status3;
             case 0x9f:
-                return index % 3 == 0 ? (byte)0xef : index % 3 == 1 ? memoryType : (byte)0x15;
+                return index % 3 == 0 ? (byte)0xef : index % 3 == 1 ? memoryType : capacityId;
             case 0x4b:
                 return index < 4 ? (byte)0xff : (byte)(uniqueId >> (56 - ((index - 4) % 8) * 8));
             case 0x03:
@@ -94,7 +96,7 @@ namespace Antmicro.Renode.Peripherals.SPI
                 }
                 return underlyingMemory.ReadByte((Address + index - 3 - dummyBytes) & AddressMask);
             case 0x90:
-                return index < 3 ? (byte)0xff : (index & 1) == 1 ? (byte)0xef : (byte)0x14;
+                return index < 3 ? (byte)0xff : (index & 1) == 1 ? (byte)0xef : (byte)(capacityId - 1);
             default:
                 return 0xff;
             }
@@ -286,6 +288,7 @@ namespace Antmicro.Renode.Peripherals.SPI
         private bool continuousRead;
         private byte pendingCommand;
         private byte[] pendingData;
-        private const int AddressMask = 0x1fffff;
+        private readonly int AddressMask;
+        private readonly byte capacityId;
     }
 }
