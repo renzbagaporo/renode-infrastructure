@@ -110,6 +110,36 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.IsFalse(gpio.Core1IRQ.IsSet);
         }
 
+        [TestCase(false)]
+        [TestCase(true)]
+        public void ShouldNotLatchEdgeWhenResetRemovesDrivenHighOutput(bool rp2350)
+        {
+            var gpio = new RP2_GPIOBank0(machine, rp2350: rp2350);
+            gpio.SetPadConfiguration(0, 0x56);
+            gpio.WriteDoubleWord(4, 0x1f | (3u << 12) | (3u << 14));
+            Assert.IsTrue(gpio.GetInput(0));
+            gpio.Reset();
+            var interruptOffset = rp2350 ? 0x230 : 0xf0;
+            Assert.AreEqual(1u, gpio.ReadDoubleWord(interruptOffset) & 0xf);
+        }
+
+        [TestCase(false)]
+        [TestCase(true)]
+        public void ShouldIgnoreEdgesDuringResetHoldAndDetectEdgesAfterRelease(bool rp2350)
+        {
+            var gpio = new RP2_GPIOBank0(machine, rp2350: rp2350);
+            gpio.SetPadConfiguration(0, 0x56);
+            var interruptOffset = rp2350 ? 0x230 : 0xf0;
+            gpio.ResetHeld = true;
+            gpio.OnGPIO(0, true);
+            Assert.AreEqual(2u, gpio.ReadDoubleWord(interruptOffset) & 0xf);
+            gpio.OnGPIO(0, false);
+            Assert.AreEqual(1u, gpio.ReadDoubleWord(interruptOffset) & 0xf);
+            gpio.ResetHeld = false;
+            gpio.OnGPIO(0, true);
+            Assert.AreEqual(0xau, gpio.ReadDoubleWord(interruptOffset) & 0xf);
+        }
+
         [Test]
         public void ShouldApplyPadAtomicAliasesAndVariantResetValues()
         {

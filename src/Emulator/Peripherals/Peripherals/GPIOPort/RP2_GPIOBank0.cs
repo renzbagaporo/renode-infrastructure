@@ -110,14 +110,22 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
 
         public override void Reset()
         {
-            for(var pin = 0; pin < control.Length; pin++)
+            resetting = true;
+            try
             {
-                control[pin] = 0x1f;
+                for(var pin = 0; pin < control.Length; pin++)
+                {
+                    control[pin] = 0x1f;
+                }
+                Array.Clear(edgeInterrupts, 0, edgeInterrupts.Length);
+                Array.Clear(interruptEnable, 0, interruptEnable.Length);
+                Array.Clear(interruptForce, 0, interruptForce.Length);
+                UpdatePins();
             }
-            Array.Clear(edgeInterrupts, 0, edgeInterrupts.Length);
-            Array.Clear(interruptEnable, 0, interruptEnable.Length);
-            Array.Clear(interruptForce, 0, interruptForce.Length);
-            UpdatePins();
+            finally
+            {
+                resetting = false;
+            }
         }
 
         public IReadOnlyDictionary<int, IGPIO> Connections { get; }
@@ -295,7 +303,10 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             var irqInput = Override(padInput, (control[pin] >> 28) & 3);
             if(irqInput != interruptInput[pin])
             {
-                edgeInterrupts[pin / 8] |= (irqInput ? 8u : 4u) << ((pin % 8) * 4);
+                if(!resetting && !ResetHeld)
+                {
+                    edgeInterrupts[pin / 8] |= (irqInput ? 8u : 4u) << ((pin % 8) * 4);
+                }
                 interruptInput[pin] = irqInput;
             }
             Connections[pin].Set(ReadWireLevel(pin));
@@ -363,6 +374,8 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             default: return value;
             }
         }
+
+        private bool resetting;
 
         private readonly IRP2GPIO sio;
         private readonly bool rp2350;
