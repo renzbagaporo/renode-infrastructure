@@ -11,6 +11,7 @@ namespace Antmicro.Renode.Peripherals.CPU
     {
         public override ExecutionResult ExecuteInstructions(ulong numberOfInstructionsToExecute, out ulong numberOfExecutedInstructions)
         {
+            ApplyFlashPatchBreakpoints();
             var step = nvic.TryGetExternalDebugStepRequest(out var generation);
             if(step && numberOfInstructionsToExecute != 0)
             {
