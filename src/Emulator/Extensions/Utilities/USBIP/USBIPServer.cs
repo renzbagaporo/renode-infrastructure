@@ -14,6 +14,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Text.RegularExpressions;
 using System.Threading;
+using System.Threading.Tasks;
 
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure;
@@ -36,7 +37,7 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
         }
 
         // this is just a simple wrapper method allowing to register devices from monitor
-        public static void Register(this USBIPServer @this, IUSBDevice device, int? port = null)
+        public static void Register(this USBIPServer @this, IUSBDevice device, int? port = null, USBIPServer.USBSpeed speed = USBIPServer.USBSpeed.High)
         {
             if(!port.HasValue)
             {
@@ -45,7 +46,7 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
                     : 0;
             }
 
-            @this.Register(device, new NumberRegistrationPoint<int>(port.Value));
+            @this.Register(device, new NumberRegistrationPoint<int>(port.Value), speed);
         }
     }
 
@@ -55,7 +56,7 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
         {
             this.port = port;
 
-            server = new SocketServerProvider(false, serverName: "USBIP");
+            server = new SocketServerProvider(false, flushOnConnect: true, serverName: "USBIP");
             server.DataReceived += HandleIncomingData;
             server.ConnectionClosed += Reset;
 
@@ -66,12 +67,12 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
 
         public override void Dispose()
         {
+            Shutdown();
             foreach(var (_, conn) in deviceToConnection)
             {
                 conn.Dispose();
             }
             base.Dispose();
-            Shutdown();
         }
 
         public void Run()
@@ -81,26 +82,60 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
 
         public void Reset()
         {
+            PendingTransfer[] transfers;
+            CancellationTokenSource previousToken;
+            lock(transferLock)
+            {
+                generation++;
+                transfers = pendingTransfers.Values.ToArray();
+                pendingTransfers.Clear();
+                endpointTasks.Clear();
+                previousToken = cancellationToken;
+                cancellationToken = new CancellationTokenSource();
+            }
+            previousToken.Cancel();
+            foreach(var transfer in transfers)
+            {
+                transfer.Cancel();
+            }
             state = State.WaitForCommand;
             urbHeader = default(URBHeader);
             additionalDataCount = 0;
-
             buffer.Clear();
-            cancellationToken = new CancellationTokenSource();
         }
 
         public override void Register(IUSBDevice device, NumberRegistrationPoint<int> registrationPoint)
         {
+            Register(device, registrationPoint, USBSpeed.High);
+        }
+
+        public void Register(IUSBDevice device, NumberRegistrationPoint<int> registrationPoint, USBSpeed speed)
+        {
             base.Register(device, registrationPoint);
             deviceToConnection[device] = device.ConnectUSB();
+            deviceSpeeds[device] = speed;
         }
 
         public override void Unregister(IUSBDevice device)
         {
             if(deviceToConnection.Remove(device, out var conn))
             {
+                PendingTransfer[] transfers;
+                lock(transferLock)
+                {
+                    transfers = pendingTransfers.Values.Where(t => t.Connection == conn).ToArray();
+                    foreach(var transfer in transfers)
+                    {
+                        pendingTransfers.Remove(transfer.Header.SequenceNumber);
+                    }
+                }
+                foreach(var transfer in transfers)
+                {
+                    transfer.Cancel();
+                }
                 conn.Dispose();
             }
+            deviceSpeeds.Remove(device);
             base.Unregister(device);
         }
 
@@ -117,9 +152,9 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
         {
             this.Log(LogLevel.Info, "Shutting down the server...");
 
+            Reset();
             cancellationToken.Cancel();
             server.Stop();
-            buffer.Clear();
         }
 
         private void HandleIncomingData(int b)
@@ -246,83 +281,14 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
                     }
                 }
 
-                if(urbHeader.BusId != ExportedBusId)
-                {
-                    this.Log(LogLevel.Warning, "URB command directed to a non-existing bus 0x{0:X}", urbHeader.BusId);
-                }
-                else if(!TryGetByAddress((int)urbHeader.DeviceId, out var device))
-                {
-                    this.Log(LogLevel.Warning, "URB command directed to a non-existing device 0x{0:X}", urbHeader.DeviceId);
-                }
-                else
-                {
-                    var conn = deviceToConnection[device];
-                    // We currently assume that ep0 is the only control endpoint
-                    if(urbHeader.EndpointNumber == 0)
-                    {
-                        // setup packet is passed in URB Request in a single `ulong` field
-                        var setupPacket = Packet.Decode<SetupPacket>(buffer, Packet.CalculateOffset<URBRequest>(nameof(URBRequest.Setup)));
-                        var additionalData = (additionalDataCount > 0)
-                            ? buffer.Skip(buffer.Count - additionalDataCount).Take(additionalDataCount).ToArray()
-                            : null;
-                        var replyHeader = urbHeader;
-                        var ep = conn.ConnectEndpointSetup(0);
-
-                        byte[] response = null;
-                        if(additionalData != null)
-                        {
-                            ep.SetupWriteBlocking(setupPacket, additionalData, cancellationToken.Token);
-                        }
-                        else
-                        {
-                            response = ep.SetupReadBlocking(setupPacket, cancellationToken.Token);
-                        }
-                        SendResponse(GenerateURBReply(replyHeader, packet, response));
-                    }
-                    else
-                    {
-                        var warnNonexistingEndpoint = () =>
-                        {
-                            this.Log(LogLevel.Warning, "URB command directed to a non-existing endpoint 0x{0:X}", urbHeader.EndpointNumber);
-                        };
-                        if(urbHeader.EndpointDirection == USB.EndpointDirection.In)
-                        {
-                            var ep = conn.ConnectEndpointRead((byte)urbHeader.EndpointNumber);
-                            if(ep == null)
-                            {
-                                warnNonexistingEndpoint();
-                            }
-                            else
-                            {
-                                this.Log(LogLevel.Noisy, "Reading from endpoint #{0}", urbHeader.EndpointNumber);
-                                var response = ep.ReadPacketBlocking(token: cancellationToken.Token);
-#if DEBUG_PACKETS
-                            this.Log(LogLevel.Noisy, "Count {0}: {1}", response.Length, Misc.PrettyPrintCollectionHex(response));
-#endif
-                                SendResponse(GenerateURBReply(urbHeader, packet, response));
-                            }
-                        }
-                        else
-                        {
-                            var ep = conn.ConnectEndpointWrite((byte)urbHeader.EndpointNumber);
-                            if(ep == null)
-                            {
-                                warnNonexistingEndpoint();
-                            }
-                            else
-                            {
-                                var additionalData = buffer.Skip(buffer.Count - additionalDataCount).Take(additionalDataCount).ToArray();
-
-                                ep.Write(additionalData);
-                                SendResponse(GenerateURBReply(urbHeader, packet));
-                            }
-                        }
-                    }
-                }
-
+                // The parser must release its mutable state before a worker can run.
+                var header = urbHeader;
+                var setup = Packet.Decode<SetupPacket>(buffer, Packet.CalculateOffset<URBRequest>(nameof(URBRequest.Setup)));
+                var payload = buffer.Skip(Packet.CalculateLength<URBRequest>()).ToArray();
                 additionalDataCount = 0;
                 state = State.WaitForURBHeader;
                 buffer.Clear();
+                DispatchRequest(header, packet, setup, payload);
 
                 break;
             }
@@ -332,9 +298,10 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
                 DebugHelper.Assert(buffer.Count <= Packet.CalculateLength<URBRequest>());
                 if(buffer.Count == Packet.CalculateLength<URBRequest>())
                 {
-                    // this command is practically ignored
+                    var header = urbHeader;
                     buffer.Clear();
                     state = State.WaitForURBHeader;
+                    HandleUnlink(header);
                 }
                 break;
             }
@@ -344,41 +311,223 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
             }
         }
 
-        private IEnumerable<byte> GenerateURBReply(URBHeader hdr, URBRequest req, IEnumerable<byte> data = null)
+        private void DispatchRequest(URBHeader header, URBRequest request, SetupPacket setup, byte[] payload)
+        {
+            if(header.BusId != ExportedBusId || !TryGetByAddress((int)header.DeviceId, out var device))
+            {
+                SendResponse(GenerateURBReply(header, request, status: NoDevice));
+                return;
+            }
+
+            var conn = deviceToConnection[device];
+            lock(transferLock)
+            {
+                if(pendingTransfers.ContainsKey(header.SequenceNumber))
+                {
+                    SendResponse(GenerateURBReply(header, request, status: InvalidArgument));
+                    return;
+                }
+                var transfer = new PendingTransfer(header, request, setup, payload, conn, generation);
+                pendingTransfers.Add(header.SequenceNumber, transfer);
+                // EP0 shares one queue for both directions. Other endpoints have
+                // independent IN/OUT queues, preserving submission order per pipe.
+                var key = (conn, header.EndpointNumber, header.EndpointNumber == 0 ? URBDirection.Out : header.Direction);
+                endpointTasks.TryGetValue(key, out var previous);
+                endpointTasks[key] = (previous ?? Task.CompletedTask).ContinueWith(_ => ExecuteTransfer(transfer),
+                    CancellationToken.None, TaskContinuationOptions.None, TaskScheduler.Default);
+            }
+        }
+
+        private void ExecuteTransfer(PendingTransfer transfer)
+        {
+            try
+            {
+                byte[] data = null;
+                var header = transfer.Header;
+                if(header.EndpointNumber == 0)
+                {
+                    var ep = transfer.Invoke(() => transfer.Connection.ConnectEndpointSetup(0));
+                    if(ep == null)
+                    {
+                        CompleteTransfer(transfer, status: NoEntry);
+                        return;
+                    }
+                    transfer.Invoke(() => ep.SetupPacketWrite(transfer.Setup));
+                    if(transfer.Setup.Direction == Direction.HostToDevice)
+                    {
+                        // A zero-count host-to-device setup has no OUT data stage;
+                        // its status stage is an IN zero-length packet.
+                        if(transfer.Setup.Count != 0)
+                        {
+                            transfer.Invoke(() => ep.Write(transfer.Payload));
+                        }
+                        ReadPacket(transfer, ep);
+                    }
+                    else
+                    {
+                        var response = new List<byte>();
+                        var length = Math.Min(transfer.Setup.Count, transfer.Request.TransferBufferLength);
+                        endpointZeroPacketSizes.TryGetValue(transfer.Connection, out var packetSize);
+                        if(packetSize == 0) packetSize = 64;
+                        while(response.Count < length)
+                        {
+                            var chunk = ReadPacket(transfer, ep);
+                            response.AddRange(chunk.Take((int)length - response.Count));
+                            if(chunk.Length % packetSize != 0 || chunk.Length == 0)
+                            {
+                                break;
+                            }
+                        }
+                        transfer.Invoke(() => ep.Write(Array.Empty<byte>()));
+                        data = response.ToArray();
+                    }
+                }
+                else if(header.Direction == URBDirection.In)
+                {
+                    var ep = transfer.Invoke(() => transfer.Connection.ConnectEndpointRead((byte)header.EndpointNumber));
+                    if(ep == null)
+                    {
+                        CompleteTransfer(transfer, status: NoEntry);
+                        return;
+                    }
+                    data = ReadPacket(transfer, ep);
+                    if(data.Length > transfer.Request.TransferBufferLength)
+                    {
+                        CompleteTransfer(transfer, status: Overflow);
+                        return;
+                    }
+                }
+                else
+                {
+                    var ep = transfer.Invoke(() => transfer.Connection.ConnectEndpointWrite((byte)header.EndpointNumber));
+                    if(ep == null)
+                    {
+                        CompleteTransfer(transfer, status: NoEntry);
+                        return;
+                    }
+                    transfer.Invoke(() => ep.Write(transfer.Payload));
+                }
+                CompleteTransfer(transfer, data);
+            }
+            catch(OperationCanceledException)
+            {
+                // UNLINK/reset owns completion and suppresses this submission's reply.
+            }
+            catch(Exception e)
+            {
+                this.Log(LogLevel.Warning, "USB/IP transfer failed: {0}", e.Message);
+                CompleteTransfer(transfer, status: InputOutputError);
+            }
+            finally
+            {
+                transfer.Dispose();
+            }
+        }
+
+        private byte[] ReadPacket(PendingTransfer transfer, IUSBPipeRead pipe)
+        {
+            using(var available = new AutoResetEvent(false))
+            {
+                var finished = false;
+                Action notify = () =>
+                {
+                    lock(available)
+                    {
+                        if(!finished) available.Set();
+                    }
+                };
+                pipe.NewPacket += notify;
+                try
+                {
+                    while(true)
+                    {
+                        byte[] data = null;
+                        // Cancellation and TryRead share a gate: after Cancel returns,
+                        // this reader can never consume a future packet.
+                        if(transfer.Invoke(() => pipe.TryRead(out data)))
+                        {
+                            Misc.WaitForCallback(onDone => IUSBPipeRead.WrapReadCallbackInDelay(_ => onDone())(data), transfer.Token);
+                            return data;
+                        }
+                        WaitHandle.WaitAny(new WaitHandle[] { available, transfer.Token.WaitHandle });
+                    }
+                }
+                finally
+                {
+                    pipe.NewPacket -= notify;
+                    lock(available)
+                    {
+                        finished = true;
+                    }
+                }
+            }
+        }
+
+        private void CompleteTransfer(PendingTransfer transfer, byte[] data = null, int status = 0)
+        {
+            lock(transferLock)
+            {
+                if(transfer.Generation != generation
+                    || !pendingTransfers.TryGetValue(transfer.Header.SequenceNumber, out var current)
+                    || current != transfer)
+                {
+                    return;
+                }
+                pendingTransfers.Remove(transfer.Header.SequenceNumber);
+                SendResponse(GenerateURBReply(transfer.Header, transfer.Request, data, status));
+            }
+        }
+
+        private void HandleUnlink(URBHeader header)
+        {
+            PendingTransfer transfer;
+            int currentGeneration;
+            lock(transferLock)
+            {
+                pendingTransfers.Remove(header.FlagsOrStatus, out transfer);
+                currentGeneration = generation;
+            }
+            transfer?.Cancel();
+            lock(transferLock)
+            {
+                if(currentGeneration != generation) return;
+                var reply = new URBHeader
+                {
+                    Command = URBCommand.UnlinkReply,
+                    SequenceNumber = header.SequenceNumber,
+                    FlagsOrStatus = unchecked((uint)(transfer == null ? 0 : ConnectionReset))
+                };
+                SendResponse(Packet.Encode(reply).Concat(new byte[Packet.CalculateLength<URBRequest>()]));
+            }
+        }
+
+        private IEnumerable<byte> GenerateURBReply(URBHeader hdr, URBRequest req, IEnumerable<byte> data = null, int status = 0)
         {
             var header = new URBHeader
             {
                 Command = URBCommand.URBReply,
                 SequenceNumber = hdr.SequenceNumber,
-                BusId = hdr.BusId,
-                DeviceId = hdr.DeviceId,
-                Direction = hdr.Direction,
-                EndpointNumber = hdr.EndpointNumber,
+                FlagsOrStatus = unchecked((uint)status)
             };
-
             var reply = new URBReply
             {
-                // this is intentional:
-                // - report size of TransferBufferLength when returning no additional data,
-                // - report additional data size (and not TransferBufferLenght) otherwise
-                ActualLength = (data == null)
-                    ? req.TransferBufferLength
-                    : (uint)data.Count()
+                ActualLength = status != 0 ? 0 : data == null ? req.TransferBufferLength : (uint)data.Count(),
+                NumberOfPackets = uint.MaxValue
             };
-
-            var result = Packet.Encode(header).Concat(Packet.Encode(reply)).AsEnumerable();
-            if(data != null)
+            var result = Packet.Encode(header).Concat(Packet.Encode(reply));
+            if(data != null && hdr.Direction == URBDirection.In)
             {
                 result = result.Concat(data);
             }
-
             return result;
         }
 
-        private IEnumerable<byte> GenerateDeviceDescriptor(IUSBConnection conn, uint deviceNumber, bool includeInterfaces)
+        private IEnumerable<byte> GenerateDeviceDescriptor(IUSBDevice device, uint deviceNumber, bool includeInterfaces)
         {
+            var conn = deviceToConnection[device];
             var ep0 = conn.ConnectEndpointSetup(0);
             var deviceDescriptor = ep0.ReadDeviceDescriptorBlocking(cancellationToken.Token);
+            endpointZeroPacketSizes[conn] = deviceDescriptor.MaximumPacketSize;
             var interfaceDescriptors = new List<USB.InterfaceDescriptor>();
 
             if(includeInterfaces)
@@ -397,7 +546,7 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
 
                 BusNumber = ExportedBusId,
                 DeviceNumber = deviceNumber,
-                Speed = (int)USBSpeed.High, // this is hardcoded, but I don't know if that's good
+                Speed = (uint)deviceSpeeds[device],
 
                 IdVendor = deviceDescriptor.VendorId,
                 IdProduct = deviceDescriptor.ProductId,
@@ -453,7 +602,7 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
 
             foreach(var child in ChildCollection)
             {
-                result = result.Concat(GenerateDeviceDescriptor(deviceToConnection[child.Value], (uint)child.Key, true));
+                result = result.Concat(GenerateDeviceDescriptor(child.Value, (uint)child.Key, true));
             }
 
             return result;
@@ -466,7 +615,7 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
             IUSBDevice device = null;
 
             var m = Regex.Match(deviceIdString, "([0-9]+)-([0-9]+)");
-            if(m == null)
+            if(!m.Success)
             {
                 this.Log(LogLevel.Warning, "Unexpected device string when handling attach command: {0}. It should be in format '1-4'", deviceIdString);
                 success = false;
@@ -499,11 +648,76 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
             if(success)
             {
                 var conn = deviceToConnection[device];
-                response = response.Concat(GenerateDeviceDescriptor(conn, (uint)deviceId, false));
+                response = response.Concat(GenerateDeviceDescriptor(device, (uint)deviceId, false));
             }
 
             return (success, response);
         }
+
+        private sealed class PendingTransfer : IDisposable
+        {
+            public PendingTransfer(URBHeader header, URBRequest request, SetupPacket setup, byte[] payload, IUSBConnection connection, int generation)
+            {
+                Header = header;
+                Request = request;
+                Setup = setup;
+                Payload = payload;
+                Connection = connection;
+                Generation = generation;
+            }
+
+            public T Invoke<T>(Func<T> action)
+            {
+                lock(gate)
+                {
+                    cancellation.Token.ThrowIfCancellationRequested();
+                    return action();
+                }
+            }
+
+            public void Invoke(Action action) => Invoke(() => { action(); return true; });
+
+            public void Cancel()
+            {
+                lock(gate)
+                {
+                    if(!disposed) cancellation.Cancel();
+                }
+            }
+
+            public void Dispose()
+            {
+                lock(gate)
+                {
+                    disposed = true;
+                    cancellation.Dispose();
+                }
+            }
+
+            public CancellationToken Token => cancellation.Token;
+            public readonly URBHeader Header;
+            public readonly URBRequest Request;
+            public readonly SetupPacket Setup;
+            public readonly byte[] Payload;
+            public readonly IUSBConnection Connection;
+            public readonly int Generation;
+            private readonly object gate = new object();
+            private readonly CancellationTokenSource cancellation = new CancellationTokenSource();
+            private bool disposed;
+        }
+
+        private readonly object transferLock = new object();
+        private readonly Dictionary<uint, PendingTransfer> pendingTransfers = new Dictionary<uint, PendingTransfer>();
+        private readonly Dictionary<(IUSBConnection, uint, URBDirection), Task> endpointTasks = new Dictionary<(IUSBConnection, uint, URBDirection), Task>();
+        private readonly Dictionary<IUSBDevice, USBSpeed> deviceSpeeds = new Dictionary<IUSBDevice, USBSpeed>();
+        private readonly Dictionary<IUSBConnection, byte> endpointZeroPacketSizes = new Dictionary<IUSBConnection, byte>();
+        private int generation;
+        private const int ConnectionReset = -104;
+        private const int NoEntry = -2;
+        private const int NoDevice = -19;
+        private const int InvalidArgument = -22;
+        private const int InputOutputError = -5;
+        private const int Overflow = -75;
 
         private State state;
         private URBHeader urbHeader;
@@ -518,7 +732,7 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
         private const uint ExportedBusId = 1;
         private const ushort ProtocolVersion = 0x0111;
 
-        private enum USBSpeed
+        public enum USBSpeed
         {
             Unknown = 0,
             Low = 1,
