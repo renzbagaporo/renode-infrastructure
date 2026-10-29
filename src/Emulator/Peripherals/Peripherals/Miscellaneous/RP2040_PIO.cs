@@ -206,11 +206,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 {
                 case 0:
                     sm.ClockDivider = ApplyOperation(sm.ClockDivider, value, operation, 0xffffff00);
-                    Schedule(sm);
+                    Reschedule(sm);
                     break;
                 case 4:
                     sm.ExecControl = ApplyOperation(sm.ExecControl, value, operation, 0x7fffff9f);
-                    if(sm.JumpLoop) { ClearExecution(sm); Schedule(sm); }
+                    if(sm.JumpLoop) ClearExecution(sm);
+                    Reschedule(sm);
                     BeginPinCycle();
                     ResolvePinWrites();
                     break;
@@ -221,8 +222,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     {
                         sm.Tx.Clear();
                         sm.Rx.Clear();
-                        Wake(sm);
                     }
+                    Reschedule(sm);
                     break;
                 case 16:
                     ClearExecution(sm);
@@ -235,7 +236,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     sm.RetryNextCycle = false;
                     Schedule(sm, wake: retry);
                     break;
-                case 20: sm.PinControl = ApplyOperation(sm.PinControl, value, operation); break;
+                case 20:
+                    sm.PinControl = ApplyOperation(sm.PinControl, value, operation);
+                    if(sm.JumpLoop) ClearExecution(sm);
+                    Reschedule(sm);
+                    break;
                 }
                 UpdateSignals();
                 return;
@@ -272,7 +277,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                         var remaining = sm.Scheduled ? CyclesUntilExecution(sm) : 1ul;
                         sm.Edge256 = (BigInteger)cycleCounter.Value * 256 + Divider256(sm) * remaining;
                     }
-                    Schedule(sm, wake: sm.Stalled && CanResume(sm));
+                    Reschedule(sm);
                 }
                 BeginPinCycle();
                 ResolvePinWrites();
@@ -353,6 +358,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 irqFlags = (irqFlags | cycleIRQSet) & ~cycleIRQClear;
                 executingCycle = false;
                 if(previousIRQFlags != irqFlags) WakeAll();
+                foreach(var sm in stateMachines) if(sm.Stalled && !sm.Scheduled) Reschedule(sm);
                 ResolvePinWrites();
                 UpdateSignals();
             }
@@ -745,14 +751,33 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 foreach(var sm in stateMachines)
                 {
                     if(!sm.Stalled) continue;
-                    var source = (sm.Instruction >> 5) & 3;
-                    var dependsOnPin = sm.JumpLoop ? ((sm.Instruction >> 5) & 7) == 6 ? (int)((sm.ExecControl >> 24) & 31) : -1
-                        : (sm.Instruction >> 13) != 1 || source > 1 ? -1
-                        : source == 0 ? sm.Instruction & 31 : (InBase(sm) + (sm.Instruction & 31)) & 31;
+                    var dependsOnPin = InputDependency(sm);
                     if(dependsOnPin == pin && (!sm.Timer.Enabled || sm.DueTick > visibleTick))
                         Schedule(sm, wake: true, earliestTick: visibleTick);
                 }
             }
+        }
+
+        private static int InputDependency(StateMachine sm)
+        {
+            if(sm.JumpLoop) return ((sm.Instruction >> 5) & 7) == 6 ? (int)((sm.ExecControl >> 24) & 31) : -1;
+            if((sm.Instruction >> 13) != 1) return -1;
+            var source = (sm.Instruction >> 5) & 3;
+            if(source > 1) return -1;
+            return source == 0 ? sm.Instruction & 31 : (InBase(sm) + (sm.Instruction & 31)) & 31;
+        }
+
+        private void Reschedule(StateMachine sm)
+        {
+            var ready = sm.Stalled && CanResume(sm);
+            ulong visibleTick = 0;
+            if(sm.Stalled && !ready)
+            {
+                var pin = InputDependency(sm);
+                if(pin >= 0 && (inputSyncBypass & (1u << pin)) == 0 && inputHistory[pin].Count != 0)
+                    visibleTick = inputHistory[pin].Peek().Tick;
+            }
+            Schedule(sm, wake: ready || visibleTick != 0, earliestTick: visibleTick);
         }
 
         private void OnClockChanged()
@@ -766,7 +791,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 foreach(var sm in stateMachines)
                 {
                     sm.Timer.Frequency = Math.Max(1ul, frequency);
-                    Schedule(sm);
+                    Reschedule(sm);
                 }
             }
         }
@@ -798,9 +823,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 var value = source == 0 ? ReadInput(index) : source == 1 ? ReadInput((InBase(sm) + index) & 31)
                     : source == 2 && (irqFlags & (1u << IrqIndex(sm, index))) != 0;
                 return value == ((argument & 0x80) != 0);
-            case 2: return sm.Rx.Count < RxCapacity(sm);
-            case 3: return sm.Tx.Count != 0 || sm.OutputCount < PullThreshold(sm);
-            case 4: return (argument & 0x80) != 0 ? sm.Tx.Count != 0 : sm.Rx.Count < RxCapacity(sm);
+            case 2: return !AutoPush(sm) || sm.InputCount < PushThreshold(sm) || sm.Rx.Count < RxCapacity(sm);
+            case 3: return !AutoPull(sm) || sm.Tx.Count != 0 || sm.OutputCount < PullThreshold(sm);
+            case 4:
+                if((argument & 0x80) != 0)
+                    return ((AutoPull(sm) || (argument & 0x40) != 0) && sm.OutputCount < PullThreshold(sm))
+                        || sm.Tx.Count != 0 || (argument & 0x20) == 0;
+                return ((argument & 0x40) != 0 && sm.InputCount < PushThreshold(sm))
+                    || sm.Rx.Count < RxCapacity(sm) || (argument & 0x20) == 0;
             case 6: return (irqFlags & (1u << IrqIndex(sm, argument & 31))) == 0;
             default: return true;
             }

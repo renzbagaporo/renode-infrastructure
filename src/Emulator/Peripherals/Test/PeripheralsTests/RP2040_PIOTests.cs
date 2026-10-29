@@ -636,6 +636,79 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.AreEqual(2u, pio.ReadDoubleWord(0xd4));
         }
 
+        [TestCase(false)]
+        [TestCase(true)]
+        public void ShouldRetainSynchronizedPinWakeAcrossClockGating(bool inputBeforeGate)
+        {
+            var clocks = new TestClocks();
+            pio = new RP2040_PIO(machine, gpio, clocks);
+            Load(0x2084, 0xe027, 0x80a0);
+            pio.WriteDoubleWord(0, 1);
+            Advance(1);
+            if(inputBeforeGate) gpio.OnGPIO(4, true);
+            clocks.SetSystemFrequency(0);
+            if(!inputBeforeGate) gpio.OnGPIO(4, true);
+            Advance(100);
+            clocks.SetSystemFrequency(1000000);
+            Advance(1);
+            Assert.AreEqual(0u, pio.ReadDoubleWord(0xd4));
+            Advance(1);
+            Assert.AreEqual(1u, pio.ReadDoubleWord(0xd4));
+        }
+
+        [Test]
+        public void ShouldRetainQueuedPinWakeWhenClockDividerRestarts()
+        {
+            Load(0x2084, 0xe027, 0x80a0);
+            pio.WriteDoubleWord(0, 1);
+            Advance(1);
+            gpio.OnGPIO(4, true);
+            pio.WriteDoubleWord(0xc8, 3u << 16);
+            pio.WriteDoubleWord(0x2000, 1u << 8);
+            Advance(2);
+            Assert.AreEqual(0u, pio.ReadDoubleWord(0xd4));
+            Advance(1);
+            Assert.AreEqual(1u, pio.ReadDoubleWord(0xd4));
+        }
+
+        [Test]
+        public void ShouldReevaluateWAITPinWhenInputMappingChanges()
+        {
+            gpio.OnGPIO(5, true);
+            Advance(2);
+            pio.WriteDoubleWord(0xdc, 4u << 15);
+            Force(0, 0x20a0); // wait1 pin0, currently GPIO4
+            Assert.AreNotEqual(0u, pio.ReadDoubleWord(0xcc) & 0x80000000);
+            pio.WriteDoubleWord(0xdc, 5u << 15);
+            Advance(1);
+            Assert.AreEqual(0u, pio.ReadDoubleWord(0xcc) & 0x80000000);
+        }
+
+        [Test]
+        public void ShouldReevaluateStalledPULLWhenAutopullFenceIsEnabled()
+        {
+            Force(0, 0xa0e3); // mov osr,null: full OSR
+            Force(0, 0x80a0); // unconditional PULL still waits for TX data
+            Assert.AreNotEqual(0u, pio.ReadDoubleWord(0xcc) & 0x80000000);
+            pio.WriteDoubleWord(0xd0, 0xc0000 | (1u << 17));
+            Advance(1);
+            Assert.AreEqual(0u, pio.ReadDoubleWord(0xcc) & 0x80000000);
+        }
+
+        [Test]
+        public void ShouldRetainFractionalDividerPhaseThroughAStalledInput()
+        {
+            Load(0x2084, 0xe027, 0x80a0);
+            pio.WriteDoubleWord(0xc8, (1u << 16) | (128u << 8));
+            pio.WriteDoubleWord(0, 1);
+            Advance(1000000);
+            gpio.OnGPIO(4, true);
+            Advance(1);
+            Assert.AreEqual(0u, pio.ReadDoubleWord(0xd4));
+            Advance(1);
+            Assert.AreEqual(1u, pio.ReadDoubleWord(0xd4));
+        }
+
         private uint SPIByte(uint value, bool lead, int mosi, int miso, int sck)
         {
             uint result = 0;
