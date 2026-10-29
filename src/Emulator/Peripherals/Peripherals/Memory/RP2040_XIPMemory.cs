@@ -3,6 +3,7 @@
 // Full license text is available in 'licenses/MIT.txt'.
 //
 
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -18,7 +19,7 @@ namespace Antmicro.Renode.Peripherals.Memory
     // The cache is not retained: all reads fetch the NOR backing data. XIP
     // writes invalidate cache tags and must never program the serial flash.
     public sealed class RP2040_XIPMemory : IBytePeripheral, IWordPeripheral, IDoubleWordPeripheral,
-        IQuadWordPeripheral, IMultibyteWritePeripheral, IMapped, IKnownSize, IMemory
+        IQuadWordPeripheral, IMultibyteWritePeripheral, IMapped, IKnownSize, IMemory, IDisposable
     {
         public RP2040_XIPMemory(IMachine machine, WinbondW25QFlash flash, RP2040_XIP xip)
         {
@@ -27,13 +28,7 @@ namespace Antmicro.Renode.Peripherals.Memory
             this.xip = xip;
             flash.StateChanged += InvalidateInstructions;
             xip.AvailabilityChanged += RouteDataAccessesThroughBus;
-            machine.PeripheralsChanged += (_, change) =>
-            {
-                if(change.Peripheral == this || change.Peripheral is ICPUWithMappedMemory)
-                {
-                    RouteDataAccessesThroughBus();
-                }
-            };
+            machine.PeripheralsChanged += OnPeripheralsChanged;
         }
 
         public byte ReadByte(long offset) => xip.Available ? flash.UnderlyingMemory.ReadByte(offset) : (byte)0;
@@ -76,6 +71,14 @@ namespace Antmicro.Renode.Peripherals.Memory
             InvalidateInstructions();
         }
 
+        public void Dispose()
+        {
+            machine.PeripheralsChanged -= OnPeripheralsChanged;
+            flash.StateChanged -= InvalidateInstructions;
+            xip.AvailabilityChanged -= RouteDataAccessesThroughBus;
+            flash.UnderlyingMemory.Dispose();
+        }
+
         public void Reset()
         {
             RouteDataAccessesThroughBus();
@@ -84,6 +87,14 @@ namespace Antmicro.Renode.Peripherals.Memory
         public long Size => flash.UnderlyingMemory.Size;
 
         public IEnumerable<IMappedSegment> MappedSegments => flash.UnderlyingMemory.MappedSegments;
+
+        private void OnPeripheralsChanged(IMachine _, PeripheralsChangedEventArgs change)
+        {
+            if(change.Peripheral == this || change.Peripheral is ICPUWithMappedMemory)
+            {
+                RouteDataAccessesThroughBus();
+            }
+        }
 
         private void RouteDataAccessesThroughBus()
         {
