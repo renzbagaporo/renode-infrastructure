@@ -37,7 +37,10 @@ namespace Antmicro.Renode.Peripherals.Memory
 
         public byte ReadByte(long offset)
         {
-            return qmi.FlashReadConfigured && qmi.TryTranslate(offset, untranslated, out var physical)
+            if(!qmi.Available) throw new BusAccessException(BusAccessError.GenericError);
+            if(offset >= 0x1000000 && offset < Size) return 0xff;
+            if(!qmi.TryTranslate(offset, untranslated, out var physical)) throw new BusAccessException(BusAccessError.AddressError);
+            return qmi.FlashReadConfigured && flash.ReadAvailable
                 ? flash.UnderlyingMemory.ReadByte(physical % flash.UnderlyingMemory.Size) : (byte)0xff;
         }
 
@@ -90,7 +93,12 @@ namespace Antmicro.Renode.Peripherals.Memory
         private void RefreshInstructionPage(int page)
         {
             var offset = (long)page * 4096;
-            var data = ReadBytes(offset, 4096);
+            var data = new byte[4096];
+            for(var i = 0; i < data.Length; i++)
+            {
+                try { data[i] = ReadByte(offset + i); }
+                catch(BusAccessException) { data[i] = 0xff; }
+            }
             instructionImage.WriteBytes(offset, data, 0, data.Length);
         }
 

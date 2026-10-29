@@ -5,6 +5,7 @@
 
 using System;
 using Antmicro.Renode.Core;
+using Antmicro.Renode.Peripherals.CPU;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.Timers;
 using Antmicro.Renode.Time;
@@ -44,7 +45,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         protected override void OnBeforeAccess()
         {
-            if(machine.SystemBus.TryGetCurrentCPU(out var cpu)) cpu.SyncTime();
+            if(machine.SystemBus.TryGetTransactionInitiator(out var initiator) && initiator is ICPU cpu) cpu.SyncTime();
         }
 
         protected override uint ReadRegister(long offset)

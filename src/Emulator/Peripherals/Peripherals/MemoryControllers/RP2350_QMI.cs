@@ -7,6 +7,7 @@ using System;
 using System.Collections.Generic;
 
 using Antmicro.Renode.Core;
+using Antmicro.Renode.Peripherals.CPU;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.Miscellaneous;
 using Antmicro.Renode.Peripherals.SPI;
@@ -39,6 +40,7 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
             transmit.Clear();
             receive.Clear();
             directControl = 6u << 22;
+            chipSelectOverride = 0;
             for(var window = 0; window < 2; window++)
             {
                 var index = window * 5;
@@ -53,8 +55,14 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
             NotifyConfiguration();
         }
 
+        public uint ChipSelectOverride
+        {
+            get => chipSelectOverride;
+            set { chipSelectOverride = value & 3; UpdateSelect(); NotifyConfiguration(); }
+        }
+
         public bool Available => !ResetHeld && (directControl & 1) == 0
-            && (clocks == null || clocks.SystemFrequency != 0) && !Selected && flash.ReadAvailable;
+            && (clocks == null || clocks.SystemFrequency != 0) && !Selected && chipSelectOverride == 0;
 
         public event Action ConfigurationChanged;
 
@@ -96,7 +104,7 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
 
         protected override void OnBeforeAccess()
         {
-            if(machine.SystemBus.TryGetCurrentCPU(out var cpu)) cpu.SyncTime();
+            if(machine.SystemBus.TryGetTransactionInitiator(out var initiator) && initiator is ICPU cpu) cpu.SyncTime();
         }
 
         protected override uint ReadRegister(long offset)
@@ -192,6 +200,9 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
         private void UpdateSelect()
         {
             var selected = (directControl & 4) != 0 || ((directControl & 0x40) != 0 && transferTimer.Enabled);
+            if(chipSelectOverride == 1) selected = !selected;
+            else if(chipSelectOverride == 2) selected = true;
+            else if(chipSelectOverride == 3) selected = false;
             if(!selected) EndTransaction();
             else transactionActive = true;
         }
@@ -202,7 +213,13 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
             transactionActive = false;
         }
 
-        private void NotifyConfiguration() => ConfigurationChanged?.Invoke();
+        private void NotifyConfiguration()
+        {
+            var bus = machine.GetSystemBus(this);
+            foreach(var start in new ulong[] { 0x10000000, 0x14000000, 0x1c000000 })
+                bus.SetAddressRangeLocked(new Antmicro.Renode.Core.Range(start, 0x2000000), !Available);
+            ConfigurationChanged?.Invoke();
+        }
         private bool Selected => (directControl & 0xc) != 0;
         private readonly WinbondW25QFlash flash;
         private readonly RP2350_Clocks clocks;
@@ -211,6 +228,7 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
         private readonly Queue<uint> receive = new Queue<uint>();
         private readonly uint[] memoryConfiguration = new uint[10];
         private readonly uint[] addressTranslation = new uint[8];
+        private uint chipSelectOverride;
         private uint directControl;
         private uint frame;
         private bool transactionActive;
