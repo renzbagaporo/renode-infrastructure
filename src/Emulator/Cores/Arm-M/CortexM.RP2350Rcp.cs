@@ -23,7 +23,16 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
             var target = machine.SystemBus.GetCPUs().OfType<CortexM>()
                 .SingleOrDefault(cpu => cpu.Model == "cortex-m33-rp2350" && cpu.MultiprocessingId == core);
-            return target == null ? 0u : target.tlibRp2350RcpSetSalt(salt);
+            if(target == null)
+            {
+                return 0;
+            }
+            lock(target.reset)
+            {
+                // The native writer release-publishes valid after the salt and
+                // PRNG seed. The monitor also excludes the target's reset.
+                return target.tlibRp2350RcpSetSalt(salt);
+            }
         }
 
         [Export]
@@ -32,12 +41,16 @@ namespace Antmicro.Renode.Peripherals.CPU
             foreach(var cpu in machine.SystemBus.GetCPUs().OfType<CortexM>()
                 .Where(cpu => cpu.Model == "cortex-m33-rp2350"))
             {
-                cpu.tlibRp2350RcpSetFault();
-                // NVIC input numbering starts at external IRQ 0 (exception 16).
-                // NMI is exception 2 and remains asserted until local reset.
-                if(panic == 0 || cpu != this)
+                lock(cpu.reset)
                 {
-                    cpu.nvic.OnGPIO(-14, true);
+                    // Publish the native fault and its NMI level together with
+                    // respect to local reset. No other CPU is paused here.
+                    cpu.tlibRp2350RcpSetFault();
+                    // NVIC input numbering starts at exception 16; NMI is 2.
+                    if(panic == 0 || cpu != this)
+                    {
+                        cpu.nvic.OnGPIO(-14, true);
+                    }
                 }
             }
         }

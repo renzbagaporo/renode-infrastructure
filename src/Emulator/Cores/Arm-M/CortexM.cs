@@ -88,6 +88,13 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         public override void Reset()
         {
+            // Native RCP callbacks can publish to this core while it runs.
+            // Stop execution before taking the state monitor: a callback must
+            // be able to finish before Pause waits for the CPU thread.
+            if(Model == "cortex-m33-rp2350")
+            {
+                Pause();
+            }
             lock(reset)
             {
                 var isCpuWaitSet = CpuWaitSignal.IsSet;
