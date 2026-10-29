@@ -171,14 +171,16 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             core = 0;
             var bus = machine.GetSystemBus(this);
             var secure = true;
+            var haveState = bus.TryGetCurrentContextState<CortexM.ContextState>(out var _, out var state);
+            var debugAccess = haveState && state.DebugAccess;
             if(bus.TryGetTransactionInitiator(out var initiator) && initiator is ICPU cpu)
             {
                 core = (int)(cpu.MultiprocessingId & 1);
-                cpu.SyncTime();
+                if(!debugAccess) cpu.SyncTime();
                 if(cpu is CortexM cortex && cortex.TrustZoneEnabled) secure = cortex.SecureState;
             }
-            if(bus.TryGetCurrentContextState<CortexM.ContextState>(out var _, out var state)) secure = state.AttributionSecure;
-            if(accessControl != null && accessControl.CoreIsForcedNonSecure(core)) secure = false;
+            if(haveState) secure = state.AttributionSecure;
+            if(!debugAccess && accessControl != null && accessControl.CoreIsForcedNonSecure(core)) secure = false;
             if(mirror && !secure) throw new BusAccessException(BusAccessError.CommandError);
             return mirror || !secure ? 1 : 0;
         }
