@@ -176,6 +176,21 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.AreEqual(0x4c013477, Read(0xa5));
         }
 
+        [Test]
+        public void ShouldPreserveThePhysicalResetPinAcrossPeripheralReset()
+        {
+            Wake();
+            target.OnGPIO(2, false);
+            target.Reset();
+            Wake();
+            Send(0xa5, 8);
+            Assert.AreEqual(0, target.RequestCount);
+            Assert.IsFalse(IsDriving);
+            target.OnGPIO(2, true);
+            Wake();
+            Assert.AreEqual(0x4c013477, Read(0xa5));
+        }
+
         private void Write(uint header, uint value, bool parity)
         {
             Send(header, 8);

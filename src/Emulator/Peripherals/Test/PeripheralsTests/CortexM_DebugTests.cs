@@ -114,6 +114,37 @@ namespace Antmicro.Renode.PeripheralsTests
         }
 
         [Test]
+        public void ShouldCatchResetAtTheActualResetVectorAndResumeWhenCatchIsDisabled()
+        {
+            var ram = new MappedMemory(machine, 0x2000);
+            machine.SystemBus.Register(ram, new BusPointRegistration(0x20000000));
+            ram.WriteDoubleWord(0, 0x20001000);
+            ram.WriteDoubleWord(4, 0x20000101);
+            ram.WriteWord(0x100, 0x3001);
+            ram.WriteWord(0x102, 0xe7fd);
+            cpu.InitVectorTableOffset = 0x20000000;
+            nvic.WriteDoubleWord(0xdf0, 0xa05f0003);
+            nvic.WriteDoubleWord(0xdfc, 0x01000001);
+            cpu.Reset();
+            Assert.IsTrue(cpu.HaltedByDebugger);
+            Assert.AreEqual(0x20000100, (uint)cpu.PC & ~1u);
+            Assert.AreEqual(0x20001000, (uint)cpu.GetRegister(13));
+            Assert.AreEqual(8, nvic.ReadDoubleWord(0xd30));
+            Assert.AreNotEqual(0, nvic.ReadDoubleWord(0xdf0) & 0x2000000);
+            EmulationManager.Instance.CurrentEmulation.RunFor(TimeInterval.FromMicroseconds(100));
+            Assert.AreEqual(0, cpu.ExecutedInstructions);
+            Assert.AreEqual(0x01000001, nvic.ReadDoubleWord(0xdfc));
+            nvic.WriteDoubleWord(0xdfc, 0);
+            cpu.Reset();
+            Assert.IsFalse(cpu.HaltedByDebugger);
+            Assert.AreEqual(0, nvic.ReadDoubleWord(0xdf0) & 2);
+            EmulationManager.Instance.CurrentEmulation.RunFor(TimeInterval.FromMicroseconds(100));
+            EmulationManager.Instance.CurrentEmulation.RunFor(TimeInterval.FromMicroseconds(100));
+            Assert.Greater((uint)cpu.GetRegister(0), 0,
+                $"PC={cpu.PC}, state={cpu.EmulationState}, executed={cpu.ExecutedInstructions}, halted={cpu.HaltedByDebugger}, locked={nvic.Lockup.IsSet}");
+        }
+
+        [Test]
         public void ShouldSelectTheRequestedCoreThroughItsActualMEMAP()
         {
             var nvic1 = new NVIC(machine);

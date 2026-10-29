@@ -14,6 +14,19 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
 
         public bool ExternalDebugEnabled => EnableMemoryMappedDebug && (debugControl & 1) != 0;
 
+        public bool CatchCoreReset => ExternalDebugEnabled && (debugExceptionControl & 1) != 0;
+
+        public bool HandleExternalDebugReset()
+        {
+            var catchReset = CatchCoreReset;
+            debugResetStatus = true;
+            debugRestartStatus = false;
+            debugData = 0;
+            debugFaultStatus = catchReset ? 8u : 0;
+            debugControl = (debugControl & ~2u) | (catchReset ? 2u : 0);
+            return catchReset;
+        }
+
         public void ReportExternalDebugBreakpoint()
         {
             debugFaultStatus |= 2;
@@ -38,6 +51,7 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
                 return true;
             case 0xdf4: return true; // DCRSR is write-only.
             case 0xdf8: value = debugData; return true;
+            case 0xdfc: value = debugExceptionControl; return true;
             case 0xfbc: value = 0x47702a04; return true; // Armv8-M processor debug
             case 0xfd0: value = 4; return true;
             case 0xfe0: value = 0x21; return true;
@@ -91,6 +105,7 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
                 else debugData = (uint)cpu.GetRegister(register);
                 return true;
             case 0xdf8: debugData = value; return true;
+            case 0xdfc: debugExceptionControl = value & 0x01000001; return true;
             default: return false;
             }
         }
@@ -113,7 +128,7 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             }
         }
 
-        private uint debugControl, debugData, debugFaultStatus;
+        private uint debugControl, debugData, debugFaultStatus, debugExceptionControl;
         private bool debugResetStatus, debugRestartStatus;
     }
 }

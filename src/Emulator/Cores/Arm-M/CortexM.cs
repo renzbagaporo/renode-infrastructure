@@ -100,6 +100,17 @@ namespace Antmicro.Renode.Peripherals.CPU
 
                 InnerReset();
 
+                if(nvic != null && nvic.EnableMemoryMappedDebug)
+                {
+                    var catchReset = nvic.HandleExternalDebugReset();
+                    if(catchReset)
+                    {
+                        TryInitVTOR();
+                        InitPCAndSP();
+                    }
+                    HaltedByDebugger = catchReset;
+                }
+
                 IsHalted = isCpuWaitSet;
             }
         }

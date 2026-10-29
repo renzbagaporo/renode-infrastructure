@@ -21,9 +21,6 @@ namespace Antmicro.Renode.Peripherals.CPU
         public virtual void Reset()
         {
             state = State.Dormant;
-            clock = false;
-            data = true;
-            resetAsserted = false;
             consecutiveOnes = 0;
             alertPosition = 0;
             activationPosition = 0;
@@ -255,7 +252,8 @@ namespace Antmicro.Renode.Peripherals.CPU
         private enum State { Dormant, Activation, Lockout, Reset, Request, RequestTurnaround, Acknowledgement, ReadData, ReadTurnaround, WriteTurnaround, WriteData }
         private static readonly uint[] SelectionAlert = { 0x19bc0ea2, 0xe3ddafe9, 0x86852d95, 0x6209f392 };
         private State state;
-        private bool clock, data, output, outputEnabled, resetAsserted, accessPort, read, requireIdentification, targetSelection;
+        private bool data = true;
+        private bool clock, output, outputEnabled, resetAsserted, accessPort, read, requireIdentification, targetSelection;
         private int consecutiveOnes, alertPosition, activationPosition, bitCount, resetSequencePosition;
         private uint shift, transferValue, resetSequence;
         private byte address;

@@ -832,7 +832,7 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
         public void Reset()
         {
             debugResetStatus = true;
-            debugFaultStatus = 0;
+            debugFaultStatus = CatchCoreReset ? 8u : 0;
             RegisterCollection.Reset();
             InitInterrupts();
             for(var i = 0; i < priorities.Length; i++)
