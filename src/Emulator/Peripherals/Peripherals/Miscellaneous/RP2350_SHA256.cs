@@ -53,6 +53,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         protected override void OnBeforeAccess()
         {
+            if(machine.SystemBus.TryGetCurrentContextState<CortexM.ContextState>(out var _, out var state) && state.DebugAccess) return;
             if(machine.SystemBus.TryGetTransactionInitiator(out var initiator) && initiator is ICPU cpu) cpu.SyncTime();
         }
 
