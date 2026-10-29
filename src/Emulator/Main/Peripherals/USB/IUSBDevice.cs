@@ -7,6 +7,7 @@
 using System;
 using System.Collections.Generic;
 using System.Threading;
+using System.Threading.Tasks;
 
 using Antmicro.Renode.Extensions.Utilities.USB;
 using Antmicro.Renode.Peripherals;
@@ -161,6 +162,15 @@ public interface IUSBPipeSetup : IUSBPipeRead, IUSBPipeWrite
 public interface IUSBPipeWrite
 {
     void Write(byte[] data);
+
+    // Complete only when the device accepts the transfer. Controller models
+    // that can NAK must override this method and cancel unaccepted packets.
+    Task WriteAsync(byte[] data, CancellationToken token = default)
+    {
+        token.ThrowIfCancellationRequested();
+        Write(data);
+        return Task.CompletedTask;
+    }
 }
 
 public interface IUSBPipeRead

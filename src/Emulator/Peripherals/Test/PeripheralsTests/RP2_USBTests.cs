@@ -525,6 +525,75 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.That(packet, Is.EqualTo(new byte[] { 0x42 }));
         }
 
+        [Test]
+        public void ShouldCompleteAsyncOutputOnlyAfterFirmwareAcceptsEveryPacket()
+        {
+            var data = new byte[128];
+            for(var i = 0; i < data.Length; i++) data[i] = (byte)i;
+            var write = connection.ConnectEndpointWrite(0).WriteAsync(data, CancellationToken.None);
+            Assert.That(write.IsCompleted, Is.False);
+            dpram.WriteDoubleWord(0x84, 0x440);
+            Assert.That(write.IsCompleted, Is.False);
+            Assert.That(dpram.ReadByte(0x100), Is.Zero);
+            dpram.WriteDoubleWord(0x84, 0x440);
+            Assert.That(write.Wait(TimeSpan.FromSeconds(1)), Is.True);
+            Assert.That(dpram.ReadByte(0x100), Is.EqualTo(64));
+        }
+
+        [Test]
+        public void ShouldCancelAsyncOutputBeforeAnUnavailableBufferIsArmed()
+        {
+            using(var cancellation = new CancellationTokenSource())
+            {
+                var write = connection.ConnectEndpointWrite(0).WriteAsync(new byte[] { 0xa5 }, cancellation.Token);
+                Assert.That(write.IsCompleted, Is.False);
+                cancellation.Cancel();
+                Assert.That(SpinWait.SpinUntil(() => write.IsCanceled, 1000), Is.True);
+                dpram.WriteDoubleWord(0x84, 0x440);
+                Assert.That(dpram.ReadByte(0x100), Is.Zero);
+                Assert.That(dpram.ReadWord(0x84), Is.EqualTo(0x440));
+            }
+        }
+
+        [Test]
+        public void ShouldCancelOnlyTheUnacceptedSuffixOfAsyncOutput()
+        {
+            using(var cancellation = new CancellationTokenSource())
+            {
+                var data = new byte[128];
+                for(var i = 0; i < data.Length; i++) data[i] = (byte)i;
+                var write = connection.ConnectEndpointWrite(0).WriteAsync(data, cancellation.Token);
+                dpram.WriteDoubleWord(0x84, 0x440);
+                Assert.That(dpram.ReadWord(0x84), Is.EqualTo(0x8040));
+                cancellation.Cancel();
+                Assert.That(SpinWait.SpinUntil(() => write.IsCanceled, 1000), Is.True);
+                dpram.WriteDoubleWord(0x84, 0x440);
+                Assert.That(dpram.ReadByte(0x100), Is.Zero);
+                Assert.That(dpram.ReadWord(0x84), Is.EqualTo(0x440));
+            }
+        }
+
+        [Test]
+        public void ShouldCancelAsyncOutputWhenItsConnectionIsDisposed()
+        {
+            var write = connection.ConnectEndpointWrite(0).WriteAsync(new byte[] { 0xa5 });
+            Assert.That(write.IsCompleted, Is.False);
+            connection.Dispose();
+            Assert.That(SpinWait.SpinUntil(() => write.IsCanceled, 1000), Is.True);
+            connection = usb.ConnectUSB();
+            dpram.WriteDoubleWord(0x84, 0x440);
+            Assert.That(dpram.ReadByte(0x100), Is.Zero);
+            Assert.That(dpram.ReadWord(0x84), Is.EqualTo(0x440));
+        }
+
+        [Test]
+        public void ShouldNotReportSuccessfulAsyncOutputWhileResetHeld()
+        {
+            usb.ResetHeld = true;
+            var write = connection.ConnectEndpointWrite(0).WriteAsync(new byte[] { 0xa5 }, CancellationToken.None);
+            Assert.That(write.IsCompletedSuccessfully, Is.False);
+        }
+
         private void AdvanceMicroseconds(ulong duration) => ((BaseClockSource)machine.ClockSource).Advance(TimeInterval.FromMicroseconds(duration));
 
         private sealed class ControlledClockSource : IRP2ClockSource

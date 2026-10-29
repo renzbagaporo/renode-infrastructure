@@ -124,6 +124,8 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
                 lock(transferLock)
                 {
                     transfers = pendingTransfers.Values.Where(t => t.Connection == conn).ToArray();
+                    deviceMetadata.Remove(conn);
+                    endpointZeroPacketSizes.Remove(conn);
                     foreach(var transfer in transfers)
                     {
                         pendingTransfers.Remove(transfer.Header.SequenceNumber);
@@ -353,33 +355,25 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
                         return;
                     }
                     transfer.Invoke(() => ep.SetupPacketWrite(transfer.Setup));
-                    if(transfer.Setup.Direction == Direction.HostToDevice)
+                    if(transfer.Setup.Count == 0 || transfer.Setup.Direction == Direction.HostToDevice)
                     {
                         // A zero-count host-to-device setup has no OUT data stage;
                         // its status stage is an IN zero-length packet.
                         if(transfer.Setup.Count != 0)
                         {
-                            transfer.Invoke(() => ep.Write(transfer.Payload));
+                            WritePacket(transfer, ep, transfer.Payload);
                         }
                         ReadPacket(transfer, ep);
                     }
                     else
                     {
-                        var response = new List<byte>();
                         var length = Math.Min(transfer.Setup.Count, transfer.Request.TransferBufferLength);
                         endpointZeroPacketSizes.TryGetValue(transfer.Connection, out var packetSize);
                         if(packetSize == 0) packetSize = 64;
-                        while(response.Count < length)
-                        {
-                            var chunk = ReadPacket(transfer, ep);
-                            response.AddRange(chunk.Take((int)length - response.Count));
-                            if(chunk.Length % packetSize != 0 || chunk.Length == 0)
-                            {
-                                break;
-                            }
-                        }
-                        transfer.Invoke(() => ep.Write(Array.Empty<byte>()));
-                        data = response.ToArray();
+                        var (response, status) = ReadData(transfer, ep, (int)length, packetSize);
+                        WritePacket(transfer, ep, Array.Empty<byte>());
+                        CompleteTransfer(transfer, response, status);
+                        return;
                     }
                 }
                 else if(header.Direction == URBDirection.In)
@@ -390,12 +384,15 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
                         CompleteTransfer(transfer, status: NoEntry);
                         return;
                     }
-                    data = ReadPacket(transfer, ep);
-                    if(data.Length > transfer.Request.TransferBufferLength)
+                    var descriptor = GetEndpointDescriptor(transfer.Connection, (byte)header.EndpointNumber, USB.EndpointDirection.In);
+                    if(!descriptor.HasValue || (descriptor.Value.MaxPacketSize & 0x7ff) == 0)
                     {
-                        CompleteTransfer(transfer, status: Overflow);
+                        CompleteTransfer(transfer, status: NoEntry);
                         return;
                     }
+                    var (response, status) = ReadData(transfer, ep, checked((int)transfer.Request.TransferBufferLength), descriptor.Value.MaxPacketSize & 0x7ff);
+                    CompleteTransfer(transfer, response, status);
+                    return;
                 }
                 else
                 {
@@ -405,13 +402,16 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
                         CompleteTransfer(transfer, status: NoEntry);
                         return;
                     }
-                    transfer.Invoke(() => ep.Write(transfer.Payload));
+                    WritePacket(transfer, ep, transfer.Payload);
                 }
+                transfer.Invoke(() => UpdateControlState(transfer));
                 CompleteTransfer(transfer, data);
             }
             catch(OperationCanceledException)
             {
-                // UNLINK/reset owns completion and suppresses this submission's reply.
+                // UNLINK/reset removes the request first. Device-side cancellation
+                // still completes a submission that remains outstanding.
+                CompleteTransfer(transfer, status: ConnectionReset);
             }
             catch(Exception e)
             {
@@ -421,6 +421,71 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
             finally
             {
                 transfer.Dispose();
+            }
+        }
+
+        private void WritePacket(PendingTransfer transfer, IUSBPipeWrite pipe, byte[] data)
+        {
+            var completion = transfer.Invoke(() => pipe.WriteAsync(data, transfer.Token));
+            completion.GetAwaiter().GetResult();
+            transfer.Token.ThrowIfCancellationRequested();
+        }
+
+        private (byte[], int) ReadData(PendingTransfer transfer, IUSBPipeRead pipe, int length, int maximumPacketSize)
+        {
+            var response = new List<byte>();
+            do
+            {
+                var packet = ReadPacket(transfer, pipe);
+                if(packet.Length > maximumPacketSize || packet.Length > length - response.Count)
+                {
+                    response.AddRange(packet.Take(length - response.Count));
+                    return (response.ToArray(), Overflow);
+                }
+                response.AddRange(packet);
+                if(packet.Length < maximumPacketSize)
+                {
+                    var status = response.Count < length && (transfer.Header.FlagsOrStatus & ShortNotOkFlag) != 0 ? RemoteInputOutputError : 0;
+                    return (response.ToArray(), status);
+                }
+            }
+            while(response.Count < length);
+            return (response.ToArray(), 0);
+        }
+
+        private void UpdateControlState(PendingTransfer transfer)
+        {
+            if(transfer.Header.EndpointNumber != 0 || transfer.Setup.Type != PacketType.Standard) return;
+            lock(transferLock)
+            {
+                if(!deviceMetadata.TryGetValue(transfer.Connection, out var metadata)) return;
+                if(transfer.Setup.Recipient == PacketRecipient.Device && transfer.Setup.Request == (byte)StandardRequest.SetConfiguration)
+                {
+                    metadata.Configuration = (byte)transfer.Setup.Value;
+                    metadata.AlternateSettings.Clear();
+                }
+                else if(transfer.Setup.Recipient == PacketRecipient.Interface && transfer.Setup.Request == (byte)StandardRequest.SetInterface)
+                {
+                    metadata.AlternateSettings[(byte)transfer.Setup.Index] = (byte)transfer.Setup.Value;
+                }
+            }
+        }
+
+        private USB.EndpointDescriptor? GetEndpointDescriptor(IUSBConnection connection, byte endpoint, USB.EndpointDirection direction)
+        {
+            lock(transferLock)
+            {
+                if(!deviceMetadata.TryGetValue(connection, out var metadata)) return null;
+                foreach(var entry in metadata.Endpoints)
+                {
+                    metadata.AlternateSettings.TryGetValue(entry.Interface, out var alternate);
+                    if(entry.Configuration == metadata.Configuration && entry.Alternate == alternate
+                        && entry.Descriptor.EndpointNumber == endpoint && entry.Descriptor.Direction == direction)
+                    {
+                        return entry.Descriptor;
+                    }
+                }
+                return null;
             }
         }
 
@@ -511,7 +576,7 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
             };
             var reply = new URBReply
             {
-                ActualLength = status != 0 ? 0 : data == null ? req.TransferBufferLength : (uint)data.Count(),
+                ActualLength = data != null ? (uint)data.Count() : status == 0 ? req.TransferBufferLength : 0,
                 NumberOfPackets = uint.MaxValue
             };
             var result = Packet.Encode(header).Concat(Packet.Encode(reply));
@@ -530,13 +595,27 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
             endpointZeroPacketSizes[conn] = deviceDescriptor.MaximumPacketSize;
             var interfaceDescriptors = new List<USB.InterfaceDescriptor>();
 
-            if(includeInterfaces)
+            var metadata = new DeviceMetadata();
+            for(var i = 0; i < deviceDescriptor.NumberOfConfigurations; i++)
             {
-                for(var i = 0; i < deviceDescriptor.NumberOfConfigurations; i++)
+                var (configuration, descs) = ep0.ReadConfigurationDescriptorBlocking((byte)i, cancellationToken.Token);
+                foreach(var (iface, children) in USB.IDescriptor.EnumerateInterfaceDescriptors(descs))
                 {
-                    var (_, descs) = ep0.ReadConfigurationDescriptorBlocking((byte)i, cancellationToken.Token);
-                    interfaceDescriptors.AddRange(USB.IDescriptor.EnumerateInterfaceDescriptors(descs).Select(v => v.Item1));
+                    if(i == 0 && iface.AlternateSetting == 0) interfaceDescriptors.Add(iface);
+                    foreach(var endpoint in children.OfType<USB.EndpointDescriptor>())
+                    {
+                        metadata.Endpoints.Add((configuration.ConfigurationValue, iface.Number, iface.AlternateSetting, endpoint));
+                    }
                 }
+            }
+            lock(transferLock)
+            {
+                if(deviceMetadata.TryGetValue(conn, out var previous))
+                {
+                    metadata.Configuration = previous.Configuration;
+                    foreach(var setting in previous.AlternateSettings) metadata.AlternateSettings.Add(setting.Key, setting.Value);
+                }
+                deviceMetadata[conn] = metadata;
             }
 
             var devDescriptor = new USBIP.DeviceDescriptor
@@ -564,7 +643,7 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
 
             var result = Packet.Encode(devDescriptor).AsEnumerable();
 
-            foreach(var iface in interfaceDescriptors)
+            foreach(var iface in interfaceDescriptors.Where(_ => includeInterfaces))
             {
                 var intDescriptor = new USBIP.InterfaceDescriptor
                 {
@@ -654,6 +733,14 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
             return (success, response);
         }
 
+        private sealed class DeviceMetadata
+        {
+            public byte Configuration;
+            public readonly Dictionary<byte, byte> AlternateSettings = new Dictionary<byte, byte>();
+            public readonly List<(byte Configuration, byte Interface, byte Alternate, USB.EndpointDescriptor Descriptor)> Endpoints
+                = new List<(byte, byte, byte, USB.EndpointDescriptor)>();
+        }
+
         private sealed class PendingTransfer : IDisposable
         {
             public PendingTransfer(URBHeader header, URBRequest request, SetupPacket setup, byte[] payload, IUSBConnection connection, int generation)
@@ -711,7 +798,10 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
         private readonly Dictionary<(IUSBConnection, uint, URBDirection), Task> endpointTasks = new Dictionary<(IUSBConnection, uint, URBDirection), Task>();
         private readonly Dictionary<IUSBDevice, USBSpeed> deviceSpeeds = new Dictionary<IUSBDevice, USBSpeed>();
         private readonly Dictionary<IUSBConnection, byte> endpointZeroPacketSizes = new Dictionary<IUSBConnection, byte>();
+        private readonly Dictionary<IUSBConnection, DeviceMetadata> deviceMetadata = new Dictionary<IUSBConnection, DeviceMetadata>();
         private int generation;
+        private const uint ShortNotOkFlag = 1;
+        private const int RemoteInputOutputError = -121;
         private const int ConnectionReset = -104;
         private const int NoEntry = -2;
         private const int NoDevice = -19;

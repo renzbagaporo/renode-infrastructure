@@ -16,6 +16,8 @@ using System.Threading.Tasks;
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure;
 using Antmicro.Renode.Core.USB;
+using Antmicro.Renode.Peripherals;
+using Antmicro.Renode.Peripherals.USB;
 using Antmicro.Renode.Extensions.Utilities.USBIP;
 
 using USB = Antmicro.Renode.Extensions.Utilities.USB;
@@ -41,7 +43,12 @@ namespace Antmicro.Renode.PeripheralsTests
             server.Register(device, new NumberRegistrationPoint<int>(0));
             var provider = GetField<SocketServerProvider>(server, "server");
             replies = GetField<ConcurrentQueue<byte[]>>(provider, "queue");
+            CacheDescriptors();
             SetURBState();
+            Submit(0, URBDirection.Out, 0, 0, setup: new SetupPacket { Request = 9, Value = 1 });
+            AssertReply(0, URBCommand.URBReply);
+            device.Connection.Setup.SuccessfulReads = 0;
+            device.Connection.Setup.Writes.Clear();
         }
 
         [TearDown]
@@ -171,6 +178,150 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.That(Packet.Decode<DeviceDescriptor>(descriptor.ToArray()).Speed, Is.EqualTo(expected));
         }
 
+        [Test]
+        public void ShouldAccumulateBulkPacketsUntilShortPacket()
+        {
+            Submit(1, URBDirection.In, 1, 128);
+            device.Connection.Input.Push(Enumerable.Repeat((byte)0x11, 64).ToArray());
+            device.Connection.Input.Push(Enumerable.Repeat((byte)0x22, 16).ToArray());
+            Assert.That(AssertReply(1, URBCommand.URBReply).Skip(48),
+                Is.EqualTo(Enumerable.Repeat((byte)0x11, 64).Concat(Enumerable.Repeat((byte)0x22, 16))));
+        }
+
+        [Test]
+        public void ShouldUseDescriptorPacketSizeForBulkTermination()
+        {
+            device.Connection.Setup.EndpointPacketSize = 8;
+            CacheDescriptors();
+            Submit(1, URBDirection.In, 1, 32);
+            device.Connection.Input.Push(new byte[8]);
+            device.Connection.Input.Push(new byte[3]);
+            Assert.That(AssertReply(1, URBCommand.URBReply).Length, Is.EqualTo(48 + 11));
+        }
+
+        [Test]
+        public void ShouldWaitForZeroLengthPacketAfterFullBulkPacket()
+        {
+            Submit(1, URBDirection.In, 1, 128);
+            device.Connection.Input.Push(new byte[64]);
+            Assert.That(device.Connection.Input.WaitingAfterPacket.Wait(Timeout), Is.True);
+            Assert.That(replies.IsEmpty, Is.True);
+            device.Connection.Input.Push(Array.Empty<byte>());
+            Assert.That(AssertReply(1, URBCommand.URBReply).Length, Is.EqualTo(48 + 64));
+        }
+
+        [Test]
+        public void ShouldReturnShortNotOkStatusWithPartialData()
+        {
+            Feed(new URBHeader { Command = URBCommand.URBRequest, SequenceNumber = 1, BusId = 1,
+                Direction = URBDirection.In, EndpointNumber = 1, FlagsOrStatus = 0x201 },
+                new URBRequest { TransferBufferLength = 128 });
+            device.Connection.Input.Push(new byte[16]);
+            var reply = AssertReply(1, URBCommand.URBReply);
+            Assert.That(unchecked((int)Packet.Decode<URBHeader>(reply).FlagsOrStatus), Is.EqualTo(-121));
+            Assert.That(Packet.Decode<URBReply>(reply, 24).ActualLength, Is.EqualTo(16));
+            Assert.That(reply.Length, Is.EqualTo(48 + 16));
+        }
+
+        [Test]
+        public void ShouldUnlinkPartiallyReadBulkWithoutStealingTheNextPacket()
+        {
+            Submit(1, URBDirection.In, 1, 128);
+            device.Connection.Input.Push(new byte[64]);
+            Assert.That(device.Connection.Input.WaitingAfterPacket.Wait(Timeout), Is.True);
+            Feed(new URBHeader { Command = URBCommand.Unlink, SequenceNumber = 2, FlagsOrStatus = 1 }, default(URBRequest));
+            AssertReply(2, URBCommand.UnlinkReply);
+            Submit(3, URBDirection.In, 1, 64);
+            device.Connection.Input.Push(new byte[] { 0x33 });
+            Assert.That(AssertReply(3, URBCommand.URBReply).Skip(48), Is.EqualTo(new byte[] { 0x33 }));
+        }
+
+        [Test]
+        public void ShouldUseInputStatusWhenZeroLengthSetupSaysDeviceToHost()
+        {
+            Submit(1, URBDirection.In, 0, 0,
+                setup: new SetupPacket { Direction = USBDirection.DeviceToHost, Request = 0x22 });
+            AssertReply(1, URBCommand.URBReply);
+            Assert.That(device.Connection.Setup.SuccessfulReads, Is.EqualTo(1));
+            Assert.That(device.Connection.Setup.Writes.IsEmpty, Is.True);
+        }
+
+        [Test]
+        public void ShouldCancelUnacceptedRp2OutputBeforeFirmwareArmsBuffer()
+        {
+            using(var machine = new Machine())
+            {
+                var dpram = new RP2_USB_DPRAM();
+                var usb = new RP2_USB(machine, dpram, new TestClocks());
+                usb.WriteDoubleWord(0x40, 1);
+                usb.WriteDoubleWord(0x4c, 0x20010000);
+                dpram.WriteDoubleWord(0x14, 0xa0000180); // EP2 OUT, one 64-byte buffer.
+                var recording = new RecordingDevice(usb);
+                server.Register(recording, new NumberRegistrationPoint<int>(1));
+                Feed(new URBHeader { Command = URBCommand.URBRequest, SequenceNumber = 1, BusId = 1,
+                    DeviceId = 1, Direction = URBDirection.Out, EndpointNumber = 2 },
+                    new URBRequest { TransferBufferLength = 1 }, new byte[] { 0xa5 });
+                Assert.That(recording.WriteStarted.Wait(Timeout), Is.True);
+                Feed(new URBHeader { Command = URBCommand.Unlink, SequenceNumber = 2, FlagsOrStatus = 1 }, default(URBRequest));
+                AssertReply(2, URBCommand.UnlinkReply);
+                dpram.WriteDoubleWord(0x94, 0x440);
+                Assert.That(dpram.ReadByte(0x180), Is.Zero);
+                Assert.That(dpram.ReadWord(0x94), Is.EqualTo(0x440));
+                Assert.That(replies.IsEmpty, Is.True);
+                server.Unregister(recording);
+            }
+        }
+
+        private void CacheDescriptors()
+        {
+            var descriptors = (IEnumerable<byte>)typeof(USBIPServer).GetMethod("GenerateDeviceDescriptor",
+                BindingFlags.Instance | BindingFlags.NonPublic).Invoke(server, new object[] { device, 0u, true });
+            descriptors.ToArray();
+        }
+
+        private sealed class TestClocks : IRP2ClockSource
+        {
+            public ulong SystemFrequency => 125000000;
+            public ulong PeripheralFrequency => SystemFrequency;
+            public ulong USBFrequency => 48000000;
+            public event Action ClockChanged { add { } remove { } }
+        }
+
+        private sealed class RecordingDevice : IUSBDevice
+        {
+            public RecordingDevice(IUSBDevice device) { this.device = device; }
+            public IUSBConnection ConnectUSB() => new RecordingConnection(device.ConnectUSB(), WriteStarted);
+            public byte Address => device.Address;
+            public void Reset() => device.Reset();
+            public readonly ManualResetEventSlim WriteStarted = new ManualResetEventSlim();
+            private readonly IUSBDevice device;
+        }
+
+        private sealed class RecordingConnection : IUSBConnection
+        {
+            public RecordingConnection(IUSBConnection connection, ManualResetEventSlim started) { this.connection = connection; this.started = started; }
+            public IUSBPipeSetup ConnectEndpointSetup(byte endpoint) => connection.ConnectEndpointSetup(endpoint);
+            public IUSBPipeRead ConnectEndpointRead(byte endpoint) => connection.ConnectEndpointRead(endpoint);
+            public IUSBPipeWrite ConnectEndpointWrite(byte endpoint) => new RecordingWrite(connection.ConnectEndpointWrite(endpoint), started);
+            public void Dispose() => connection.Dispose();
+            private readonly IUSBConnection connection;
+            private readonly ManualResetEventSlim started;
+        }
+
+        private sealed class RecordingWrite : IUSBPipeWrite
+        {
+            public RecordingWrite(IUSBPipeWrite pipe, ManualResetEventSlim started) { this.pipe = pipe; this.started = started; }
+            public void Write(byte[] data) { pipe.Write(data); started.Set(); }
+            public Task WriteAsync(byte[] data, CancellationToken token = default)
+            {
+                var task = pipe.WriteAsync(data, token);
+                started.Set();
+                return task;
+            }
+            private readonly IUSBPipeWrite pipe;
+            private readonly ManualResetEventSlim started;
+        }
+
         private Task Submit(uint sequence, URBDirection direction, uint endpoint, uint length, byte[] data = null, SetupPacket? setup = null)
         {
             return Feed(new URBHeader { Command = URBCommand.URBRequest, SequenceNumber = sequence, BusId = 1,
@@ -241,13 +392,23 @@ namespace Antmicro.Renode.PeripheralsTests
             public bool TryRead(out byte[] data)
             {
                 ReadAttempted.Set();
-                if(!packets.TryDequeue(out data)) return false;
+                if(!packets.TryDequeue(out data))
+                {
+                    if(SuccessfulReads != 0) WaitingAfterPacket.Set();
+                    return false;
+                }
                 Interlocked.Increment(ref SuccessfulReads);
                 return true;
             }
             public void Write(byte[] data) => Writes.Enqueue(data);
             public void SetupPacketWrite(SetupPacket setup) => Push(SetupResponse);
-            public void ReadDeviceDescriptor(Action<USB.DeviceDescriptor> callback) => callback(new USB.DeviceDescriptor { MaximumPacketSize = 64 });
+            public void ReadDeviceDescriptor(Action<USB.DeviceDescriptor> callback) => callback(new USB.DeviceDescriptor { MaximumPacketSize = 64, NumberOfConfigurations = 1 });
+            public void ReadConfigurationDescriptor(byte index, Action<(USB.ConfigurationDescriptor, IEnumerable<USB.IDescriptor>)> callback)
+                => callback((new USB.ConfigurationDescriptor { ConfigurationValue = 1 }, new USB.IDescriptor[] {
+                    new USB.InterfaceDescriptor { Number = 0 },
+                    new USB.EndpointDescriptor { EndpointNumber = 1, Direction = USB.EndpointDirection.In, Attributes = 2, MaxPacketSize = EndpointPacketSize },
+                    new USB.EndpointDescriptor { EndpointNumber = 2, Direction = USB.EndpointDirection.Out, Attributes = 2, MaxPacketSize = EndpointPacketSize }
+                }));
             public void SetupRead(SetupPacket setup, Action<byte[]> callback)
             {
                 SetupPacketWrite(setup);
@@ -262,7 +423,9 @@ namespace Antmicro.Renode.PeripheralsTests
             }
             public event Action NewPacket;
             public byte[] SetupResponse = Array.Empty<byte>();
+            public ushort EndpointPacketSize = 64;
             public int SuccessfulReads;
+            public readonly ManualResetEventSlim WaitingAfterPacket = new ManualResetEventSlim();
             public readonly ManualResetEventSlim ReadAttempted = new ManualResetEventSlim();
             public readonly ConcurrentQueue<byte[]> Writes = new ConcurrentQueue<byte[]>();
             private readonly ConcurrentQueue<byte[]> packets = new ConcurrentQueue<byte[]>();

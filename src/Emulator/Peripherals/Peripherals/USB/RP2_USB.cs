@@ -5,7 +5,9 @@
 
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
+using System.Threading.Tasks;
 
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.USB;
@@ -472,6 +474,7 @@ namespace Antmicro.Renode.Peripherals.USB
 
             public void Reset()
             {
+                foreach(var pending in pendingWrites) pending.Completion.TrySetCanceled();
                 pendingWrites.Clear();
                 parent.pendingInputNotifications &= ~(1u << number);
             }
@@ -509,34 +512,47 @@ namespace Antmicro.Renode.Peripherals.USB
                 }
             }
 
-            public void Write(byte[] data, Connection owner)
+            public void Write(byte[] data, Connection owner) => _ = WriteAsync(data, owner, CancellationToken.None);
+
+            public async Task WriteAsync(byte[] data, Connection owner, CancellationToken token)
             {
-                try
+                var pending = new PendingWrite(owner, (byte[])data.Clone());
+                using(token.Register(() =>
                 {
-                    lock(parent.dpram)
+                    try
                     {
-                        if(parent.ResetHeld || !parent.PhysicalConnection) return;
-                        // IUSBPipeWrite has no NAK result. Queue host-side pending
-                        // transfers while clocks are stopped; the SIE accepts them
-                        // only when clocking and buffer ownership allow completion.
-                        // Non-isochronous full-speed endpoints carry at most 64 bytes
-                        // per token. Preserve the zero-length status packet as well.
-                        var offset = 0;
-                        do
+                        lock(parent.dpram)
                         {
-                            var count = Math.Min(64, data.Length - offset);
-                            var packet = new byte[count];
-                            Array.Copy(data, offset, packet, 0, count);
-                            pendingWrites.Enqueue(new PendingWrite(owner, packet));
-                            offset += count;
+                            pending.Completion.TrySetCanceled(token);
+                            BufferReady();
                         }
-                        while(offset < data.Length);
-                        BufferReady();
                     }
-                }
-                finally
+                    finally
+                    {
+                        parent.PublishPending();
+                    }
+                }))
                 {
-                    parent.PublishPending();
+                    try
+                    {
+                        lock(parent.dpram)
+                        {
+                            if(owner.Disposed || parent.ResetHeld || !parent.PhysicalConnection)
+                            {
+                                pending.Completion.TrySetCanceled();
+                            }
+                            else if(!pending.Completion.Task.IsCompleted)
+                            {
+                                pendingWrites.Enqueue(pending);
+                                BufferReady();
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        parent.PublishPending();
+                    }
+                    await pending.Completion.Task.ConfigureAwait(false);
                 }
             }
 
@@ -551,21 +567,35 @@ namespace Antmicro.Renode.Peripherals.USB
                     processingBuffers = true;
                     try
                     {
-                        while(pendingWrites.Count != 0 && parent.TryGetBuffer(number, false, out var buffer))
+                        while(pendingWrites.Count != 0)
                         {
-                            var pending = pendingWrites.Dequeue();
-                            if(pending.Owner.Disposed) continue;
-                            var data = pending.Data;
+                            var pending = pendingWrites.Peek();
+                            if(pending.Owner.Disposed || pending.Completion.Task.IsCompleted)
+                            {
+                                pending.Completion.TrySetCanceled();
+                                pendingWrites.Dequeue();
+                                continue;
+                            }
+                            if(!parent.TryGetBuffer(number, false, out var buffer)) break;
+                            var count = Math.Min(64, pending.Data.Length - pending.Offset);
                             var capacity = buffer.Control & BufferLengthMask;
-                            if(data.Length > capacity)
+                            if(count > capacity)
                             {
                                 parent.sieStatus |= 1u << 26;
                                 parent.UpdateInterrupts();
                                 parent.Log(LogLevel.Warning, "USB OUT packet exceeds endpoint {0} buffer capacity", number);
+                                pending.Completion.TrySetException(new InvalidOperationException("USB OUT packet exceeds buffer capacity"));
+                                pendingWrites.Dequeue();
                                 continue;
                             }
-                            parent.dpram.WriteBytes(buffer.Address, data);
-                            parent.CompleteBuffer(buffer, false, data.Length);
+                            parent.dpram.WriteBytes(buffer.Address, pending.Data.Skip(pending.Offset).Take(count).ToArray());
+                            parent.CompleteBuffer(buffer, false, count);
+                            pending.Offset += count;
+                            if(pending.Offset == pending.Data.Length)
+                            {
+                                pendingWrites.Dequeue();
+                                pending.Completion.TrySetResult(true);
+                            }
                         }
                         if(parent.TryGetBuffer(number, true, out var input) && (input.Control & BufferFull) != 0)
                         {
@@ -586,6 +616,7 @@ namespace Antmicro.Renode.Peripherals.USB
                 {
                     var pending = pendingWrites.Dequeue();
                     if(pending.Owner != owner) pendingWrites.Enqueue(pending);
+                    else pending.Completion.TrySetCanceled();
                 }
             }
 
@@ -597,7 +628,7 @@ namespace Antmicro.Renode.Peripherals.USB
             private readonly int number;
             private readonly Queue<PendingWrite> pendingWrites = new Queue<PendingWrite>();
 
-            private readonly struct PendingWrite
+            private sealed class PendingWrite
             {
                 public PendingWrite(Connection owner, byte[] data)
                 {
@@ -607,6 +638,8 @@ namespace Antmicro.Renode.Peripherals.USB
 
                 public readonly Connection Owner;
                 public readonly byte[] Data;
+                public int Offset;
+                public readonly TaskCompletionSource<bool> Completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
             }
             private bool processingBuffers;
         }
@@ -705,6 +738,13 @@ namespace Antmicro.Renode.Peripherals.USB
                     {
                         owner.parent.PublishPending();
                     }
+                }
+
+                public Task WriteAsync(byte[] data, CancellationToken token = default)
+                {
+                    // The endpoint owns cancellation and completion under the DPRAM
+                    // monitor; no transfer can complete just by entering its queue.
+                    return endpoint.WriteAsync(data, owner, token);
                 }
 
                 public void SetupPacketWrite(SetupPacket packet)
