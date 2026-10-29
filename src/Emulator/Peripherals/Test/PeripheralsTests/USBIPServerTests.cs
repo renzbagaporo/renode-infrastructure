@@ -196,7 +196,12 @@ namespace Antmicro.Renode.PeripheralsTests
         public void ShouldUseDescriptorPacketSizeForBulkTermination()
         {
             device.Connection.Setup.EndpointPacketSize = 8;
+            device.SetConnection(false);
+            device.SetConnection(true);
             CacheDescriptors();
+            SetURBState();
+            Submit(0, URBDirection.Out, 0, 0, setup: new SetupPacket { Request = 9, Value = 1 });
+            AssertReply(0, URBCommand.URBReply);
             Submit(1, URBDirection.In, 1, 32);
             device.Connection.Input.Push(new byte[8]);
             device.Connection.Input.Push(new byte[3]);
@@ -400,6 +405,8 @@ namespace Antmicro.Renode.PeripheralsTests
         [Test]
         public void ShouldCancelDescriptorReadOnUnplugWithoutStealingReimportData()
         {
+            device.SetConnection(false);
+            device.SetConnection(true);
             server.Reset();
             server.Run();
             var provider = GetField<SocketServerProvider>(server, "server");
@@ -449,21 +456,73 @@ namespace Antmicro.Renode.PeripheralsTests
         }
 
         [Test]
-        public void ShouldCancelDiscoveryWhenClientClosesBeforeDescriptorsArrive()
+        public void ShouldFinishPhysicalDiscoveryAcrossClientRetries()
         {
+            // Start a fresh physical incarnation; the fixture's descriptors
+            // have already been read during SetUp.
+            device.SetConnection(false);
+            device.SetConnection(true);
             server.Reset();
             server.Run();
             var provider = GetField<SocketServerProvider>(server, "server");
             device.Connection.Setup.HoldDescriptors = true;
             device.Connection.Setup.DescriptorRequested.Reset();
+            var count = device.Connection.Setup.DescriptorRequests;
             using(var first = new TcpClient())
             {
                 first.Connect(IPAddress.Loopback, provider.Port.Value);
                 SendImport(first.GetStream());
                 Assert.That(device.Connection.Setup.DescriptorRequested.Wait(Timeout), Is.True);
             }
+            using(var second = new TcpClient())
+            {
+                second.ReceiveTimeout = Timeout;
+                second.Connect(IPAddress.Loopback, provider.Port.Value);
+                SendImport(second.GetStream());
+                Assert.That(SpinWait.SpinUntil(() => GetField<object>(server, "state").ToString() == "WaitForResponse", Timeout), Is.True);
+                Assert.That(device.Connection.Setup.DescriptorRequests, Is.EqualTo(count + 1),
+                    "A new TCP client must share physical enumeration rather than issue a competing SETUP");
+                device.Connection.Setup.HoldDescriptors = false;
+                device.Connection.Setup.ReleaseDescriptor();
+                var reply = ReadExactly(second.GetStream(), 8 + Packet.CalculateLength<DeviceDescriptor>());
+                Assert.That(Packet.Decode<Header>(reply).Status, Is.Zero);
+            }
+            Assert.That(device.Connection.Setup.DescriptorRequests, Is.EqualTo(count + 4));
+            using(var third = ImportDevice()) Assert.That(third.Connected, Is.True);
+            Assert.That(device.Connection.Setup.DescriptorRequests, Is.EqualTo(count + 4), "Reimport uses the physical descriptor cache");
+        }
+
+        [Test]
+        public void ShouldCacheMetadataButStillDeliverHostDescriptorRequests()
+        {
+            var count = device.Connection.Setup.DescriptorRequests;
+            CacheDescriptors();
+            Assert.That(device.Connection.Setup.DescriptorRequests, Is.EqualTo(count));
+            Submit(70, URBDirection.In, 0, 18,
+                setup: new SetupPacket { Direction = USBDirection.DeviceToHost, Request = 6, Value = 0x100, Count = 18 });
+            Assert.That(AssertReply(70, URBCommand.URBReply).Length, Is.EqualTo(48 + 18));
+            Assert.That(device.Connection.Setup.DescriptorRequests, Is.EqualTo(count + 1));
+        }
+
+        [Test]
+        public void ShouldCancelPhysicalDiscoveryOnServerDispose()
+        {
+            device.SetConnection(false);
+            device.SetConnection(true);
+            server.Reset();
+            server.Run();
+            device.Connection.Setup.HoldDescriptors = true;
+            device.Connection.Setup.DescriptorRequested.Reset();
+            var provider = GetField<SocketServerProvider>(server, "server");
+            using(var first = new TcpClient())
+            {
+                first.Connect(IPAddress.Loopback, provider.Port.Value);
+                SendImport(first.GetStream());
+                Assert.That(device.Connection.Setup.DescriptorRequested.Wait(Timeout), Is.True);
+                server.Dispose();
+                Assert.That(first.GetStream().ReadByte(), Is.EqualTo(-1));
+            }
             device.Connection.Setup.HoldDescriptors = false;
-            using(var second = ImportDevice()) Assert.That(second.Connected, Is.True);
         }
 
         private static void SendImport(Stream stream)
@@ -638,9 +697,20 @@ namespace Antmicro.Renode.PeripheralsTests
             {
                 if(setup.Request == 6 && setup.Value >> 8 != 0)
                 {
+                    Interlocked.Increment(ref DescriptorRequests);
+                    if(HoldDescriptors)
+                    {
+                        heldDescriptor = setup;
+                        DescriptorRequested.Set();
+                        return;
+                    }
                     DescriptorRequested.Set();
-                    if(HoldDescriptors) return;
                 }
+                RespondToSetup(setup);
+            }
+            public void ReleaseDescriptor() => RespondToSetup(heldDescriptor);
+            private void RespondToSetup(SetupPacket setup)
+            {
                 if(setup.Direction == USBDirection.DeviceToHost && setup.Request == 6 && setup.Value >> 8 == 1)
                 {
                     Push(Packet.Encode(new USB.DeviceDescriptor { Length = 18, Type = 1, MaximumPacketSize = 64,
@@ -685,6 +755,8 @@ namespace Antmicro.Renode.PeripheralsTests
             public event Action NewPacket;
             public byte[] SetupResponse = Array.Empty<byte>();
             public bool HoldDescriptors;
+            public int DescriptorRequests;
+            private SetupPacket heldDescriptor;
             public readonly ManualResetEventSlim DescriptorRequested = new ManualResetEventSlim();
             public bool AdditionalInterface;
             public ushort EndpointPacketSize = 64;

@@ -185,6 +185,8 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
                 registration.Connected = connected;
                 registration.Version++;
                 if(connected) return;
+                var discovery = registration.Discovery;
+                registration.Discovery = null;
                 var connection = deviceToConnection[device];
                 deviceMetadata.Remove(connection);
                 endpointZeroPacketSizes.Remove(connection);
@@ -195,6 +197,7 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
                     stream = clientStream;
                     transfers = InvalidateTransfers();
                 }
+                if(discovery != null) transfers = transfers.Concat(new[] { discovery.Transfer }).ToArray();
             }
             if(transfers.Length == 0 && stream == null) return;
             // Firmware callbacks only fence the old session. Cancellation can
@@ -272,6 +275,13 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
         {
             this.Log(LogLevel.Info, "Shutting down the server...");
 
+            PendingTransfer[] discoveries;
+            lock(transferLock)
+            {
+                discoveries = deviceStates.Values.Where(d => d.Discovery != null).Select(d => d.Discovery.Transfer).ToArray();
+                foreach(var registration in deviceStates.Values) registration.Discovery = null;
+            }
+            foreach(var discovery in discoveries) discovery.Cancel();
             Reset();
             server.Stop();
         }
@@ -461,7 +471,8 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
                     SendResponse(GenerateURBReply(header, request, status: InvalidArgument));
                     return;
                 }
-                var transfer = new PendingTransfer(header, request, setup, payload, conn, generation);
+                var epoch = generation;
+                var transfer = new PendingTransfer(header, request, setup, payload, conn, epoch, () => Volatile.Read(ref generation) == epoch);
                 pendingTransfers.Add(header.SequenceNumber, transfer);
                 // EP0 shares one queue for both directions. Other endpoints have
                 // independent IN/OUT queues, preserving submission order per pipe.
@@ -763,18 +774,59 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
 
         private IEnumerable<byte> GenerateDeviceDescriptor(IUSBDevice device, uint deviceNumber, bool includeInterfaces, int? expectedGeneration = null)
         {
-            var conn = deviceToConnection[device];
-            PendingTransfer transfer;
-            int version;
+            PendingTransfer session;
+            DescriptorDiscovery discovery;
             lock(transferLock)
             {
                 if(disconnecting || (expectedGeneration.HasValue && expectedGeneration.Value != generation)
-                    || !deviceStates.TryGetValue(device, out var physical) || !physical.Connected) throw new OperationCanceledException();
-                version = physical.Version;
-                transfer = new PendingTransfer(default(URBHeader), default(URBRequest), default(SetupPacket), Array.Empty<byte>(), conn, generation);
-                metadataTransfer = transfer;
-                descriptorConnections.Add(conn);
+                    || !deviceStates.TryGetValue(device, out var registration) || !registration.Connected) throw new OperationCanceledException();
+                var connection = deviceToConnection[device];
+                descriptorConnections.Add(connection);
+                if(registration.Discovery == null)
+                {
+                    var version = registration.Version;
+                    var transfer = new PendingTransfer(default(URBHeader), default(URBRequest), default(SetupPacket), Array.Empty<byte>(), connection, generation,
+                        () => Volatile.Read(ref registration.Version) == version);
+                    var next = new DescriptorDiscovery(transfer);
+                    registration.Discovery = next;
+                    next.Result = Task.Run(() => DiscoverDevice(device, connection, registration, version, transfer));
+                }
+                discovery = registration.Discovery;
+                session = new PendingTransfer(default(URBHeader), default(URBRequest), default(SetupPacket), Array.Empty<byte>(), connection, generation);
+                metadataTransfer = session;
             }
+            DescriptorSnapshot snapshot;
+            try
+            {
+                // TCP cancellation releases this waiter. Physical enumeration
+                // keeps ownership of EP0 until it finishes or the device unplugs.
+                discovery.Result.Wait(session.Token);
+                snapshot = discovery.Result.GetAwaiter().GetResult();
+            }
+            finally
+            {
+                lock(transferLock)
+                {
+                    if(metadataTransfer == session) metadataTransfer = null;
+                }
+                session.Dispose();
+            }
+            var descriptor = snapshot.Device;
+            descriptor.Path = new byte[256];
+            descriptor.BusId = new byte[32];
+            SetText(descriptor.BusId, "{0}-{1}", ExportedBusId, deviceNumber);
+            SetText(descriptor.Path, "/renode/virtual/{0}-{1}", ExportedBusId, deviceNumber);
+            descriptor.DeviceNumber = deviceNumber;
+            var result = Packet.Encode(descriptor).AsEnumerable();
+            if(includeInterfaces)
+            {
+                foreach(var iface in snapshot.Interfaces) result = result.Concat(Packet.Encode(iface));
+            }
+            return result.ToArray();
+        }
+
+        private DescriptorSnapshot DiscoverDevice(IUSBDevice device, IUSBConnection conn, DeviceConnectionState registration, int version, PendingTransfer transfer)
+        {
             try
             {
                 var ep0 = transfer.Invoke(() => conn.ConnectEndpointSetup(0));
@@ -784,7 +836,7 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
                 if(prefix.Length != 8 || prefix[7] == 0) throw new InvalidOperationException("Incomplete USB device descriptor prefix");
                 lock(transferLock)
                 {
-                    if(generation != transfer.Generation) throw new OperationCanceledException();
+                    RequirePhysicalGeneration(device, registration, version);
                     endpointZeroPacketSizes[conn] = prefix[7];
                 }
                 setup.Count = (ushort)Packet.CalculateLength<USB.DeviceDescriptor>();
@@ -807,8 +859,7 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
                 }
                 lock(transferLock)
                 {
-                    if(generation != transfer.Generation || !deviceStates.TryGetValue(device, out var physical)
-                        || physical.Version != version || !physical.Connected) throw new OperationCanceledException();
+                    RequirePhysicalGeneration(device, registration, version);
                     if(deviceMetadata.TryGetValue(conn, out var previous))
                     {
                         metadata.Configuration = previous.Configuration;
@@ -816,32 +867,29 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
                     }
                     deviceMetadata[conn] = metadata;
                 }
-                var descriptor = new USBIP.DeviceDescriptor
+                return new DescriptorSnapshot
                 {
-                    Path = new byte[256], BusId = new byte[32], BusNumber = ExportedBusId, DeviceNumber = deviceNumber,
-                    Speed = (uint)deviceSpeeds[device], IdVendor = deviceDescriptor.VendorId, IdProduct = deviceDescriptor.ProductId,
-                    DeviceClass = deviceDescriptor.Class, DeviceSubClass = deviceDescriptor.Subclass, DeviceProtocol = deviceDescriptor.Protocol,
-                    NumberOfConfigurations = deviceDescriptor.NumberOfConfigurations, NumberOfInterfaces = (byte)interfaces.Count
+                    Device = new USBIP.DeviceDescriptor
+                    {
+                        Path = new byte[256], BusId = new byte[32], BusNumber = ExportedBusId,
+                        Speed = (uint)deviceSpeeds[device], IdVendor = deviceDescriptor.VendorId, IdProduct = deviceDescriptor.ProductId,
+                        DeviceClass = deviceDescriptor.Class, DeviceSubClass = deviceDescriptor.Subclass, DeviceProtocol = deviceDescriptor.Protocol,
+                        NumberOfConfigurations = deviceDescriptor.NumberOfConfigurations, NumberOfInterfaces = (byte)interfaces.Count
+                    },
+                    Interfaces = interfaces.Select(iface => new USBIP.InterfaceDescriptor { InterfaceClass = iface.Class,
+                        InterfaceSubClass = iface.Subclass, InterfaceProtocol = iface.Protocol }).ToArray()
                 };
-                SetText(descriptor.BusId, "{0}-{1}", ExportedBusId, deviceNumber);
-                SetText(descriptor.Path, "/renode/virtual/{0}-{1}", ExportedBusId, deviceNumber);
-                var result = Packet.Encode(descriptor).AsEnumerable();
-                if(includeInterfaces)
-                {
-                    foreach(var iface in interfaces)
-                        result = result.Concat(Packet.Encode(new USBIP.InterfaceDescriptor { InterfaceClass = iface.Class,
-                            InterfaceSubClass = iface.Subclass, InterfaceProtocol = iface.Protocol }));
-                }
-                return result.ToArray();
             }
             finally
             {
-                lock(transferLock)
-                {
-                    if(metadataTransfer == transfer) metadataTransfer = null;
-                }
                 transfer.Dispose();
             }
+        }
+
+        private void RequirePhysicalGeneration(IUSBDevice device, DeviceConnectionState registration, int version)
+        {
+            if(!deviceStates.TryGetValue(device, out var current) || current != registration
+                || !registration.Connected || registration.Version != version) throw new OperationCanceledException();
         }
 
         private void SetText(byte[] destination, string format, params object[] param)
@@ -946,6 +994,20 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
             public Action<bool> Handler;
             public bool Connected;
             public int Version;
+            public DescriptorDiscovery Discovery;
+        }
+
+        private sealed class DescriptorDiscovery
+        {
+            public DescriptorDiscovery(PendingTransfer transfer) { Transfer = transfer; }
+            public readonly PendingTransfer Transfer;
+            public Task<DescriptorSnapshot> Result;
+        }
+
+        private sealed class DescriptorSnapshot
+        {
+            public USBIP.DeviceDescriptor Device;
+            public USBIP.InterfaceDescriptor[] Interfaces;
         }
 
         private sealed class DeviceMetadata
@@ -958,7 +1020,7 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
 
         private sealed class PendingTransfer : IDisposable
         {
-            public PendingTransfer(URBHeader header, URBRequest request, SetupPacket setup, byte[] payload, IUSBConnection connection, int generation)
+            public PendingTransfer(URBHeader header, URBRequest request, SetupPacket setup, byte[] payload, IUSBConnection connection, int generation, Func<bool> valid = null)
             {
                 Header = header;
                 Request = request;
@@ -966,6 +1028,7 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
                 Payload = payload;
                 Connection = connection;
                 Generation = generation;
+                this.valid = valid;
             }
 
             public T Invoke<T>(Func<T> action)
@@ -973,6 +1036,7 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
                 lock(gate)
                 {
                     cancellation.Token.ThrowIfCancellationRequested();
+                    if(valid != null && !valid()) throw new OperationCanceledException();
                     return action();
                 }
             }
@@ -1003,6 +1067,7 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
             public readonly byte[] Payload;
             public readonly IUSBConnection Connection;
             public readonly int Generation;
+            private readonly Func<bool> valid;
             private readonly object gate = new object();
             private readonly CancellationTokenSource cancellation = new CancellationTokenSource();
             private bool disposed;
