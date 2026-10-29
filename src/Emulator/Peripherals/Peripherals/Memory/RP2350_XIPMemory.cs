@@ -5,7 +5,6 @@
 
 using System;
 using System.Collections.Generic;
-using System.IO;
 using System.Linq;
 
 using Antmicro.Renode.Core;
@@ -17,10 +16,10 @@ using Antmicro.Renode.Peripherals.SPI;
 namespace Antmicro.Renode.Peripherals.Memory
 {
     // Pinned cache lines provide SRAM while ordinary reads fetch from serial
-    // NOR. Instruction images follow QMI translation and cache-tag changes;
-    // data accesses traverse the bus to preserve store and fault semantics.
+    // NOR. Instruction fetches and data accesses traverse the same bus path to
+    // preserve QMI availability, translation, and pinned-cache semantics.
     public sealed class RP2350_XIPMemory : IBytePeripheral, IWordPeripheral, IDoubleWordPeripheral,
-        IQuadWordPeripheral, IMultibyteWritePeripheral, IMapped, IKnownSize, IMemory, IDisposable
+        IQuadWordPeripheral, IMultibyteWritePeripheral, IExecutableIO, IKnownSize, IDisposable
     {
         public RP2350_XIPMemory(IMachine machine, WinbondW25QFlash flash, RP2350_QMI qmi, bool untranslated = false,
             RP2350_XIP xip = null, bool useCache = true, long windowOffset = 0, long size = 0x2000000)
@@ -40,8 +39,6 @@ namespace Antmicro.Renode.Peripherals.Memory
                 xip.ConfigurationChanged += InvalidateInstructions;
                 xip.ContentsChanged += InvalidateCacheRange;
             }
-            instructionImage = new MappedMemory(machine, Size, segmentSize: 4096);
-            instructionImage.SegmentTouched += RefreshInstructionPage;
             machine.PeripheralsChanged += OnPeripheralsChanged;
             flash.StateChanged += InvalidateInstructions;
             qmi.ConfigurationChanged += InvalidateInstructions;
@@ -72,6 +69,7 @@ namespace Antmicro.Renode.Peripherals.Memory
 
         private ulong ReadTransaction(long offset, int count)
         {
+            RememberReadPages(offset, count);
             return xip == null ? ReadTransactionCore(offset, count) : xip.ExecuteTransaction(() => ReadTransactionCore(offset, count));
         }
 
@@ -124,9 +122,7 @@ namespace Antmicro.Renode.Peripherals.Memory
         public void LoadBinary(string fileName, long offset = 0)
         {
             if(windowOffset != 0) throw new ArgumentException("Flash images must be loaded through the lower XIP window");
-            var data = File.ReadAllBytes(fileName);
-            flash.UnderlyingMemory.WriteBytes(offset, data, 0, data.Length);
-            InvalidateInstructions();
+            flash.LoadBinary(fileName, offset);
         }
 
         public void Dispose()
@@ -139,48 +135,56 @@ namespace Antmicro.Renode.Peripherals.Memory
                 xip.ConfigurationChanged -= InvalidateInstructions;
                 xip.ContentsChanged -= InvalidateCacheRange;
             }
-            instructionImage.Dispose();
         }
 
         public void Reset() => InvalidateInstructions();
-        public IEnumerable<IMappedSegment> MappedSegments => instructionImage.MappedSegments;
         public long Size { get; }
+
+        private void RememberReadPages(long offset, int count)
+        {
+            var bus = machine.GetSystemBus(this);
+            if(!bus.TryGetCurrentContextState<CortexM.ContextState>(out var _, out var state)
+                || !state.InstructionFetch) return;
+            if(offset < 0 || count <= 0 || offset >= Size) return;
+            var end = Math.Min(Size - 1, offset + count - 1);
+            lock(readPages)
+            {
+                for(var page = offset / PageSize; page <= end / PageSize; page++) readPages.Add(page);
+            }
+        }
 
         private void InvalidateInstructions()
         {
-            for(var page = 0; page < Size / 4096; page++)
-            {
-                if(instructionImage.IsTouched(page)) RefreshInstructionPage(page);
-            }
-            foreach(var cpu in machine.GetSystemBus(this).GetCPUs().OfType<TranslationCPU>()) cpu.InvalidateTranslationBlocks();
-            RouteDataAccessesThroughBus();
-        }
-
-        private void RefreshInstructionPage(int page)
-        {
-            var offset = (long)page * 4096;
-            var data = new byte[4096];
-            for(var i = 0; i < data.Length; i++)
-            {
-                try { data[i] = ReadSingleByte(offset + i, out var _); }
-                catch(BusAccessException) { data[i] = 0xff; }
-            }
-            instructionImage.WriteBytes(offset, data, 0, data.Length);
+            long[] pages;
+            lock(readPages) pages = readPages.ToArray();
+            InvalidatePages(pages);
         }
 
         private void InvalidateCacheRange(long offset, int count)
         {
-            if(offset + count <= windowOffset || offset >= windowOffset + Size) return;
-            offset -= windowOffset;
-            var touched = false;
-            for(var page = (int)(offset / 4096); page <= (offset + count - 1) / 4096; page++)
+            if(count <= 0 || offset + count <= windowOffset || offset >= windowOffset + Size) return;
+            var first = Math.Max(0, offset - windowOffset) / PageSize;
+            var last = Math.Min(Size - 1, offset + count - 1 - windowOffset) / PageSize;
+            long[] pages;
+            lock(readPages) pages = readPages.Where(page => page >= first && page <= last).ToArray();
+            InvalidatePages(pages);
+        }
+
+        private void InvalidatePages(long[] pages)
+        {
+            if(pages.Length == 0) return;
+            var bus = machine.GetSystemBus(this);
+            var registrations = bus.GetRegistrationPoints(this).ToArray();
+            if(!registrations.Any(registration => pages.Any(page =>
+                (ulong)((page + 1) * PageSize) > registration.Offset
+                && (ulong)(page * PageSize) < registration.Offset + registration.Range.Size))) return;
+            foreach(var cpu in bus.GetCPUs().OfType<TranslationCPU>())
             {
-                if(!instructionImage.IsTouched(page)) continue;
-                RefreshInstructionPage(page);
-                touched = true;
+                // A code read may still be translating when another master
+                // changes the flash mapping. Clear on the CPU thread after
+                // that translation returns, including any newly published TB.
+                cpu.RequestTranslationCacheClearing();
             }
-            if(touched)
-                foreach(var cpu in machine.GetSystemBus(this).GetCPUs().OfType<TranslationCPU>()) cpu.InvalidateTranslationBlocks();
         }
 
         private void OnPeripheralsChanged(IMachine _, PeripheralsChangedEventArgs change)
@@ -200,7 +204,8 @@ namespace Antmicro.Renode.Peripherals.Memory
             }
         }
 
-        private readonly MappedMemory instructionImage;
+        private readonly HashSet<long> readPages = new HashSet<long>();
+        private const long PageSize = 4096;
         private readonly long windowOffset;
         private readonly RP2350_XIP xip;
         private readonly bool useCache;

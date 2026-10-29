@@ -5,6 +5,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.IO;
 
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Exceptions;
@@ -174,6 +175,15 @@ namespace Antmicro.Renode.Peripherals.SPI
         }
 
         public MappedMemory UnderlyingMemory => underlyingMemory;
+
+        public void LoadBinary(string fileName, long offset = 0)
+        {
+            var data = File.ReadAllBytes(fileName);
+            if(offset < 0 || offset > underlyingMemory.Size - data.Length)
+                throw new ArgumentOutOfRangeException(nameof(offset), "Flash image must fit in the NOR array");
+            underlyingMemory.WriteBytes(offset, data, 0, data.Length);
+            StateChanged?.Invoke();
+        }
 
         public event Action StateChanged;
 

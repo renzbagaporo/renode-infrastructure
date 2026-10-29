@@ -216,9 +216,6 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
 
         private void NotifyConfiguration()
         {
-            var bus = machine.GetSystemBus(this);
-            foreach(var start in new ulong[] { 0x10000000, 0x14000000, 0x1c000000 })
-                bus.SetAddressRangeLocked(new Antmicro.Renode.Core.Range(start, 0x2000000), !Available);
             ConfigurationChanged?.Invoke();
         }
         private bool Selected => (directControl & 0xc) != 0;
