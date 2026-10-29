@@ -407,6 +407,10 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
                 transfer.Invoke(() => UpdateControlState(transfer));
                 CompleteTransfer(transfer, data);
             }
+            catch(USBStallException)
+            {
+                CompleteTransfer(transfer, status: BrokenPipe);
+            }
             catch(OperationCanceledException)
             {
                 // UNLINK/reset removes the request first. Device-side cancellation
@@ -436,7 +440,15 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
             var response = new List<byte>();
             do
             {
-                var packet = ReadPacket(transfer, pipe);
+                byte[] packet;
+                try
+                {
+                    packet = ReadPacket(transfer, pipe);
+                }
+                catch(USBStallException)
+                {
+                    return (response.ToArray(), BrokenPipe);
+                }
                 if(packet.Length > maximumPacketSize || packet.Length > length - response.Count)
                 {
                     response.AddRange(packet.Take(length - response.Count));
@@ -501,7 +513,9 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
                         if(!finished) available.Set();
                     }
                 };
+                var status = pipe as IUSBPipeStatus;
                 pipe.NewPacket += notify;
+                if(status != null) status.StatusChanged += notify;
                 try
                 {
                     while(true)
@@ -509,7 +523,11 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
                         byte[] data = null;
                         // Cancellation and TryRead share a gate: after Cancel returns,
                         // this reader can never consume a future packet.
-                        if(transfer.Invoke(() => pipe.TryRead(out data)))
+                        if(transfer.Invoke(() =>
+                        {
+                            if(status != null && status.IsStalled(Direction.DeviceToHost)) throw new USBStallException();
+                            return pipe.TryRead(out data);
+                        }))
                         {
                             Misc.WaitForCallback(onDone => IUSBPipeRead.WrapReadCallbackInDelay(_ => onDone())(data), transfer.Token);
                             return data;
@@ -520,6 +538,7 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
                 finally
                 {
                     pipe.NewPacket -= notify;
+                    if(status != null) status.StatusChanged -= notify;
                     lock(available)
                     {
                         finished = true;
@@ -802,6 +821,7 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
         private int generation;
         private const uint ShortNotOkFlag = 1;
         private const int RemoteInputOutputError = -121;
+        private const int BrokenPipe = -32;
         private const int ConnectionReset = -104;
         private const int NoEntry = -2;
         private const int NoDevice = -19;

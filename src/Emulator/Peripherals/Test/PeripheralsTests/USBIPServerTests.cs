@@ -272,6 +272,43 @@ namespace Antmicro.Renode.PeripheralsTests
             }
         }
 
+        [Test]
+        public void ShouldReturnBrokenPipeForPendingInputStall()
+        {
+            Submit(1, URBDirection.In, 1, 64);
+            Assert.That(device.Connection.Input.ReadAttempted.Wait(Timeout), Is.True);
+            device.Connection.Input.StallInput();
+            var reply = AssertReply(1, URBCommand.URBReply);
+            Assert.That(unchecked((int)Packet.Decode<URBHeader>(reply).FlagsOrStatus), Is.EqualTo(-32));
+            Assert.That(reply.Length, Is.EqualTo(48));
+        }
+
+        [Test]
+        public void ShouldReturnBrokenPipeAndDiscardRejectedRp2OutputOnStall()
+        {
+            using(var machine = new Machine())
+            {
+                var dpram = new RP2_USB_DPRAM();
+                var usb = new RP2_USB(machine, dpram, new TestClocks());
+                usb.WriteDoubleWord(0x40, 1);
+                usb.WriteDoubleWord(0x4c, 0x20010000);
+                dpram.WriteDoubleWord(0x14, 0xa0000180);
+                var recording = new RecordingDevice(usb);
+                server.Register(recording, new NumberRegistrationPoint<int>(1));
+                Feed(new URBHeader { Command = URBCommand.URBRequest, SequenceNumber = 1, BusId = 1,
+                    DeviceId = 1, Direction = URBDirection.Out, EndpointNumber = 2 },
+                    new URBRequest { TransferBufferLength = 1 }, new byte[] { 0xa5 });
+                Assert.That(recording.WriteStarted.Wait(Timeout), Is.True);
+                Assert.DoesNotThrow(() => dpram.WriteDoubleWord(0x94, 0x800));
+                var reply = AssertReply(1, URBCommand.URBReply);
+                Assert.That(unchecked((int)Packet.Decode<URBHeader>(reply).FlagsOrStatus), Is.EqualTo(-32));
+                dpram.WriteDoubleWord(0x94, 0x440);
+                Assert.That(dpram.ReadByte(0x180), Is.Zero);
+                Assert.That(dpram.ReadWord(0x94), Is.EqualTo(0x440));
+                server.Unregister(recording);
+            }
+        }
+
         private void CacheDescriptors()
         {
             var descriptors = (IEnumerable<byte>)typeof(USBIPServer).GetMethod("GenerateDeviceDescriptor",
@@ -387,7 +424,7 @@ namespace Antmicro.Renode.PeripheralsTests
             public readonly TestPipe Setup = new TestPipe();
         }
 
-        private sealed class TestPipe : IUSBPipeSetup
+        private sealed class TestPipe : IUSBPipeSetup, IUSBPipeStatus
         {
             public bool TryRead(out byte[] data)
             {
@@ -421,6 +458,10 @@ namespace Antmicro.Renode.PeripheralsTests
                 packets.Enqueue(data);
                 NewPacket?.Invoke();
             }
+            public void StallInput() { stalledInput = true; StatusChanged?.Invoke(); }
+            public bool IsStalled(USBDirection direction) => direction == USBDirection.DeviceToHost && stalledInput;
+            public event Action StatusChanged;
+            private bool stalledInput;
             public event Action NewPacket;
             public byte[] SetupResponse = Array.Empty<byte>();
             public ushort EndpointPacketSize = 64;

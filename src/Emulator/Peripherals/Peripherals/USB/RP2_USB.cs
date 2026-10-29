@@ -16,6 +16,8 @@ using Antmicro.Renode.Peripherals.Timers;
 using Antmicro.Renode.Time;
 using Antmicro.Renode.Utilities.Packets;
 
+using USBDirection = Antmicro.Renode.Core.USB.Direction;
+
 namespace Antmicro.Renode.Peripherals.USB
 {
     // Full-speed device controller. USB host requests exchange packets with
@@ -171,6 +173,10 @@ namespace Antmicro.Renode.Peripherals.USB
                         // endpoint can acknowledge an abort between any two tokens.
                         registers[(int)Registers.AbortDone / 4] |= registers[offset / 4];
                     }
+                    if((Registers)offset == Registers.StallArm)
+                    {
+                        endpoints[0].BufferReady();
+                    }
                     if((Registers)offset == Registers.MainControl || (Registers)offset == Registers.SIEControl)
                     {
                         UpdateConnection();
@@ -280,6 +286,16 @@ namespace Antmicro.Renode.Peripherals.USB
                 && (input || (half & BufferFull) == 0);
         }
 
+        private bool IsEndpointStalled(int endpoint, bool input)
+        {
+            if(!CanProcessPackets) return false;
+            var control = endpoint * 2 + (input ? 0 : 1);
+            var enabled = endpoint == 0 || (dpram.ReadDoubleWord(8 + (endpoint - 1) * 8 + (input ? 0 : 4)) & (1u << 31)) != 0;
+            var armed = endpoint != 0 || (registers[(int)Registers.StallArm / 4] & (input ? 1u : 2u)) != 0;
+            return enabled && armed && (registers[(int)Registers.Abort / 4] & (1u << control)) == 0
+                && (dpram.ReadDoubleWord(BufferControlOffset + control * 4) & BufferStall) != 0;
+        }
+
         private void CompleteBuffer(Buffer buffer, bool input, int length)
         {
             var value = dpram.ReadDoubleWord(buffer.ControlOffset);
@@ -316,6 +332,9 @@ namespace Antmicro.Renode.Peripherals.USB
                         this.Log(LogLevel.Warning, "USB SETUP token received while the serial interface is inactive");
                         return;
                     }
+                    // Hardware clears EP0_STALL_ARM on SETUP, independently of
+                    // when the firmware services SETUP_REC and rewrites buffers.
+                    registers[(int)Registers.StallArm / 4] = 0;
                     endpoints[0].Reset();
                     bufferIndex[0] = 0;
                     bufferIndex[1] = 0;
@@ -356,18 +375,23 @@ namespace Antmicro.Renode.Peripherals.USB
                 {
                     int endpoint;
                     bool ready;
+                    bool statusChanged;
                     lock(dpram)
                     {
-                        if(pendingInputNotifications == 0)
+                        if((pendingInputNotifications | pendingStatusNotifications) == 0)
                         {
                             publishingInputNotifications = false;
                             return;
                         }
                         endpoint = 0;
-                        while((pendingInputNotifications & (1u << endpoint)) == 0) endpoint++;
+                        while(((pendingInputNotifications | pendingStatusNotifications) & (1u << endpoint)) == 0) endpoint++;
+                        statusChanged = (pendingStatusNotifications & (1u << endpoint)) != 0;
+                        ready = (pendingInputNotifications & (1u << endpoint)) != 0
+                            && TryGetBuffer(endpoint, true, out var buffer) && (buffer.Control & BufferFull) != 0;
                         pendingInputNotifications &= ~(1u << endpoint);
-                        ready = TryGetBuffer(endpoint, true, out var buffer) && (buffer.Control & BufferFull) != 0;
+                        pendingStatusNotifications &= ~(1u << endpoint);
                     }
+                    if(statusChanged) endpoints[endpoint].PublishStatusChanged();
                     if(ready) endpoints[endpoint].PublishAvailable();
                 }
             }
@@ -431,6 +455,7 @@ namespace Antmicro.Renode.Peripherals.USB
         private bool connectionObserved;
         private bool timingWarningEmitted;
         private uint pendingInputNotifications;
+        private uint pendingStatusNotifications;
         private bool publishingInputNotifications;
 
         private const int EndpointCount = 16;
@@ -477,6 +502,10 @@ namespace Antmicro.Renode.Peripherals.USB
                 foreach(var pending in pendingWrites) pending.Completion.TrySetCanceled();
                 pendingWrites.Clear();
                 parent.pendingInputNotifications &= ~(1u << number);
+                if(inputStalled || outputStalled) parent.pendingStatusNotifications |= 1u << number;
+                else parent.pendingStatusNotifications &= ~(1u << number);
+                inputStalled = false;
+                outputStalled = false;
             }
 
             public void SetupPacketWrite(SetupPacket packet)
@@ -567,6 +596,14 @@ namespace Antmicro.Renode.Peripherals.USB
                     processingBuffers = true;
                     try
                     {
+                        var newInputStalled = parent.IsEndpointStalled(number, true);
+                        var newOutputStalled = parent.IsEndpointStalled(number, false);
+                        if(newInputStalled != inputStalled || newOutputStalled != outputStalled)
+                        {
+                            inputStalled = newInputStalled;
+                            outputStalled = newOutputStalled;
+                            parent.pendingStatusNotifications |= 1u << number;
+                        }
                         while(pendingWrites.Count != 0)
                         {
                             var pending = pendingWrites.Peek();
@@ -574,6 +611,12 @@ namespace Antmicro.Renode.Peripherals.USB
                             {
                                 pending.Completion.TrySetCanceled();
                                 pendingWrites.Dequeue();
+                                continue;
+                            }
+                            if(outputStalled)
+                            {
+                                pendingWrites.Dequeue();
+                                pending.Completion.TrySetException(new USBStallException());
                                 continue;
                             }
                             if(!parent.TryGetBuffer(number, false, out var buffer)) break;
@@ -620,9 +663,14 @@ namespace Antmicro.Renode.Peripherals.USB
                 }
             }
 
+            public bool IsStalled(bool input) => parent.IsEndpointStalled(number, input);
+
             public void PublishAvailable() => NewPacket?.Invoke();
 
+            public void PublishStatusChanged() => StatusChanged?.Invoke();
+
             public event Action NewPacket;
+            public event Action StatusChanged;
 
             private readonly RP2_USB parent;
             private readonly int number;
@@ -642,6 +690,8 @@ namespace Antmicro.Renode.Peripherals.USB
                 public readonly TaskCompletionSource<bool> Completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
             }
             private bool processingBuffers;
+            private bool inputStalled;
+            private bool outputStalled;
         }
 
         private sealed class Connection : IUSBConnection
@@ -696,13 +746,14 @@ namespace Antmicro.Renode.Peripherals.USB
 
             // Handles and pending host transfers belong to this attachment.
             // SIE/bus resets retain its subscriptions; disposal invalidates them.
-            private sealed class EndpointLease : IUSBPipeSetup
+            private sealed class EndpointLease : IUSBPipeSetup, IUSBPipeStatus
             {
                 public EndpointLease(Connection owner, Endpoint endpoint)
                 {
                     this.owner = owner;
                     this.endpoint = endpoint;
                     endpoint.NewPacket += PublishAvailable;
+                    endpoint.StatusChanged += PublishStatusChanged;
                 }
 
                 public bool TryRead(out byte[] data)
@@ -777,10 +828,46 @@ namespace Antmicro.Renode.Peripherals.USB
                     }
                 }
 
+                public bool IsStalled(USBDirection direction)
+                {
+                    lock(owner.parent.dpram)
+                    {
+                        return !owner.disposed && endpoint.IsStalled(direction == USBDirection.DeviceToHost);
+                    }
+                }
+
+                public event Action StatusChanged
+                {
+                    add
+                    {
+                        lock(owner.parent.dpram)
+                        {
+                            if(!owner.disposed) statusHandlers += value;
+                        }
+                    }
+                    remove
+                    {
+                        lock(owner.parent.dpram) statusHandlers -= value;
+                    }
+                }
+
+                private void PublishStatusChanged()
+                {
+                    Action callback;
+                    lock(owner.parent.dpram)
+                    {
+                        if(owner.disposed) return;
+                        callback = statusHandlers;
+                    }
+                    callback?.Invoke();
+                }
+
                 public void Detach()
                 {
                     endpoint.NewPacket -= PublishAvailable;
+                    endpoint.StatusChanged -= PublishStatusChanged;
                     handlers = null;
+                    statusHandlers = null;
                 }
 
                 private void PublishAvailable()
@@ -797,6 +884,7 @@ namespace Antmicro.Renode.Peripherals.USB
                 private readonly Connection owner;
                 private readonly Endpoint endpoint;
                 private Action handlers;
+                private Action statusHandlers;
             }
 
             private readonly RP2_USB parent;

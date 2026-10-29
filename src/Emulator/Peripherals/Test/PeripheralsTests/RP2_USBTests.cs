@@ -594,6 +594,74 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.That(write.IsCompletedSuccessfully, Is.False);
         }
 
+        [Test]
+        public void ShouldClearEndpointZeroStallArmOnNewSetup()
+        {
+            usb.WriteDoubleWord(0x68, 3);
+            connection.ConnectEndpointSetup(0).SetupPacketWrite(new SetupPacket { Request = 6, Count = 18 });
+            Assert.That(usb.ReadDoubleWord(0x68), Is.Zero);
+        }
+
+        [Test]
+        public void ShouldFailPendingAsyncOutputOnStallWithoutNotifyingLegacyReaders()
+        {
+            var input = connection.ConnectEndpointRead(0);
+            var notifications = 0;
+            input.NewPacket += () => notifications++;
+            var write = connection.ConnectEndpointWrite(0).WriteAsync(new byte[] { 0xa5 });
+            usb.WriteDoubleWord(0x68, 2);
+            Assert.DoesNotThrow(() => dpram.WriteDoubleWord(0x84, 0x800));
+            Assert.That(SpinWait.SpinUntil(() => write.IsFaulted, 1000), Is.True);
+            Assert.That(notifications, Is.Zero);
+            dpram.WriteDoubleWord(0x84, 0x440);
+            Assert.That(dpram.ReadByte(0x100), Is.Zero);
+            Assert.That(dpram.ReadWord(0x84), Is.EqualTo(0x440));
+        }
+
+        [Test]
+        public void ShouldPublishEndpointZeroStallSeparatelyAndOnlyWhenArmed()
+        {
+            var input = connection.ConnectEndpointRead(0);
+            var status = (IUSBPipeStatus)input;
+            var statusNotifications = 0;
+            var legacyNotifications = 0;
+            input.NewPacket += () => legacyNotifications++;
+            input.ReadPacket(_ => legacyNotifications++);
+            status.StatusChanged += () =>
+            {
+                Assert.That(Monitor.IsEntered(dpram), Is.False);
+                statusNotifications++;
+            };
+            Assert.DoesNotThrow(() => dpram.WriteDoubleWord(0x80, 0x800));
+            Assert.That(status.IsStalled(USBDirection.DeviceToHost), Is.False);
+            Assert.That(statusNotifications, Is.Zero);
+            Assert.DoesNotThrow(() => usb.WriteDoubleWord(0x68, 1));
+            Assert.That(status.IsStalled(USBDirection.DeviceToHost), Is.True);
+            Assert.That(input.TryRead(out _), Is.False);
+            Assert.That(statusNotifications, Is.EqualTo(1));
+            connection.ConnectEndpointSetup(0).SetupPacketWrite(new SetupPacket { Request = 6, Count = 18 });
+            Assert.That(status.IsStalled(USBDirection.DeviceToHost), Is.False);
+            Assert.That(statusNotifications, Is.EqualTo(2));
+            Assert.That(legacyNotifications, Is.Zero);
+        }
+
+        [Test]
+        public void ShouldRejectOnlyTheUnacceptedOutputSuffixOnStall()
+        {
+            var data = new byte[128];
+            for(var i = 0; i < data.Length; i++) data[i] = (byte)i;
+            var write = connection.ConnectEndpointWrite(0).WriteAsync(data);
+            dpram.WriteDoubleWord(0x84, 0x440);
+            Assert.That(dpram.ReadByte(0x100), Is.Zero);
+            usb.WriteDoubleWord(0x68, 2);
+            Assert.DoesNotThrow(() => dpram.WriteDoubleWord(0x84, 0x800));
+            Assert.That(SpinWait.SpinUntil(() => write.IsFaulted, 1000), Is.True);
+            Assert.That(write.Exception.InnerException, Is.TypeOf<USBStallException>());
+            dpram.WriteDoubleWord(0x84, 0x440);
+            Assert.That(dpram.ReadByte(0x100), Is.Zero);
+            Assert.That(dpram.ReadWord(0x84), Is.EqualTo(0x440));
+        }
+
         private void AdvanceMicroseconds(ulong duration) => ((BaseClockSource)machine.ClockSource).Advance(TimeInterval.FromMicroseconds(duration));
 
         private sealed class ControlledClockSource : IRP2ClockSource

@@ -173,6 +173,20 @@ public interface IUSBPipeWrite
     }
 }
 
+// Optional handshake state, separate from data availability. A STALL is not
+// a packet and must not invoke legacy NewPacket readers from a firmware write.
+public interface IUSBPipeStatus
+{
+    bool IsStalled(Direction direction);
+
+    event Action StatusChanged;
+}
+
+public sealed class USBStallException : Exception
+{
+    public USBStallException() : base("USB endpoint returned STALL") { }
+}
+
 public interface IUSBPipeRead
 {
     event Action NewPacket;
