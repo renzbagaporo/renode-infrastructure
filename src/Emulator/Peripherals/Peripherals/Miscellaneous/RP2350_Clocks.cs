@@ -42,6 +42,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             selectedReferenceSource = 0;
             selectedSystemSource = 0;
             resuscitationControl = 0xff;
+            UpdateClocks();
         }
 
         public ulong GetFrequency(int clock)

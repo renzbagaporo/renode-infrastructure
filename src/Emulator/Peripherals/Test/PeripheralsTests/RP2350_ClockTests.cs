@@ -34,6 +34,25 @@ namespace Antmicro.Renode.PeripheralsTests
         }
 
         [Test]
+        public void ShouldNotifyTickConsumersWhenClocksReset()
+        {
+            var ticks = new RP2350_Ticks(machine, clocks);
+            ticks.WriteDoubleWord(0x4, 12);
+            ticks.WriteDoubleWord(0x0, 1);
+            StartSystemPLL();
+            clocks.WriteDoubleWord(0x30, 2);
+            clocks.WriteDoubleWord(0x3c, 1);
+            Assert.AreEqual(1000000ul, ticks.GetFrequency(0));
+            ulong notifiedFrequency = 0;
+            clocks.ClockChanged += () => notifiedFrequency = clocks.GetFrequency(5);
+
+            clocks.Reset();
+
+            Assert.AreEqual(rosc.Frequency / 12, ticks.GetFrequency(0));
+            Assert.AreEqual(rosc.Frequency, notifiedFrequency);
+        }
+
+        [Test]
         public void ShouldUseVariantSpecificResetLineMask()
         {
             var rp2040Resets = new RP2_Resets(machine);
