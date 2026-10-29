@@ -15,7 +15,7 @@ using Antmicro.Renode.Logging;
 namespace Antmicro.Renode.Peripherals.GPIOPort
 {
     [GPIO(NumberOfInputs = 48)]
-    public sealed class RP2_GPIOBank0 : RP2APBPeripheral, IGPIOReceiver, INumberedGPIOOutput
+    public sealed class RP2_GPIOBank0 : RP2APBPeripheral, IThreeStateGPIO, INumberedGPIOOutput
     {
         public RP2_GPIOBank0(IMachine machine, IRP2GPIO sio = null, bool rp2350 = false, int numberOfPins = 0) : base(machine)
         {
@@ -114,6 +114,19 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             lock(SyncRoot)
             {
                 return IsBondedPin(pin) && sampled[pin];
+            }
+        }
+
+        public void GetOutputState(int number, out bool level, out bool enabled)
+        {
+            lock(SyncRoot)
+            {
+                if(!IsBondedPin(number))
+                {
+                    throw new RecoverableException($"GPIO {number} is not bonded on this model");
+                }
+                level = drivenValue[number];
+                enabled = drivenEnable[number];
             }
         }
 
