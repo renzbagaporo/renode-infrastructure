@@ -269,6 +269,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                 Privileged = (csw & (1u << 25)) != 0,
                 CpuSecure = (csw & (1u << 30)) == 0,
                 AttributionSecure = (csw & (1u << 30)) == 0,
+                DebugAccess = true,
             };
 
             private readonly IBusController bus;

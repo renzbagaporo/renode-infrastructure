@@ -5,8 +5,10 @@
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Peripherals.Bus;
 using Antmicro.Renode.Peripherals.CPU;
+using Antmicro.Renode.Peripherals.GPIOPort;
 using Antmicro.Renode.Peripherals.IRQControllers;
 using Antmicro.Renode.Peripherals.Memory;
+using Antmicro.Renode.Peripherals.Miscellaneous;
 using Antmicro.Renode.Time;
 
 using NUnit.Framework;
@@ -262,6 +264,29 @@ namespace Antmicro.Renode.PeripheralsTests
             port.WriteAP(0x2d00, 0x4b800052);
             Assert.AreEqual(0x20000100, port.ReadMemory(0x2000, 0xe000ed08));
             Assert.IsFalse(cpu.SecureState);
+        }
+
+        [Test]
+        public void ShouldKeepDebuggerSecurityIndependentOfTheSelectedCoresForcedNonSecureState()
+        {
+            var nvic1 = new NVIC(machine);
+            var cpu1 = new CortexM("cortex-m33", machine, nvic1, cpuId: 1, enableTrustZone: true);
+            machine.SystemBus.Register(cpu1, new CPURegistrationPoint(1));
+            machine.SetLocalName(cpu1, "cpu1");
+            machine.SystemBus.Register(nvic1, new BusPointRegistration(0xe000e000, cpu: cpu1));
+            var accessControl = new RP2350_AccessControl(machine);
+            var gpio = new RP2_GPIOBank0(machine, rp2350: true, accessControl: accessControl);
+            machine.SystemBus.Register(gpio, new BusPointRegistration(0x40028000));
+            accessControl.WriteDoubleWord(4, 0xacce0002); // FORCE_CORE_NS.PROC1
+            var port = new TestDebugPort(machine, cpu, cpu1);
+            port.PowerUp();
+            port.WriteMemory(0x4000, 0x40028004, 5); // Secure GPIO0 CTRL, SIO function
+            Assert.AreEqual(5, port.ReadMemory(0x4000, 0x40028004), "Secure MEM-AP access remains Secure");
+            var coreState = new CortexM.ContextState { Privileged = true, CpuSecure = true, AttributionSecure = true };
+            Assert.AreEqual(0, machine.SystemBus.ReadDoubleWord(0x40028004, cpu1, (ulong)coreState),
+                "The same core's own accesses are forced Non-secure");
+            port.WriteAP(0x4d00, 0x4b800052); // MEM-AP HNONSEC
+            Assert.AreEqual(0, port.ReadMemory(0x4000, 0x40028004), "Non-secure debug attributes are still honored");
         }
 
         [Test]

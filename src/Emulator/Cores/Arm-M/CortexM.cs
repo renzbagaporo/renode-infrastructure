@@ -1476,6 +1476,9 @@ namespace Antmicro.Renode.Peripherals.CPU
             public bool CpuSecure;
             public bool AttributionSecure;
             public bool Semihosting;
+            // A MEM-AP can select this core's PPB bank without being a
+            // transaction issued by that core's processor bus master.
+            public bool DebugAccess;
 
             public static implicit operator ulong(ContextState stateObj)
             {
@@ -1484,6 +1487,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                 state |= stateObj.CpuSecure ? 2UL : 0;
                 state |= stateObj.AttributionSecure ? 4UL : 0;
                 state |= stateObj.Semihosting ? 8UL : 0;
+                state |= stateObj.DebugAccess ? 16UL : 0;
                 return state;
             }
 
@@ -1495,6 +1499,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                     CpuSecure = (state & 2UL) == 2UL,
                     AttributionSecure = (state & 4UL) == 4UL,
                     Semihosting = (state & 8UL) == 8UL,
+                    DebugAccess = (state & 16UL) == 16UL,
                 };
             }
         }

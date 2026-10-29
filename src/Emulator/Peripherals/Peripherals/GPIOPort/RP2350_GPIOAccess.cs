@@ -11,6 +11,11 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
         public static bool IsSecure(IMachine machine, RP2350_AccessControl accessControl)
         {
             var bus = machine.SystemBus;
+            if(bus.TryGetCurrentContextState<CortexM.ContextState>(out var _, out var debugState)
+                && debugState.DebugAccess)
+            {
+                return debugState.AttributionSecure;
+            }
             if(bus.TryGetCurrentCPU(out var cpu) && accessControl != null
                 && accessControl.CoreIsForcedNonSecure((int)cpu.MultiprocessingId))
             {
