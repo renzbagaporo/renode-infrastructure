@@ -732,9 +732,12 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.AreEqual(0, changes, "A stalled higher SM still asserts side-set on every clock enable");
         }
 
-        [Test]
-        public void ShouldRestoreStalledSideSetAtItsNextDividerEnable()
+        [TestCase(false)]
+        [TestCase(true)]
+        public void ShouldRestoreStalledSideSetAtItsNextDividerEnable(bool gateClock)
         {
+            var clocks = new TestClocks();
+            pio = new RP2040_PIO(machine, gpio, clocks);
             gpio.WriteDoubleWord(4, 6);
             pio.WriteDoubleWord(0xdc, 1u << 26);
             Force(0, 0xe081);
@@ -748,6 +751,12 @@ namespace Antmicro.Renode.PeripheralsTests
             Advance(1);
             Force(0, 0xe000); // between SM1's enables at3 and6
             Assert.IsFalse(gpio.GetInput(0));
+            if(gateClock)
+            {
+                clocks.SetSystemFrequency(0);
+                Advance(100);
+                clocks.SetSystemFrequency(1000000);
+            }
             Advance(1);
             Assert.IsFalse(gpio.GetInput(0));
             Advance(1);

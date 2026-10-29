@@ -853,7 +853,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     sm.Timer.Frequency = Math.Max(1ul, frequency);
                     Reschedule(sm);
                 }
+                BeginPinCycle();
+                ResolvePinWrites();
             }
+            PublishPending();
         }
 
         private void WakeAll(StateMachine except = null)
