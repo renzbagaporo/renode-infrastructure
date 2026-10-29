@@ -58,10 +58,6 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
         private void ResetBank()
         {
             bank.Reset();
-            for(var pin = 0; pin < 8; pin++)
-            {
-                bank.WriteDoubleWord(pin * 8 + 4, 0);
-            }
             bank.WriteDoubleWord(0x230, 0xcccccccc);
             UpdateChipSelect();
         }
@@ -82,7 +78,7 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             if(TryTranslate(offset, out var bankOffset))
             {
                 var value = bank.ReadDoubleWord(bankOffset);
-                return ResetHeld && offset == 0x60 ? value & 0x00333333 : value;
+                return ResetHeld && offset == 0x218 ? value & 0x33333333 : value;
             }
             this.LogUnhandledRead(offset);
             return 0;
@@ -170,15 +166,15 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
         {
             bankOffset = offset;
             if(offset < 0x40) return true;
-            if(offset >= 0x40 && offset <= 0x54 && (offset & 3) == 0)
+            if(offset >= 0x200 && offset <= 0x214 && (offset & 3) == 0)
             {
-                var summary = (offset - 0x40) / 4;
+                var summary = (offset - 0x200) / 4;
                 bankOffset = 0x200 + (summary / 2) * 0x10 + (summary % 2) * 8;
                 return true;
             }
-            if(offset >= 0x60 && offset <= 0x84 && (offset & 3) == 0)
+            if(offset >= 0x218 && offset <= 0x23c && (offset & 3) == 0)
             {
-                bankOffset = 0x230 + (offset - 0x60) * 6;
+                bankOffset = 0x230 + (offset - 0x218) * 6;
                 return true;
             }
             return false;
