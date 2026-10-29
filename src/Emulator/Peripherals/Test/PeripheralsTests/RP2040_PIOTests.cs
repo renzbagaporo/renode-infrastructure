@@ -9,6 +9,7 @@ using System.Linq;
 using System.Threading;
 
 using Antmicro.Renode.Core;
+using Antmicro.Renode.Peripherals;
 using Antmicro.Renode.Peripherals.GPIOPort;
 using Antmicro.Renode.Peripherals.Miscellaneous;
 using Antmicro.Renode.Time;
@@ -530,6 +531,111 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.AreEqual(1u, pio.ReadDoubleWord(0xd4));
         }
 
+        [Test]
+        public void ShouldExecuteAllJMPConditionsAndWrapDecrementAtZero()
+        {
+            Force(0, 0xe020); // set x,0
+            Force(0, 0x0025); // jmp !x,5
+            Assert.AreEqual(5u, pio.ReadDoubleWord(0xd4));
+            Force(0, 0xe022);
+            Force(0, 0x0047);
+            Force(0, 0x0048);
+            Force(0, 0x0049); // x-- at zero does not branch, still decrements
+            Assert.AreEqual(8u, pio.ReadDoubleWord(0xd4));
+            Force(0, 0xa0c1);
+            Force(0, 0x8020);
+            Assert.AreEqual(uint.MaxValue, pio.ReadDoubleWord(0x20));
+            Force(0, 0xe040); // set y,0
+            Force(0, 0x006a);
+            Assert.AreEqual(10u, pio.ReadDoubleWord(0xd4));
+            Force(0, 0xe041);
+            Force(0, 0x008b);
+            Force(0, 0x008c);
+            Assert.AreEqual(11u, pio.ReadDoubleWord(0xd4));
+            Force(0, 0xa0c2);
+            Force(0, 0x8020);
+            Assert.AreEqual(uint.MaxValue, pio.ReadDoubleWord(0x20));
+            Force(0, 0xe021);
+            Force(0, 0xe041);
+            Force(0, 0x00ad); // x==y
+            Assert.AreEqual(11u, pio.ReadDoubleWord(0xd4));
+            Force(0, 0xe042);
+            Force(0, 0x00ae); // x!=y
+            Assert.AreEqual(14u, pio.ReadDoubleWord(0xd4));
+            pio.WriteDoubleWord(0xcc, 7u << 24);
+            pio.WriteDoubleWord(0x38, 1u << 7);
+            gpio.OnGPIO(7, true);
+            Force(0, 0x00cf);
+            Assert.AreEqual(15u, pio.ReadDoubleWord(0xd4));
+            Force(0, 0x00f0); // OSR is empty
+            Assert.AreEqual(15u, pio.ReadDoubleWord(0xd4));
+            Force(0, 0xa0e3); // mov osr,null resets its shift counter
+            Force(0, 0x00f0);
+            Assert.AreEqual(16u, pio.ReadDoubleWord(0xd4));
+        }
+
+        [Test]
+        public void ShouldExecuteForcedMOVEXECWhileStateMachineIsDisabled()
+        {
+            pio.WriteDoubleWord(0xc8, 100u << 16);
+            pio.WriteDoubleWord(0x10, 0xe02a);
+            Force(0, 0x80a0);
+            Force(0, 0xa087); // mov exec,osr
+            Advance(1);
+            Force(0, 0xa0c1);
+            Force(0, 0x8020);
+            Assert.AreEqual(10u, pio.ReadDoubleWord(0x20));
+            Assert.AreEqual(0u, pio.ReadDoubleWord(0));
+        }
+
+        [Test]
+        public void ShouldSampleIRQFlagsBeforeSimultaneousStateMachineWrites()
+        {
+            Load(0xc000, 0x80a0, 0x20c0, 0x80a0); // IRQ0; pull; WAIT1 IRQ0; pull
+            Force(1, 2);
+            pio.WriteDoubleWord(0, 3);
+            Advance(1);
+            Assert.AreEqual(2u, pio.ReadDoubleWord(0xec)); // SM1 still waiting
+            Assert.AreEqual(1u, pio.ReadDoubleWord(0x30));
+            Advance(1);
+            Assert.AreEqual(3u, pio.ReadDoubleWord(0xec));
+            Assert.AreEqual(0u, pio.ReadDoubleWord(0x30));
+        }
+
+        [Test]
+        public void ShouldReleaseStickyPriorityOnStateMachineRestart()
+        {
+            gpio.WriteDoubleWord(4, 6);
+            pio.WriteDoubleWord(0xdc, 1u << 26);
+            pio.WriteDoubleWord(0xf4, 1u << 26);
+            pio.WriteDoubleWord(0xcc, 0x1f000 | (1u << 17));
+            pio.WriteDoubleWord(0xe4, 0x1f000 | (1u << 17));
+            Force(0, 0xe081);
+            Force(0, 0xe000);
+            Force(1, 0xe001);
+            Assert.IsTrue(gpio.GetInput(0));
+            pio.WriteDoubleWord(0x2000, 1u << 5);
+            Assert.IsFalse(gpio.GetInput(0));
+        }
+
+        [Test]
+        public void ShouldFreezeAndResumeOnTheSystemClockAndChangeFrequency()
+        {
+            var clocks = new TestClocks();
+            pio = new RP2040_PIO(machine, gpio, clocks);
+            Load(0xe321, 0xe022, 0x80a0); // set x,1 [3]; set x,2
+            pio.WriteDoubleWord(0, 1);
+            Advance(2);
+            clocks.SetSystemFrequency(0);
+            Advance(100);
+            Assert.AreEqual(1u, pio.ReadDoubleWord(0xd4));
+            clocks.SetSystemFrequency(2000000);
+            Advance(1);
+            Assert.AreEqual(1u, pio.ReadDoubleWord(0xd4));
+            ((BaseClockSource)machine.ClockSource).Advance(TimeInterval.FromNanoseconds(500));
+            Assert.AreEqual(2u, pio.ReadDoubleWord(0xd4));
+        }
+
         private uint SPIByte(uint value, bool lead, int mosi, int miso, int sck)
         {
             uint result = 0;
@@ -588,6 +694,19 @@ namespace Antmicro.Renode.PeripheralsTests
             for(var index = 0; index < words.Length; index++) pio.WriteDoubleWord(0x48 + 4 * index, words[index]);
         }
         private void Advance(ulong microseconds) => ((BaseClockSource)machine.ClockSource).Advance(TimeInterval.FromMicroseconds(microseconds));
+        private sealed class TestClocks : IRP2ClockSource
+        {
+            public ulong SystemFrequency { get; private set; } = 1000000;
+            public ulong PeripheralFrequency => SystemFrequency;
+            public ulong USBFrequency => 48000000;
+            public event Action ClockChanged;
+            public void SetSystemFrequency(ulong frequency)
+            {
+                SystemFrequency = frequency;
+                ClockChanged?.Invoke();
+            }
+        }
+
         private const int ClockPin = 2;
         private const int DataPin = 3;
         private Machine machine;

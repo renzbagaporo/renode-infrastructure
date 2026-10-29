@@ -64,6 +64,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 control = 0;
                 debug = 0;
                 irqFlags = 0;
+                executingCycle = false;
+                cycleIRQFlags = cycleIRQSet = cycleIRQClear = 0;
                 inputSyncBypass = 0;
                 output = 0;
                 outputEnable = 0;
@@ -209,6 +211,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 case 4:
                     sm.ExecControl = ApplyOperation(sm.ExecControl, value, operation, 0x7fffff9f);
                     if(sm.JumpLoop) { ClearExecution(sm); Schedule(sm); }
+                    BeginPinCycle();
+                    ResolvePinWrites();
                     break;
                 case 8:
                     var previous = sm.ShiftControl;
@@ -270,6 +274,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     }
                     Schedule(sm, wake: sm.Stalled && CanResume(sm));
                 }
+                BeginPinCycle();
+                ResolvePinWrites();
                 break;
             case 8: debug &= ~value; break;
             case 0x30: irqFlags &= ~(value & 0xff); WakeAll(); break;
@@ -291,6 +297,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             lock(SyncRoot)
             {
                 var now = cycleCounter.Value;
+                executingCycle = true;
+                cycleIRQFlags = irqFlags;
+                cycleIRQSet = cycleIRQClear = 0;
                 BeginPinCycle();
                 // Clock enables on the same system edge are simultaneous. Run
                 // all of them before resolving pin strobes in SM priority order.
@@ -340,6 +349,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                         Schedule(sm, advance: false, wake: true);
                     }
                 }
+                var previousIRQFlags = irqFlags;
+                irqFlags = (irqFlags | cycleIRQSet) & ~cycleIRQClear;
+                executingCycle = false;
+                if(previousIRQFlags != irqFlags) WakeAll();
                 ResolvePinWrites();
                 UpdateSignals();
             }
@@ -387,8 +400,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 else if(source == 2)
                 {
                     var mask = 1u << IrqIndex(sm, index);
-                    input = (irqFlags & mask) != 0;
-                    if(input && polarity) { irqFlags &= ~mask; WakeAll(sm); }
+                    input = (ReadIRQFlags() & mask) != 0;
+                    if(input && polarity) ClearIRQ(mask);
                 }
                 else input = false;
                 complete = input == polarity;
@@ -468,13 +481,15 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 break;
             case 6: // IRQ
                 var irqMask = 1u << IrqIndex(sm, argument & 31);
-                if((argument & 0x40) != 0) { irqFlags &= ~irqMask; WakeAll(sm); }
-                else if((argument & 0x20) == 0) { irqFlags |= irqMask; WakeAll(sm); }
-                else
+                if((argument & 0x40) != 0) ClearIRQ(irqMask);
+                else if((argument & 0x20) == 0) SetIRQ(irqMask);
+                else if(!sm.IrqSet)
                 {
-                    if(!sm.IrqSet) { irqFlags |= irqMask; sm.IrqSet = true; WakeAll(sm); }
-                    complete = (irqFlags & irqMask) == 0;
+                    SetIRQ(irqMask);
+                    sm.IrqSet = true;
+                    complete = false;
                 }
+                else complete = (ReadIRQFlags() & irqMask) == 0;
                 break;
             case 7: // SET
                 var immediate = (uint)(argument & 31);
@@ -498,13 +513,29 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
             sm.Delay = sm.Forced || sm.Exec.HasValue ? 0 : ((instruction >> 8) & 31) & ((1 << (5 - SideCount(sm))) - 1);
             var exec = sm.Exec;
+            var forced = sm.Forced;
             ClearExecution(sm);
             if(exec.HasValue)
             {
                 sm.Pending = sm.Injected = true;
+                sm.Forced = forced;
                 sm.Instruction = exec.Value;
             }
             return true;
+        }
+
+        private uint ReadIRQFlags() => executingCycle ? cycleIRQFlags : irqFlags;
+
+        private void SetIRQ(uint mask)
+        {
+            if(executingCycle) cycleIRQSet |= mask;
+            else { irqFlags |= mask; WakeAll(); }
+        }
+
+        private void ClearIRQ(uint mask)
+        {
+            if(executingCycle) cycleIRQClear |= mask;
+            else { irqFlags &= ~mask; WakeAll(); }
         }
 
         private uint ReadSource(StateMachine sm, int source)
@@ -931,5 +962,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private uint control, debug, irqFlags, inputSyncBypass, output, outputEnable;
         private ulong frequency;
         private bool publishing;
+        private bool executingCycle;
+        private uint cycleIRQFlags, cycleIRQSet, cycleIRQClear;
     }
 }
