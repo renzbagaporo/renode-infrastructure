@@ -72,6 +72,11 @@ namespace Antmicro.Renode.Peripherals.Memory
 
         private ulong ReadTransaction(long offset, int count)
         {
+            return xip == null ? ReadTransactionCore(offset, count) : xip.ExecuteTransaction(() => ReadTransactionCore(offset, count));
+        }
+
+        private ulong ReadTransactionCore(long offset, int count)
+        {
             ulong result = 0;
             var hit = true;
             for(var i = 0; i < count; i++)
@@ -98,17 +103,18 @@ namespace Antmicro.Renode.Peripherals.Memory
             if(offset >= 0x2000000) throw new BusAccessException(BusAccessError.AddressError);
             // The serial NOR array can only be programmed with a serial command.
         }
-        public void WriteWord(long offset, ushort value)
+        public void WriteWord(long offset, ushort value) => WriteTransaction(offset, value, 2);
+        public void WriteDoubleWord(long offset, uint value) => WriteTransaction(offset, value, 4);
+        public void WriteQuadWord(long offset, ulong value) => WriteTransaction(offset, value, 8);
+
+        private void WriteTransaction(long offset, ulong value, int count)
         {
-            for(var i = 0; i < 2; i++) WriteByte(offset + i, (byte)(value >> (i * 8)));
-        }
-        public void WriteDoubleWord(long offset, uint value)
-        {
-            for(var i = 0; i < 4; i++) WriteByte(offset + i, (byte)(value >> (i * 8)));
-        }
-        public void WriteQuadWord(long offset, ulong value)
-        {
-            for(var i = 0; i < 8; i++) WriteByte(offset + i, (byte)(value >> (i * 8)));
+            void Write()
+            {
+                for(var i = 0; i < count; i++) WriteByte(offset + i, (byte)(value >> (i * 8)));
+            }
+            if(xip == null) Write();
+            else xip.ExecuteTransaction(Write);
         }
         public void WriteBytes(long offset, byte[] array, int startingIndex, int count, IPeripheral context = null)
         {

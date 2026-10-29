@@ -49,6 +49,20 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
         public event Action ConfigurationChanged;
         public event Action<long, int> ContentsChanged;
 
+        internal T ExecuteTransaction<T>(Func<T> action)
+        {
+            try
+            {
+                lock(SyncRoot) return action();
+            }
+            finally { PublishNotifications(); }
+        }
+
+        internal void ExecuteTransaction(Action action)
+        {
+            ExecuteTransaction(() => { action(); return true; });
+        }
+
         public bool TryReadPinned(long offset, bool useCache, bool untranslated, out byte value)
         {
             lock(SyncRoot) return ReadPinned(offset, useCache, untranslated, out value);
