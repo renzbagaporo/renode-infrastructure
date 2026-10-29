@@ -29,6 +29,8 @@ namespace Antmicro.Renode.Peripherals.CPU
             activationPosition = 0;
             shift = 0;
             bitCount = 0;
+            resetSequencePosition = -1;
+            requireIdentification = true;
             SetDrive(false, false);
         }
 
@@ -71,6 +73,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         protected abstract void WriteParityError();
         protected virtual void LineReset() { }
         protected virtual void ResetTarget() { }
+        protected virtual bool SelectTarget(uint value) { return true; }
 
         private void RisingEdge()
         {
@@ -82,8 +85,25 @@ namespace Antmicro.Renode.Peripherals.CPU
                 state = State.Reset;
                 bitCount = 0;
                 shift = 0;
+                resetSequencePosition = 0;
+                resetSequence = 0;
+                requireIdentification = true;
                 LineReset();
                 return;
+            }
+            if(resetSequencePosition >= 0)
+            {
+                if(data) resetSequence |= 1u << resetSequencePosition;
+                if(++resetSequencePosition == 16)
+                {
+                    resetSequencePosition = -1;
+                    if(resetSequence == 0xe3bc)
+                    {
+                        state = State.Dormant;
+                        alertPosition = 0;
+                        return;
+                    }
+                }
             }
             switch(state)
             {
@@ -130,7 +150,18 @@ namespace Antmicro.Renode.Peripherals.CPU
                 accessPort = (shift & 2) != 0;
                 read = (shift & 4) != 0;
                 address = (byte)((shift >> 1) & 0xc);
-                acknowledgement = BeginTransfer(accessPort, read, address, out transferValue);
+                targetSelection = requireIdentification && !accessPort && !read && address == 12;
+                if(requireIdentification && !targetSelection && (accessPort || !read || address != 0))
+                {
+                    state = State.Lockout;
+                    return;
+                }
+                if(targetSelection) acknowledgement = 0;
+                else
+                {
+                    requireIdentification = false;
+                    acknowledgement = BeginTransfer(accessPort, read, address, out transferValue);
+                }
                 state = State.RequestTurnaround;
                 bitCount = 0;
                 return;
@@ -151,7 +182,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                 FinishTransfer();
                 return;
             case State.WriteTurnaround:
-                if(acknowledgement != Acknowledgement.Ok) FinishTransfer();
+                if(acknowledgement != Acknowledgement.Ok && !targetSelection) FinishTransfer();
                 else
                 {
                     state = State.WriteData;
@@ -166,7 +197,15 @@ namespace Antmicro.Renode.Peripherals.CPU
                     bitCount++;
                     return;
                 }
-                if(data == Parity(shift)) CompleteWrite(accessPort, address, shift);
+                if(targetSelection)
+                {
+                    if(data != Parity(shift) || !SelectTarget(shift))
+                    {
+                        state = State.Lockout;
+                        return;
+                    }
+                }
+                else if(data == Parity(shift)) CompleteWrite(accessPort, address, shift);
                 else WriteParityError();
                 FinishTransfer();
                 return;
@@ -178,7 +217,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             switch(state)
             {
             case State.Acknowledgement:
-                SetDrive((((int)acknowledgement >> bitCount) & 1) != 0, true);
+                SetDrive((((int)acknowledgement >> bitCount) & 1) != 0, !targetSelection);
                 break;
             case State.ReadData:
                 SetDrive(bitCount == 32 ? Parity(transferValue) : ((transferValue >> bitCount) & 1) != 0, true);
@@ -216,9 +255,9 @@ namespace Antmicro.Renode.Peripherals.CPU
         private enum State { Dormant, Activation, Lockout, Reset, Request, RequestTurnaround, Acknowledgement, ReadData, ReadTurnaround, WriteTurnaround, WriteData }
         private static readonly uint[] SelectionAlert = { 0x19bc0ea2, 0xe3ddafe9, 0x86852d95, 0x6209f392 };
         private State state;
-        private bool clock, data, output, outputEnabled, resetAsserted, accessPort, read;
-        private int consecutiveOnes, alertPosition, activationPosition, bitCount;
-        private uint shift, transferValue;
+        private bool clock, data, output, outputEnabled, resetAsserted, accessPort, read, requireIdentification, targetSelection;
+        private int consecutiveOnes, alertPosition, activationPosition, bitCount, resetSequencePosition;
+        private uint shift, transferValue, resetSequence;
         private byte address;
         private Acknowledgement acknowledgement;
     }

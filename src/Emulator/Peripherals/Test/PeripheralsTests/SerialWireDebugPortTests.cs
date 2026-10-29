@@ -59,12 +59,78 @@ namespace Antmicro.Renode.PeripheralsTests
         public void ShouldRejectInvalidWriteParityWithoutCommittingData()
         {
             Wake();
+            Read(0xa5);
             Write(0x81, 0x12345678, !Parity(0x12345678));
             Assert.AreEqual(0, target.WriteCount);
             Assert.AreEqual(1, target.ParityErrors);
             Write(0x81, 0xabcdef00, Parity(0xabcdef00));
             Assert.AreEqual(1, target.WriteCount);
             Assert.AreEqual(0xabcdef00, target.LastWrite);
+        }
+
+        [Test]
+        public void ShouldRecognizeTheArchitecturalSWDToDormantSequence()
+        {
+            Wake();
+            Assert.AreEqual(0x4c013477, Read(0xa5));
+            for(var i = 0; i < 56; i++) Cycle(true);
+            Send(0xe3bc, 16);
+            LineReset();
+            Send(0xa5, 8);
+            Assert.IsFalse(IsDriving);
+            Assert.AreEqual(1, target.RequestCount);
+            Wake();
+            Assert.AreEqual(0x4c013477, Read(0xa5));
+        }
+
+        [Test]
+        public void ShouldAcceptOnlyIdentificationAfterLineReset()
+        {
+            Wake();
+            Send(0x81, 8);
+            Assert.AreEqual(0, target.RequestCount);
+            Assert.IsFalse(IsDriving);
+            LineReset();
+            Assert.AreEqual(0x4c013477, Read(0xa5));
+        }
+
+        [TestCase(0x01002927u, true)]
+        [TestCase(0x11002927u, false)]
+        public void ShouldKeepTargetSelectionResponseUndrivenAndSelectByIdentity(uint identity, bool selected)
+        {
+            Wake();
+            Send(0x99, 8);
+            for(var i = 0; i < 5; i++)
+            {
+                Assert.IsFalse(IsDriving);
+                Cycle(null);
+            }
+            Send(identity, 32);
+            Cycle(Parity(identity));
+            Send(0, 2);
+            if(selected) Assert.AreEqual(0x4c013477, Read(0xa5));
+            else
+            {
+                Send(0xa5, 8);
+                for(var i = 0; i < 40; i++) { Assert.IsFalse(IsDriving); Cycle(null); }
+                Assert.AreEqual(0, target.RequestCount);
+            }
+        }
+
+        [Test]
+        public void ShouldTreatTargetSelectionParityFailureAsProtocolError()
+        {
+            Wake();
+            Send(0x99, 8);
+            for(var i = 0; i < 5; i++) Cycle(null);
+            Send(0x01002927, 32);
+            Cycle(!Parity(0x01002927));
+            Send(0xa5, 8);
+            Assert.AreEqual(0, target.RequestCount);
+            Assert.AreEqual(0, target.ParityErrors);
+            Assert.IsFalse(IsDriving);
+            LineReset();
+            Assert.AreEqual(0x4c013477, Read(0xa5));
         }
 
         [TestCase(2)]
@@ -202,6 +268,7 @@ namespace Antmicro.Renode.PeripheralsTests
             }
             protected override void CompleteWrite(bool ap, byte address, uint value) { WriteCount++; LastWrite = value; }
             protected override void WriteParityError() { ParityErrors++; }
+            protected override bool SelectTarget(uint value) { return value == 0x01002927; }
         }
 
         private TestTarget target;
