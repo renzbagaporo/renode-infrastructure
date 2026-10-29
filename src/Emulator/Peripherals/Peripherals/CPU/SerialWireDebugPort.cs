@@ -394,7 +394,9 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         protected enum Acknowledgement { Ok = 1, Wait = 2, Fault = 4 }
         private enum State { Dormant, Activation, Lockout, Reset, Request, RequestTurnaround, Acknowledgement, ReadData, ReadTurnaround, WriteTurnaround, WriteData }
-        private static readonly uint[] SelectionAlert = { 0x19bc0ea2, 0xe3ddafe9, 0x86852d95, 0x6209f392 };
+        // IHI 0074E B5.3.3 transmits the complete 128-bit value LSB first:
+        // the least-significant word is clocked before the remaining words.
+        private static readonly uint[] SelectionAlert = { 0x6209f392, 0x86852d95, 0xe3ddafe9, 0x19bc0ea2 };
         private State state;
         private bool data = true;
         private bool clock, output, outputEnabled, resetAsserted, accessPort, read, requireIdentification, targetSelection;

@@ -31,6 +31,20 @@ namespace Antmicro.Renode.PeripheralsTests
         }
 
         [Test]
+        public void ShouldRejectSelectionAlertWithReversedWordOrder()
+        {
+            Send(0xff, 8);
+            foreach(var word in new uint[] { 0x19bc0ea2, 0xe3ddafe9, 0x86852d95, 0x6209f392 }) Send(word, 32);
+            Send(0, 4);
+            Send(0x1a, 8);
+            LineReset();
+            Send(0xa5, 8);
+            Cycle(null);
+            Assert.IsFalse(IsDriving);
+            Assert.AreEqual(0, target.RequestCount);
+        }
+
+        [Test]
         public void ShouldDriveAckDataAndParityOnlyAfterTurnaround()
         {
             Wake();
@@ -398,7 +412,13 @@ namespace Antmicro.Renode.PeripheralsTests
         private void SendAlert()
         {
             Send(0xff, 8);
-            foreach(var word in new uint[] { 0x19bc0ea2, 0xe3ddafe9, 0x86852d95, 0x6209f392 }) Send(word, 32);
+            // Arm IHI 0074E, B5.3.3, page B5-143 gives this explicit
+            // binary sequence in transmission order (leftmost bit first).
+            const string wireOrder = "01001001110011111001000001000110"
+                + "10101001101101001010000101100001"
+                + "10010111111101011011101111000111"
+                + "01000101011100000011110110011000";
+            foreach(var bit in wireOrder) Cycle(bit == '1');
         }
 
         private void LineReset()
