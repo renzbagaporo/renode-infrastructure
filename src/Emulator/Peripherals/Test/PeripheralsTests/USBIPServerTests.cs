@@ -504,6 +504,79 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.That(device.Connection.Setup.DescriptorRequests, Is.EqualTo(count + 1));
         }
 
+        [TestCase("stall")]
+        [TestCase("incomplete")]
+        [TestCase("error")]
+        [TestCase("cancelled")]
+        public void ShouldRetryFailedDiscoveryWithoutPhysicalReplug(string failure)
+        {
+            device.SetConnection(false);
+            device.SetConnection(true);
+            server.Reset();
+            var count = device.Connection.Setup.DescriptorRequests;
+            device.Connection.Setup.NextDescriptorFailure = failure;
+            Assert.Throws<TargetInvocationException>(() => CacheDescriptors());
+            Assert.DoesNotThrow(() => CacheDescriptors(), "A completed failure must not poison this physical incarnation");
+            Assert.That(device.Connection.Setup.DescriptorRequests, Is.EqualTo(count + 5));
+            CacheDescriptors();
+            Assert.That(device.Connection.Setup.DescriptorRequests, Is.EqualTo(count + 5), "The successful retry is cached");
+        }
+
+        [Test]
+        public void ShouldShareFailedDiscoveryUntilItsPipeCleanupCompletes()
+        {
+            device.SetConnection(false);
+            device.SetConnection(true);
+            server.Reset();
+            server.Run();
+            var provider = GetField<SocketServerProvider>(server, "server");
+            var count = device.Connection.Setup.DescriptorRequests;
+            using(var cleanupStarted = new ManualResetEventSlim())
+            using(var cleanupReleased = new ManualResetEventSlim())
+            {
+                device.Connection.Setup.NextDescriptorFailure = "stall";
+                device.Connection.Setup.BeforeReadUnsubscribed = () =>
+                {
+                    device.Connection.Setup.BeforeReadUnsubscribed = null;
+                    cleanupStarted.Set();
+                    cleanupReleased.Wait(Timeout * 3);
+                };
+                try
+                {
+                    object firstSession;
+                    using(var first = new TcpClient())
+                    {
+                        first.Connect(IPAddress.Loopback, provider.Port.Value);
+                        SendImport(first.GetStream());
+                        Assert.That(cleanupStarted.Wait(Timeout), Is.True);
+                        firstSession = GetField<object>(server, "metadataTransfer");
+                        Assert.That(firstSession, Is.Not.Null);
+                    }
+                    using(var second = new TcpClient())
+                    {
+                        second.ReceiveTimeout = Timeout;
+                        second.Connect(IPAddress.Loopback, provider.Port.Value);
+                        SendImport(second.GetStream());
+                        Assert.That(SpinWait.SpinUntil(() =>
+                        {
+                            var session = GetField<object>(server, "metadataTransfer");
+                            return session != null && session != firstSession;
+                        }, Timeout), Is.True);
+                        Assert.That(device.Connection.Setup.DescriptorRequests, Is.EqualTo(count + 1),
+                            "An unwinding EP0 reader still owns the physical flight");
+                        cleanupReleased.Set();
+                        Assert.That(second.GetStream().ReadByte(), Is.EqualTo(-1));
+                    }
+                    using(var third = ImportDevice()) Assert.That(third.Connected, Is.True);
+                    Assert.That(device.Connection.Setup.DescriptorRequests, Is.EqualTo(count + 5));
+                }
+                finally
+                {
+                    cleanupReleased.Set();
+                }
+            }
+        }
+
         [Test]
         public void ShouldCancelPhysicalDiscoveryOnServerDispose()
         {
@@ -697,7 +770,23 @@ namespace Antmicro.Renode.PeripheralsTests
             {
                 if(setup.Request == 6 && setup.Value >> 8 != 0)
                 {
+                    stalledInput = false;
                     Interlocked.Increment(ref DescriptorRequests);
+                    var failure = NextDescriptorFailure;
+                    NextDescriptorFailure = null;
+                    switch(failure)
+                    {
+                    case "stall":
+                        StallInput();
+                        return;
+                    case "incomplete":
+                        Push(new byte[4]);
+                        return;
+                    case "error":
+                        throw new InvalidOperationException("Descriptor delivery failed");
+                    case "cancelled":
+                        throw new OperationCanceledException();
+                    }
                     if(HoldDescriptors)
                     {
                         heldDescriptor = setup;
@@ -746,13 +835,20 @@ namespace Antmicro.Renode.PeripheralsTests
             public void Push(byte[] data)
             {
                 packets.Enqueue(data);
-                NewPacket?.Invoke();
+                newPacket?.Invoke();
             }
             public void StallInput() { stalledInput = true; StatusChanged?.Invoke(); }
             public bool IsStalled(USBDirection direction) => direction == USBDirection.DeviceToHost && stalledInput;
             public event Action StatusChanged;
             private bool stalledInput;
-            public event Action NewPacket;
+            public event Action NewPacket
+            {
+                add { newPacket += value; }
+                remove { BeforeReadUnsubscribed?.Invoke(); newPacket -= value; }
+            }
+            private event Action newPacket;
+            public Action BeforeReadUnsubscribed;
+            public string NextDescriptorFailure;
             public byte[] SetupResponse = Array.Empty<byte>();
             public bool HoldDescriptors;
             public int DescriptorRequests;

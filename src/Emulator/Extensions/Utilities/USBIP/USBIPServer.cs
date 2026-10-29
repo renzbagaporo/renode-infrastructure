@@ -776,15 +776,18 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
         {
             PendingTransfer session;
             DescriptorDiscovery discovery;
+            DeviceConnectionState registration;
+            int version;
             lock(transferLock)
             {
                 if(disconnecting || (expectedGeneration.HasValue && expectedGeneration.Value != generation)
-                    || !deviceStates.TryGetValue(device, out var registration) || !registration.Connected) throw new OperationCanceledException();
+                    || !deviceStates.TryGetValue(device, out registration) || !registration.Connected) throw new OperationCanceledException();
+                version = registration.Version;
+                EvictFailedDiscovery(device, registration, version, registration.Discovery);
                 var connection = deviceToConnection[device];
                 descriptorConnections.Add(connection);
                 if(registration.Discovery == null)
                 {
-                    var version = registration.Version;
                     var transfer = new PendingTransfer(default(URBHeader), default(URBRequest), default(SetupPacket), Array.Empty<byte>(), connection, generation,
                         () => Volatile.Read(ref registration.Version) == version);
                     var next = new DescriptorDiscovery(transfer);
@@ -802,6 +805,11 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
                 // keeps ownership of EP0 until it finishes or the device unplugs.
                 discovery.Result.Wait(session.Token);
                 snapshot = discovery.Result.GetAwaiter().GetResult();
+            }
+            catch
+            {
+                EvictFailedDiscovery(device, registration, version, discovery);
+                throw;
             }
             finally
             {
@@ -823,6 +831,23 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
                 foreach(var iface in snapshot.Interfaces) result = result.Concat(Packet.Encode(iface));
             }
             return result.ToArray();
+        }
+
+        private void EvictFailedDiscovery(IUSBDevice device, DeviceConnectionState registration, int version, DescriptorDiscovery discovery)
+        {
+            var result = discovery?.Result;
+            // Faulted/cancelled tasks are complete: DiscoverDevice has disposed
+            // the transfer and every pipe reader has finished its cleanup.
+            // A cancelled TCP waiter must never evict a still-running flight.
+            if(result == null || (!result.IsFaulted && !result.IsCanceled)) return;
+            lock(transferLock)
+            {
+                if(deviceStates.TryGetValue(device, out var current) && current == registration
+                    && registration.Version == version && registration.Discovery == discovery && discovery.Result == result)
+                {
+                    registration.Discovery = null;
+                }
+            }
         }
 
         private DescriptorSnapshot DiscoverDevice(IUSBDevice device, IUSBConnection conn, DeviceConnectionState registration, int version, PendingTransfer transfer)
