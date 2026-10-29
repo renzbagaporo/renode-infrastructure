@@ -16,6 +16,8 @@ namespace Antmicro.Renode.Peripherals.DMA
 {
     // One shared read/data slot models the bus pipeline. Requests accept reads;
     // writes already accepted into that slot drain independently of DREQ and EN.
+    // This conservative bus pipeline completes at most one transfer per two
+    // system cycles; it does not model the RP2040 crossbar's parallel masters.
     public sealed class RP2040_DMA : RP2APBPeripheral, IGPIOReceiver
     {
         public RP2040_DMA(IMachine machine, IRP2ClockSource clocks = null, ulong frequency = 125000000) : base(machine)
@@ -37,7 +39,8 @@ namespace Antmicro.Renode.Peripherals.DMA
         public GPIO IRQ0 { get; }
         public GPIO IRQ1 { get; }
 
-        // Hardware request numbers match the RP2040 TREQ_SEL encoding.
+        // Hardware request numbers match the RP2040 TREQ_SEL encoding. Inputs
+        // are FIFO-ready levels (as provided by RP2040_PIO), not pulse credits.
         public void OnGPIO(int number, bool value)
         {
             if(number < 0 || number >= requests.Length) return;
@@ -287,9 +290,9 @@ namespace Antmicro.Renode.Peripherals.DMA
         {
             switch(transfer.Bytes)
             {
-            case 1: return machine.SystemBus.ReadByte(transfer.ReadAddress);
-            case 2: return machine.SystemBus.ReadWord(transfer.ReadAddress);
-            default: return machine.SystemBus.ReadDoubleWord(transfer.ReadAddress);
+            case 1: return machine.SystemBus.ReadByte(transfer.ReadAddress, context: this);
+            case 2: return machine.SystemBus.ReadWord(transfer.ReadAddress, context: this);
+            default: return machine.SystemBus.ReadDoubleWord(transfer.ReadAddress, context: this);
             }
         }
 
@@ -297,14 +300,14 @@ namespace Antmicro.Renode.Peripherals.DMA
         {
             switch(transfer.Bytes)
             {
-            case 1: machine.SystemBus.WriteByte(transfer.WriteAddress, (byte)transfer.Data); break;
-            case 2: machine.SystemBus.WriteWord(transfer.WriteAddress, (ushort)transfer.Data); break;
-            default: machine.SystemBus.WriteDoubleWord(transfer.WriteAddress, transfer.Data); break;
+            case 1: machine.SystemBus.WriteByte(transfer.WriteAddress, (byte)transfer.Data, context: this); break;
+            case 2: machine.SystemBus.WriteWord(transfer.WriteAddress, (ushort)transfer.Data, context: this); break;
+            default: machine.SystemBus.WriteDoubleWord(transfer.WriteAddress, transfer.Data, context: this); break;
             }
         }
 
         private bool Mapped(uint address, int bytes) => (address & (uint)(bytes - 1)) == 0
-            && machine.SystemBus.WhatIsAt(address) != null && machine.SystemBus.WhatIsAt((ulong)address + (uint)bytes - 1) != null;
+            && machine.SystemBus.WhatIsAt(address, this) != null && machine.SystemBus.WhatIsAt((ulong)address + (uint)bytes - 1, this) != null;
 
         private Channel Arbitrate()
         {

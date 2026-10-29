@@ -388,7 +388,9 @@ namespace Antmicro.Renode.PeripheralsTests
         public void ShouldWaitForSystemClockAndResumePendingTransferAtNewFrequency()
         {
             var clocks = new MutableClock { SystemFrequency = 1000000 };
+            machine.SystemBus.Unregister(dma);
             dma = new RP2040_DMA(machine, clocks);
+            machine.SystemBus.Register(dma, new BusRangeRegistration(Dma, 0x4000));
             memory.WriteDoubleWord(0, 0x12345678);
             Configure(0, Ram, Ram + 0x100, 2, Control(0, 2, 63, true, true));
             Advance(1);
@@ -426,6 +428,35 @@ namespace Antmicro.Renode.PeripheralsTests
                 Assert.AreEqual(0u, pio.ReadDoubleWord(8));
                 dma.WriteDoubleWord(0x400, 3);
             }
+        }
+
+        [Test]
+        public void ShouldIdentifyDMABusInitiatorAndRestoreSurroundingTransaction()
+        {
+            var peripheral = new WidthPeripheral(dma);
+            machine.SystemBus.Register(peripheral, new BusRangeRegistration(Device, 0x100));
+            Action checkInitiator = () =>
+            {
+                Assert.IsTrue(machine.SystemBus.TryGetTransactionInitiator(out var initiator));
+                Assert.AreSame(dma, initiator);
+            };
+            peripheral.OnRead = _ => checkInitiator();
+            peripheral.OnWrite = (_, width, value) =>
+            {
+                checkInitiator();
+                Assert.AreEqual(2, width);
+                Assert.AreEqual(0x3344u, value);
+            };
+            using(machine.SystemBus.SetLocalContext(memory))
+            {
+                Configure(0, Device, Ram, 1, Control(0, 2, 63, false, false));
+                Advance(2);
+                Configure(0, Ram, Device, 1, Control(0, 1, 63, false, false));
+                Advance(2);
+                Assert.IsTrue(machine.SystemBus.TryGetTransactionInitiator(out var initiator));
+                Assert.AreSame(memory, initiator);
+            }
+            Assert.IsFalse(machine.SystemBus.TryGetTransactionInitiator(out _));
         }
 
         [Test]
@@ -471,18 +502,24 @@ namespace Antmicro.Renode.PeripheralsTests
             public WidthPeripheral(RP2040_DMA dma) { this.dma = dma; }
             public readonly List<int> Reads = new List<int>();
             public Action<long> OnRead;
+            public Action<long, int, uint> OnWrite;
             public byte ReadByte(long offset) { Read(offset, 1); return 0x44; }
             public ushort ReadWord(long offset) { Read(offset, 2); return 0x3344; }
             public uint ReadDoubleWord(long offset) { Read(offset, 4); return 0x11223344; }
-            public void WriteByte(long offset, byte value) => Assert.IsFalse(Monitor.IsEntered(dma));
-            public void WriteWord(long offset, ushort value) => Assert.IsFalse(Monitor.IsEntered(dma));
-            public void WriteDoubleWord(long offset, uint value) => Assert.IsFalse(Monitor.IsEntered(dma));
+            public void WriteByte(long offset, byte value) => Write(offset, 1, value);
+            public void WriteWord(long offset, ushort value) => Write(offset, 2, value);
+            public void WriteDoubleWord(long offset, uint value) => Write(offset, 4, value);
             public void Reset() { }
             private void Read(long offset, int width)
             {
                 Assert.IsFalse(Monitor.IsEntered(dma));
                 Reads.Add(width);
                 OnRead?.Invoke(offset);
+            }
+            private void Write(long offset, int width, uint value)
+            {
+                Assert.IsFalse(Monitor.IsEntered(dma));
+                OnWrite?.Invoke(offset, width, value);
             }
             private readonly RP2040_DMA dma;
         }
