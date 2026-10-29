@@ -13,9 +13,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 {
     public sealed class RP2350_Ticks : RP2APBPeripheral
     {
-        public RP2350_Ticks(IMachine machine, RP2350_Clocks clocks) : base(machine)
+        public RP2350_Ticks(IMachine machine, RP2350_Clocks clocks, RP2_Timer timer0 = null, RP2_Timer timer1 = null) : base(machine)
         {
             this.clocks = clocks;
+            this.timer0 = timer0;
+            this.timer1 = timer1;
             enabled = new bool[NumberOfTicks];
             cycles = new uint[NumberOfTicks];
             timers = new LimitTimer[NumberOfTicks];
@@ -35,7 +37,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
                 timer.Reset();
             }
+            UpdateClocks();
         }
+
+        public event Action ClockChanged;
 
         public ulong GetFrequency(int tick)
         {
@@ -104,8 +109,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 }
                 timers[i].Enabled = enabled[i] && cycles[i] != 0 && frequency != 0;
             }
+            timer0?.SetTickClock(GetFrequency(2), GetFrequency(2) != 0);
+            timer1?.SetTickClock(GetFrequency(3), GetFrequency(3) != 0);
+            ClockChanged?.Invoke();
         }
 
+        private readonly RP2_Timer timer0;
+        private readonly RP2_Timer timer1;
         private readonly bool[] enabled;
         private readonly uint[] cycles;
         private readonly LimitTimer[] timers;

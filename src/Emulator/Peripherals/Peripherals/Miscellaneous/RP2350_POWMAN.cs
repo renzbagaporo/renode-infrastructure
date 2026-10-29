@@ -36,6 +36,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             debugConfiguration = 0;
             watchdogSelect = 0;
             rescueHeld = false;
+            powerState = timerControl = 0;
+            Array.Clear(powerUp, 0, powerUp.Length);
             Array.Clear(scratch, 0, scratch.Length);
         }
 
@@ -53,6 +55,27 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         }
 
         public event Action<int> WarmReset;
+        public uint WatchdogSelection => watchdogSelect;
+
+        public void ResetFromWatchdog(RP2350_Watchdog watchdog)
+        {
+            var selected = watchdogSelect;
+            var cause = (selected & 1) != 0 ? 1u << 22 : (selected & 0x10) != 0 ? 1u << 23
+                : (selected & 0x100) != 0 ? 1u << 24 : 1u << 28;
+            var retainedFlags = chipReset & 0x11;
+            var retainedScratch = (uint[])scratch.Clone();
+            if((selected & 0x11) != 0)
+            {
+                Reset();
+                Array.Copy(retainedScratch, scratch, scratch.Length);
+            }
+            chipReset = cause | retainedFlags;
+            if((selected & 0x111) != 0) powerState = 0;
+            watchdog.ClearScratchOnPowerReset();
+            var retained = new List<IPeripheral> { this, debugPort, watchdog };
+            retained.AddRange(machine.GetRegisteredPeripherals().Select(entry => entry.Peripheral).OfType<WinbondW25QFlash>());
+            machine.RequestResetInSafeState(unresetable: retained);
+        }
 
         protected override uint ReadRegister(long offset)
         {
@@ -62,6 +85,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             case 0: return badPassword ? 1u : 0;
             case 0x2c: return chipReset;
             case 0x30: return watchdogSelect;
+            case 0x38: return powerState;
+            case 0x88: return timerControl;
+            case 0x8c: case 0x90: case 0x94: case 0x98: return powerUp[(offset - 0x8c) / 4];
             case 0xa4: return debugPowerConfiguration;
             case 0xa8: return bootDisable;
             case 0xac: return debugConfiguration;
@@ -95,6 +121,35 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             case 0x2c:
                 if((value & 0x10) != 0) chipReset &= ~0x10u;
                 chipReset = ApplyOperation(chipReset, value, operation, 1);
+                break;
+            case 0x38:
+                var request = (ApplyOperation(powerState, value, operation, 0xf0) >> 4) & 0xf;
+                var current = powerState & 0xf;
+                powerState = (powerState & 0xf) | (request << 4);
+                if((request & 4) != 0 && (request & 8) == 0 || ((request & ~current) != 0 && (current & ~request) != 0))
+                {
+                    powerState |= 0x400;
+                    return;
+                }
+                if(request != current)
+                {
+                    powerState |= 0x2000;
+                    machine.LocalTimeSource.ExecuteInNearestSyncedState(_ =>
+                    {
+                        powerState = (request << 4) | request;
+                        machine.SystemBus.SetAddressRangeLocked(new Antmicro.Renode.Core.Range(0x20000000, 0x40000), (request & 2) != 0);
+                        machine.SystemBus.SetAddressRangeLocked(new Antmicro.Renode.Core.Range(0x20040000, 0x42000), (request & 1) != 0);
+                        machine.SystemBus.SetAddressRangeLocked(new Antmicro.Renode.Core.Range(0x400e0000, 0x4000), (request & 4) != 0);
+                        foreach(var core in cores) core.CpuWaitSignal.Set((request & 8) != 0);
+                    });
+                }
+                break;
+            case 0x88:
+                timerControl = ApplyOperation(timerControl, value, operation, 0x7ff);
+                break;
+            case 0x8c: case 0x90: case 0x94: case 0x98:
+                var powerIndex = (offset - 0x8c) / 4;
+                powerUp[powerIndex] = ApplyOperation(powerUp[powerIndex], value, operation, 0x3fff);
                 break;
             case 0x30:
                 watchdogSelect = ApplyOperation(watchdogSelect, value, operation, 0x1111);
@@ -144,6 +199,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private readonly NVIC[] nvics;
         private readonly RP2350_DebugPort debugPort;
         private readonly uint[] scratch = new uint[12];
+        private readonly uint[] powerUp = new uint[4];
+        private uint powerState;
+        private uint timerControl;
         private uint chipReset;
         private uint bootDisable;
         private uint watchdogSelect;
