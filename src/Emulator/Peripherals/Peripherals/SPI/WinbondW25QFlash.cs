@@ -153,6 +153,7 @@ namespace Antmicro.Renode.Peripherals.SPI
             }
             transaction.Clear();
             command = 0;
+            StateChanged?.Invoke();
         }
 
         public void OnGPIO(int number, bool value)
@@ -167,9 +168,18 @@ namespace Antmicro.Renode.Peripherals.SPI
             continuousRead = false;
             writeEnabled = false;
             command = 0;
+            StateChanged?.Invoke();
         }
 
         public MappedMemory UnderlyingMemory => underlyingMemory;
+
+        public event Action StateChanged;
+
+        public bool ReadAvailable => !Busy;
+
+        public bool QuadEnabled => (status2 & 2) != 0;
+
+        public bool ContinuousReadEnabled => continuousRead;
 
         // Durations use the typical values in W25Q16JV Rev G, AC characteristics.
         private void BeginOperation(uint durationMicroseconds)
@@ -197,6 +207,7 @@ namespace Antmicro.Renode.Peripherals.SPI
             operationTimer.Limit = durationMicroseconds;
             operationTimer.ResetValue();
             operationTimer.Enabled = true;
+            StateChanged?.Invoke();
         }
 
         private void CompleteOperation()
@@ -235,6 +246,7 @@ namespace Antmicro.Renode.Peripherals.SPI
             }
             writeEnabled = false;
             pendingData = null;
+            StateChanged?.Invoke();
         }
 
         private bool IsProtected(int address)

@@ -16,8 +16,7 @@ using Antmicro.Renode.Time;
 
 namespace Antmicro.Renode.Peripherals.SPI
 {
-    [AllowedTranslations(AllowedTranslation.ByteToDoubleWord | AllowedTranslation.WordToDoubleWord)]
-    public sealed class RP2040_SSI : SimpleContainer<ISPIPeripheral>, IDoubleWordPeripheral, IKnownSize, IGPIOReceiver
+    public sealed class RP2040_SSI : SimpleContainer<ISPIPeripheral>, IDoubleWordPeripheral, IWordPeripheral, IBytePeripheral, IKnownSize, IGPIOReceiver
     {
         public RP2040_SSI(IMachine machine, ulong frequency = 125000000) : base(machine)
         {
@@ -52,7 +51,16 @@ namespace Antmicro.Renode.Peripherals.SPI
             errors = 0;
             dummyWait = false;
             UpdateInterrupt();
+            ConfigurationChanged?.Invoke();
         }
+
+        public byte ReadByte(long offset) => (byte)(ReadDoubleWord(offset & ~3L) >> (int)((offset & 3) * 8));
+
+        public ushort ReadWord(long offset) => (ushort)(ReadDoubleWord(offset & ~3L) >> (int)((offset & 2) * 8));
+
+        public void WriteByte(long offset, byte value) => WriteDoubleWord(offset & ~3L, (uint)value * 0x01010101u);
+
+        public void WriteWord(long offset, ushort value) => WriteDoubleWord(offset & ~3L, (uint)value | ((uint)value << 16));
 
         public uint ReadDoubleWord(long offset)
         {
@@ -154,6 +162,7 @@ namespace Antmicro.Renode.Peripherals.SPI
                 break;
             }
             UpdateInterrupt();
+            ConfigurationChanged?.Invoke();
         }
 
         // IO_QSPI.OUTOVER: 0 normal, 1 invert, 2 force low, 3 force high.
@@ -167,6 +176,7 @@ namespace Antmicro.Renode.Peripherals.SPI
                 var next = value & 3;
                 if(next == 3 || (next == 0 && chipSelectOverride == 2 && !transferTimer.Enabled)) EndTransaction();
                 chipSelectOverride = next;
+                ConfigurationChanged?.Invoke();
             }
         }
 
@@ -180,6 +190,17 @@ namespace Antmicro.Renode.Peripherals.SPI
         {
             if(number == 0) ChipSelectOverride = value ? 3u : 2u;
         }
+
+        public event Action ConfigurationChanged;
+
+        // This model exposes 32-bit XIP bus words in EEPROM-read mode.
+        // The external flash must also accept the configured instruction/mode.
+        public bool IsXIPReady => Enabled && registers[4] == 1 && chipSelectOverride == 0
+            && registers[0x14 / 4] != 0 && Mode == 3 && FrameBits == 32
+            && (LaneWidth == 1 || LaneWidth == 2 || LaneWidth == 4)
+            && ((registers[0xf4 / 4] >> 2) & 15) >= 6
+            && ((registers[0xf4 / 4] >> 2) & 15) <= 8
+            && (registers[0xf4 / 4] & 3) <= 2;
 
         public GPIO IRQ { get; } = new GPIO();
         public long Size => 0x4000;
@@ -309,6 +330,7 @@ namespace Antmicro.Renode.Peripherals.SPI
                 if(TryGetByAddress(0, out var target)) target.FinishTransmission();
             }
             transactionActive = false;
+            ConfigurationChanged?.Invoke();
         }
 
         private uint ClearErrors(uint mask)

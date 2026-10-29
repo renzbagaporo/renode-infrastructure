@@ -134,6 +134,50 @@ namespace Antmicro.Renode.PeripheralsTests
         }
 
         [Test]
+        public void ShouldReplicateNarrowBusWritesWithoutReadingTheReceiveFifo()
+        {
+            machine.SystemBus.WriteByte(0x18000000, 7);
+            Assert.AreEqual(0x07070707u, ssi.ReadDoubleWord(0));
+            machine.SystemBus.WriteWord(0x18000000, 0xabcd);
+            Assert.AreEqual(0xabcdabcdu, ssi.ReadDoubleWord(0));
+            Configure();
+            machine.SystemBus.WriteByte(0x18000060, 0x9f);
+            Advance(16);
+            Assert.AreEqual(1u, ssi.ReadDoubleWord(0x24));
+            machine.SystemBus.WriteByte(0x18000060, 0);
+            Assert.AreEqual(1u, ssi.ReadDoubleWord(0x24));
+        }
+
+        [Test]
+        public void ShouldExposeXipReadinessOnlyForEnabledEnhancedReadConfiguration()
+        {
+            var notifications = 0;
+            ssi.ConfigurationChanged += () => notifications++;
+            Assert.IsFalse(ssi.IsXIPReady);
+            Configure();
+            Assert.IsFalse(ssi.IsXIPReady);
+            ssi.WriteDoubleWord(8, 0);
+            ssi.WriteDoubleWord(0, (2u << 21) | (31u << 16) | (3u << 8));
+            ssi.WriteDoubleWord(0xf4, 2u | (8u << 2) | (0xa0u << 24) | (4u << 11));
+            Assert.IsFalse(ssi.IsXIPReady);
+            ssi.WriteDoubleWord(8, 1);
+            Assert.IsTrue(ssi.IsXIPReady);
+            ssi.ChipSelectOverride = 3;
+            Assert.IsFalse(ssi.IsXIPReady);
+            ssi.ChipSelectOverride = 0;
+            Assert.IsTrue(ssi.IsXIPReady);
+            ssi.WriteDoubleWord(0x10, 0);
+            Assert.IsFalse(ssi.IsXIPReady);
+            ssi.WriteDoubleWord(8, 0);
+            ssi.WriteDoubleWord(0, (31u << 16) | (3u << 8));
+            ssi.WriteDoubleWord(0xf4, (3u << 24) | (2u << 8) | (6u << 2));
+            ssi.WriteDoubleWord(0x10, 1);
+            ssi.WriteDoubleWord(8, 1);
+            Assert.IsTrue(ssi.IsXIPReady);
+            Assert.Greater(notifications, 0);
+        }
+
+        [Test]
         public void ShouldConfigureThroughAtomicAliases()
         {
             Configure();
