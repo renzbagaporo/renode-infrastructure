@@ -1215,7 +1215,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
             catch(BusAccessException exception)
             {
-                HandleBusAccessError(offset, SysbusAccessWidth.Byte, BusAccess.Operation.Read, exception.Error);
+                HandleBusAccessError(offset, SysbusAccessWidth.Byte, BusAccess.Operation.Read, exception.Error, cpuState);
                 return 0;
             }
         }
@@ -1240,7 +1240,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
             catch(BusAccessException exception)
             {
-                HandleBusAccessError(offset, SysbusAccessWidth.Word, BusAccess.Operation.Read, exception.Error);
+                HandleBusAccessError(offset, SysbusAccessWidth.Word, BusAccess.Operation.Read, exception.Error, cpuState);
                 return 0;
             }
         }
@@ -1265,7 +1265,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
             catch(BusAccessException exception)
             {
-                HandleBusAccessError(offset, SysbusAccessWidth.DoubleWord, BusAccess.Operation.Read, exception.Error);
+                HandleBusAccessError(offset, SysbusAccessWidth.DoubleWord, BusAccess.Operation.Read, exception.Error, cpuState);
                 return 0;
             }
         }
@@ -1290,7 +1290,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
             catch(BusAccessException exception)
             {
-                HandleBusAccessError(offset, SysbusAccessWidth.QuadWord, BusAccess.Operation.Read, exception.Error);
+                HandleBusAccessError(offset, SysbusAccessWidth.QuadWord, BusAccess.Operation.Read, exception.Error, cpuState);
                 return 0;
             }
         }
@@ -1316,7 +1316,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
             catch(BusAccessException exception)
             {
-                HandleBusAccessError(offset, SysbusAccessWidth.Byte, BusAccess.Operation.Write, exception.Error);
+                HandleBusAccessError(offset, SysbusAccessWidth.Byte, BusAccess.Operation.Write, exception.Error, cpuState);
             }
         }
 
@@ -1341,7 +1341,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
             catch(BusAccessException exception)
             {
-                HandleBusAccessError(offset, SysbusAccessWidth.Word, BusAccess.Operation.Write, exception.Error);
+                HandleBusAccessError(offset, SysbusAccessWidth.Word, BusAccess.Operation.Write, exception.Error, cpuState);
             }
         }
 
@@ -1366,7 +1366,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
             catch(BusAccessException exception)
             {
-                HandleBusAccessError(offset, SysbusAccessWidth.DoubleWord, BusAccess.Operation.Write, exception.Error);
+                HandleBusAccessError(offset, SysbusAccessWidth.DoubleWord, BusAccess.Operation.Write, exception.Error, cpuState);
             }
         }
 
@@ -1391,11 +1391,11 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
             catch(BusAccessException exception)
             {
-                HandleBusAccessError(offset, SysbusAccessWidth.QuadWord, BusAccess.Operation.Write, exception.Error);
+                HandleBusAccessError(offset, SysbusAccessWidth.QuadWord, BusAccess.Operation.Write, exception.Error, cpuState);
             }
         }
 
-        protected virtual void HandleBusAccessError(ulong address, SysbusAccessWidth width, BusAccess.Operation operation, BusAccessError error)
+        protected virtual void HandleBusAccessError(ulong address, SysbusAccessWidth width, BusAccess.Operation operation, BusAccessError error, ulong cpuState)
         {
             this.WarningLog("This CPU does not support handling bus access errors, ignoring {0} on a {1} access of width {2} at 0x{3:X}.", error, operation, width, address);
         }

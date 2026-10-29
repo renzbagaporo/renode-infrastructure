@@ -951,9 +951,18 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         public const uint IDAU_SAURegionAddressMask = ~(IDAU_SAURegionMinSize - 1u);
 
-        protected override void HandleBusAccessError(ulong address, SysbusAccessWidth width, BusAccess.Operation operation, BusAccessError error)
+        protected override void HandleBusAccessError(ulong address, SysbusAccessWidth width, BusAccess.Operation operation, BusAccessError error, ulong cpuState)
         {
-            tlibRaisePreciseBusFault(checked((uint)address));
+            if(((ContextState)cpuState).InstructionFetch)
+            {
+                // Report the failed bus transaction to the native fetch helper.
+                // It distinguishes speculative reads from architecturally required fetches.
+                tlibReportInstructionFetchBusError();
+            }
+            else
+            {
+                tlibRaisePreciseBusFault(checked((uint)address));
+            }
         }
 
         protected override UInt32 BeforePCWrite(UInt32 value)
@@ -1381,6 +1390,9 @@ namespace Antmicro.Renode.Peripherals.CPU
         private readonly Action<uint> tlibRaisePreciseBusFault;
 
         [Import]
+        private readonly Action tlibReportInstructionFetchBusError;
+
+        [Import]
         private readonly Action tlibEnterResetLockup;
 
         [Import]
@@ -1480,6 +1492,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             // A MEM-AP can select this core's PPB bank without being a
             // transaction issued by that core's processor bus master.
             public bool DebugAccess;
+            public bool InstructionFetch;
 
             public static implicit operator ulong(ContextState stateObj)
             {
@@ -1489,6 +1502,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                 state |= stateObj.AttributionSecure ? 4UL : 0;
                 state |= stateObj.Semihosting ? 8UL : 0;
                 state |= stateObj.DebugAccess ? 16UL : 0;
+                state |= stateObj.InstructionFetch ? 32UL : 0;
                 return state;
             }
 
@@ -1501,6 +1515,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                     AttributionSecure = (state & 4UL) == 4UL,
                     Semihosting = (state & 8UL) == 8UL,
                     DebugAccess = (state & 16UL) == 16UL,
+                    InstructionFetch = (state & 32UL) == 32UL,
                 };
             }
         }
@@ -1604,6 +1619,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             ["cpuSecure"] = 1,
             ["attributionSecure"] = 2,
             ["semihosting"] = 3,
+            ["instructionFetch"] = 5,
         };
     }
 }
