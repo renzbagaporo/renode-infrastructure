@@ -1,9 +1,11 @@
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
+using System;
 using System.Threading.Tasks;
 
 using Antmicro.Migrant;
 using Antmicro.Renode.Peripherals.IRQControllers;
+using Antmicro.Renode.Utilities.Binding;
 
 namespace Antmicro.Renode.Peripherals.CPU
 {
@@ -58,6 +60,12 @@ namespace Antmicro.Renode.Peripherals.CPU
                         {
                             base.HaltedByDebugger = true;
                             UpdateRequestedHaltedState();
+                            uint previousState;
+                            lock(reset) previousState = tlibEnterHaltingDebug();
+                            // Hooks can call external code. Publish the actual
+                            // wake/Lockup exit outside all reset/debug monitors.
+                            if((previousState & 1) != 0) NotifySleepExitFromDebugStop();
+                            if((previousState & 2) != 0) nvic.SetLockupState(false);
                             lock(reset) nvic.CompleteExternalDebugControl(generation, true);
                         }
                     }
@@ -123,6 +131,11 @@ namespace Antmicro.Renode.Peripherals.CPU
                 nvic.CompleteExternalDebugRegisterTransfer(transfer.Generation, value, transfer.Write);
             }
         }
+
+#pragma warning disable 649
+        [Import]
+        private readonly Func<uint> tlibEnterHaltingDebug;
+#pragma warning restore 649
 
         private readonly object debugWorkerSync = new object();
         private ulong debugWorkerRevision;

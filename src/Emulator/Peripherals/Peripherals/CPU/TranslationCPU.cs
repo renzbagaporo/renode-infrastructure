@@ -277,6 +277,14 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
         }
 
+        // The debug-control owner calls this only after the execution thread
+        // has stopped and native sleep latches have been cleared. Native entry
+        // callbacks retain their pause guard; this stopped-PE path needs none.
+        protected void NotifySleepExitFromDebugStop()
+        {
+            wfiStateChangeHook?.Invoke(false);
+        }
+
         public void AddHookAtWfiStateChange(Action<bool> hook)
         {
             if(wfiStateChangeHook == null)

@@ -181,7 +181,7 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
                     value = debugControl;
                     if(debugHaltAcknowledged) value |= 0x20000;
                     if(debugRegisterReady) value |= 0x10000;
-                    if(InSleep.IsSet) value |= 0x40000;
+                    if(InSleep.IsSet || InDeepSleep.IsSet) value |= 0x40000;
                     if(Lockup.IsSet) value |= 0x80000;
                     if(cpu.TrustZoneEnabled) value |= 0x100000;
                     if(debugResetStatus) value |= 0x2000000;
