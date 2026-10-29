@@ -3,6 +3,8 @@
 // Full license text is available in 'licenses/MIT.txt'.
 //
 
+using System.Threading;
+
 using Antmicro.Renode.Peripherals;
 
 using NUnit.Framework;
@@ -87,6 +89,17 @@ namespace Antmicro.Renode.UnitTests
         }
 
         [Test]
+        public void ShouldCompleteAccessAfterReleasingStateMonitor()
+        {
+            var peripheral = new TestPeripheral();
+            peripheral.WriteDoubleWord(0, 0x1234);
+            Assert.AreEqual(0x1234u, peripheral.ReadDoubleWord(0));
+            peripheral.ResetHeld = true;
+            Assert.AreEqual(3, peripheral.CompletedAccesses);
+            Assert.IsFalse(peripheral.CompletedUnderMonitor);
+        }
+
+        [Test]
         public void ShouldNotifyResetHoldTransitionsAfterUpdatingState()
         {
             var peripheral = new TestPeripheral();
@@ -149,6 +162,16 @@ namespace Antmicro.Renode.UnitTests
             public bool LastResetState { get; private set; }
 
             public bool ResetHeldDuringReset { get; private set; }
+
+            public int CompletedAccesses { get; private set; }
+
+            public bool CompletedUnderMonitor { get; private set; }
+
+            protected override void OnAccessCompleted()
+            {
+                CompletedAccesses++;
+                CompletedUnderMonitor |= Monitor.IsEntered(this);
+            }
 
             protected override void OnResetHeldChanged()
             {

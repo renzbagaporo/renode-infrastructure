@@ -14,9 +14,16 @@ namespace Antmicro.Renode.Peripherals
     {
         public uint ReadDoubleWord(long offset)
         {
-            lock(SyncRoot)
+            try
             {
-                return ReadRegister(offset & RegisterOffsetMask);
+                lock(SyncRoot)
+                {
+                    return ReadRegister(offset & RegisterOffsetMask);
+                }
+            }
+            finally
+            {
+                OnAccessCompleted();
             }
         }
 
@@ -32,12 +39,19 @@ namespace Antmicro.Renode.Peripherals
 
         public void WriteDoubleWord(long offset, uint value)
         {
-            lock(SyncRoot)
+            try
             {
-                if(!resetHeld)
+                lock(SyncRoot)
                 {
-                    WriteRegister(offset & RegisterOffsetMask, value, (AtomicOperation)((offset >> 12) & 3));
+                    if(!resetHeld)
+                    {
+                        WriteRegister(offset & RegisterOffsetMask, value, (AtomicOperation)((offset >> 12) & 3));
+                    }
                 }
+            }
+            finally
+            {
+                OnAccessCompleted();
             }
         }
 
@@ -66,18 +80,25 @@ namespace Antmicro.Renode.Peripherals
             }
             set
             {
-                lock(SyncRoot)
+                try
                 {
-                    if(value == resetHeld)
+                    lock(SyncRoot)
                     {
-                        return;
+                        if(value == resetHeld)
+                        {
+                            return;
+                        }
+                        resetHeld = value;
+                        if(value)
+                        {
+                            Reset();
+                        }
+                        OnResetHeldChanged();
                     }
-                    resetHeld = value;
-                    if(value)
-                    {
-                        Reset();
-                    }
-                    OnResetHeldChanged();
+                }
+                finally
+                {
+                    OnAccessCompleted();
                 }
             }
         }
@@ -90,6 +111,12 @@ namespace Antmicro.Renode.Peripherals
         // External protocol callbacks use the same monitor as register accesses
         // and reset transitions. Shared-memory peripherals can supply its lock.
         protected virtual object SyncRoot => this;
+
+        // Devices with synchronous signal receivers publish queued notifications
+        // after releasing their state monitor, avoiding cross-device lock cycles.
+        protected virtual void OnAccessCompleted()
+        {
+        }
 
         protected static uint ApplyOperation(uint previous, uint value, AtomicOperation operation, uint writableMask = uint.MaxValue)
         {
