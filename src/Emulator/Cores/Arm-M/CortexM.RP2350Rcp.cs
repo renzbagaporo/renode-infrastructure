@@ -29,9 +29,22 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
             lock(target.reset)
             {
-                // The native writer release-publishes valid after the salt and
-                // PRNG seed. The monitor also excludes the target's reset.
+                // Native salt transactions serialize canary/PRNG readers and
+                // reset invalidation; this monitor also excludes local reset.
                 return target.tlibRp2350RcpSetSalt(salt);
+            }
+        }
+
+        private void ResetRP2350RcpSalts()
+        {
+            if(MultiprocessingId != 0) return;
+            // The official ROM permits core 1 to remain alive over core 0's
+            // SYSRESETREQ, but warns its ROM calls then see an empty salt.
+            // Resetting core 1 alone must retain its salt for SDK relaunch.
+            foreach(var target in machine.SystemBus.GetCPUs().OfType<CortexM>()
+                .Where(cpu => cpu.Model == "cortex-m33-rp2350"))
+            {
+                lock(target.reset) target.tlibRp2350RcpResetSalt();
             }
         }
 
@@ -62,6 +75,9 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         [Import]
         private readonly Action tlibRp2350RcpSetFault;
+
+        [Import]
+        private readonly Action tlibRp2350RcpResetSalt;
 #pragma warning restore 649
     }
 }

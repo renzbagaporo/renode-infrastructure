@@ -109,6 +109,7 @@ namespace Antmicro.Renode.Peripherals.CPU
 
                 if(Model == "cortex-m33-rp2350")
                 {
+                    ResetRP2350RcpSalts();
                     nvic?.OnGPIO(-14, false);
                 }
 
