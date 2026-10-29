@@ -27,7 +27,7 @@ using Antmicro.Renode.Utilities;
 namespace Antmicro.Renode.Peripherals.IRQControllers
 {
     [AllowedTranslations(AllowedTranslation.ByteToDoubleWord | AllowedTranslation.WordToDoubleWord)]
-    public class NVIC : IDoubleWordPeripheral, IHasDivisibleFrequency, IKnownSize, IIRQController, IHasMappedRegisters
+    public partial class NVIC : IDoubleWordPeripheral, IHasDivisibleFrequency, IKnownSize, IIRQController, IHasMappedRegisters
     {
         public NVIC(IMachine machine, ulong systickFrequency = 50 * 0x800000, byte priorityMask = 0xFF, bool haltSystickOnDeepSleep = true)
         {
@@ -506,6 +506,7 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
 
         public void WriteDoubleWord(long offset, uint value, bool isSecure)
         {
+            if(EnableMemoryMappedDebug && WriteDebugRegister(offset, value)) return;
             if(offset >= SetEnableStart && offset < SetEnableEnd)
             {
                 EnableOrDisableInterrupt((int)offset - SetEnableStart, value, true, isSecure);
@@ -716,6 +717,7 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
 
         public uint ReadDoubleWord(long offset, bool isSecure)
         {
+            if(EnableMemoryMappedDebug && ReadDebugRegister(offset, out var debugValue)) return debugValue;
             if(offset >= PriorityStart && offset < PriorityEnd)
             {
                 return HandlePriorityRead(offset - PriorityStart, true, isSecure);
@@ -829,6 +831,8 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
 
         public void Reset()
         {
+            debugResetStatus = true;
+            debugFaultStatus = 0;
             RegisterCollection.Reset();
             InitInterrupts();
             for(var i = 0; i < priorities.Length; i++)
@@ -2761,6 +2765,11 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             currentCpu = null;
             try
             {
+                if(EnableMemoryMappedDebug && machine.GetSystemBus(this).TryGetCurrentContextState<CortexM.ContextState>(out var context, out var state))
+                {
+                    currentCpu = context as ICPU;
+                    return state.CpuSecure;
+                }
                 currentCpu = machine.GetSystemBus(this).GetCurrentCPU();
                 // Checking if TZ is enabled is a short-cut to avoid lengthy lookups into CPU state
                 // and stack unwinding if an exception is thrown.
