@@ -425,7 +425,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 if(!sm.Shifted)
                 {
                     var count = BitCount(argument);
-                    var bits = ReadSource(sm, (argument >> 5) & 7) & Mask(count);
+                    var bits = ReadSource(sm, (argument >> 5) & 7, count) & Mask(count);
                     sm.ISR = count == 32 ? bits : InRight(sm) ? (sm.ISR >> count) | (bits << (32 - count)) : (sm.ISR << count) | bits;
                     sm.InputCount = Math.Min(32, sm.InputCount + count);
                     sm.Shifted = true;
@@ -553,13 +553,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             else { irqFlags &= ~mask; WakeAll(); }
         }
 
-        private uint ReadSource(StateMachine sm, int source)
+        private uint ReadSource(StateMachine sm, int source, int pinCount = 32)
         {
             switch(source)
             {
             case 0:
                 uint pins = 0;
-                for(var bit = 0; bit < 32; bit++) if(ReadInput((InBase(sm) + bit) & 31)) pins |= 1u << bit;
+                var now = cycleCounter.Value;
+                for(var bit = 0; bit < pinCount; bit++) if(ReadInput((InBase(sm) + bit) & 31, now)) pins |= 1u << bit;
                 return pins;
             case 1: return sm.X;
             case 2: return sm.Y;
@@ -801,10 +802,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
         }
 
-        private bool ReadInput(int pin)
+        private bool ReadInput(int pin) => ReadInput(pin, cycleCounter.Value);
+
+        private bool ReadInput(int pin, ulong now)
         {
             var history = inputHistory[pin];
-            var now = cycleCounter.Value;
             while(history.Count != 0 && history.Peek().Tick <= now) synchronizedInput[pin] = history.Dequeue().Value;
             return (inputSyncBypass & (1u << pin)) != 0 ? gpio.GetInput(pin) : synchronizedInput[pin];
         }

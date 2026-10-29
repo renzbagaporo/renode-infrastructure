@@ -431,6 +431,53 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.AreEqual(0x80000000u, pio.ReadDoubleWord(0x20));
         }
 
+        [TestCase(1, 0, false)]
+        [TestCase(1, 29, true)]
+        [TestCase(5, 0, true)]
+        [TestCase(5, 29, false)]
+        [TestCase(31, 0, false)]
+        [TestCase(31, 29, true)]
+        [TestCase(32, 0, true)]
+        [TestCase(32, 29, false)]
+        public void ShouldSampleRequestedINPinsAndFullWidthMOVPins(int count, int inputBase, bool shiftRight)
+        {
+            const uint pattern = 0x25c3e19b;
+            for(var pin = 0; pin < 30; pin++) gpio.OnGPIO(pin, (pattern & (1u << pin)) != 0);
+            Advance(2);
+            pio.WriteDoubleWord(0xdc, (uint)inputBase << 15);
+            pio.WriteDoubleWord(0xd0, shiftRight ? 1u << 18 : 0u);
+            var rotated = (pattern >> inputBase) | (pattern << ((32 - inputBase) & 31));
+            var mask = count == 32 ? uint.MaxValue : (1u << count) - 1;
+            Force(0, (ushort)(0x4000 | (count & 31))); // IN PINS, zero encodes 32
+            Force(0, 0x8020);
+            var expected = rotated & mask;
+            if(shiftRight && count != 32) expected <<= 32 - count;
+            Assert.AreEqual(expected, pio.ReadDoubleWord(0x20));
+            Force(0, 0xa0c0); // MOV ISR, PINS always reads all 32 mapped pins
+            Force(0, 0x8020);
+            Assert.AreEqual(rotated, pio.ReadDoubleWord(0x20));
+        }
+
+        [Test]
+        public void ShouldRetainSynchronizerHistoryForPinsOutsideANarrowIN()
+        {
+            gpio.OnGPIO(19, true);
+            Advance(1);
+            gpio.OnGPIO(19, false);
+            Force(0, 0x4001); // This IN reads pin 0 while pin 19 has pending history.
+            Force(0, 0x8020);
+            Assert.AreEqual(0u, pio.ReadDoubleWord(0x20));
+            Advance(1);
+            pio.WriteDoubleWord(0xdc, 19u << 15);
+            Force(0, 0x4001);
+            Force(0, 0x8020);
+            Assert.AreEqual(0x80000000u, pio.ReadDoubleWord(0x20));
+            Advance(1);
+            Force(0, 0x4001);
+            Force(0, 0x8020);
+            Assert.AreEqual(0u, pio.ReadDoubleWord(0x20));
+        }
+
         [Test]
         public void ShouldPauseInstructionDelayAndRetainDividerPhaseWhileDisabled()
         {
