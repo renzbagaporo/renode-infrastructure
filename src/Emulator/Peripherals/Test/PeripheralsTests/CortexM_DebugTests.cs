@@ -101,6 +101,59 @@ namespace Antmicro.Renode.PeripheralsTests
         }
 
         [Test]
+        public void ShouldLatchExternalBreakpointAndClearFaultStatusWithWriteOne()
+        {
+            nvic.WriteDoubleWord(0xdf0, 0xa05f0001);
+            nvic.ReportExternalDebugBreakpoint();
+            Assert.AreEqual(2, nvic.ReadDoubleWord(0xd30));
+            Assert.AreEqual(3, nvic.ReadDoubleWord(0xdf0) & 3);
+            nvic.WriteDoubleWord(0xd30, 1);
+            Assert.AreEqual(2, nvic.ReadDoubleWord(0xd30));
+            nvic.WriteDoubleWord(0xd30, 2);
+            Assert.AreEqual(0, nvic.ReadDoubleWord(0xd30));
+        }
+
+        [Test]
+        public void ShouldSelectTheRequestedCoreThroughItsActualMEMAP()
+        {
+            var nvic1 = new NVIC(machine);
+            var cpu1 = new CortexM("cortex-m33", machine, nvic1, cpuId: 1, enableTrustZone: true);
+            machine.SystemBus.Register(cpu1, new CPURegistrationPoint(1));
+            machine.SetLocalName(cpu1, "cpu1");
+            machine.SystemBus.Register(nvic1, new BusPointRegistration(0xe000e000, cpu: cpu1));
+            var port = new TestDebugPort(machine, cpu, cpu1);
+            port.PowerUp();
+            foreach(var ap in new uint[] { 0x2000, 0x4000 })
+            {
+                port.WriteMemory(ap, 0xe000edf0, 0xa05f0003);
+                port.WriteMemory(ap, 0xe000edf8, ap);
+                port.WriteMemory(ap, 0xe000edf4, 0x10000);
+            }
+            Assert.AreEqual(0x2000, (uint)cpu.GetRegister(0));
+            Assert.AreEqual(0x4000, (uint)cpu1.GetRegister(0));
+            Assert.AreEqual(0x411fd210, port.ReadMemory(0x2000, 0xe000ed00));
+            Assert.AreEqual(0x411fd210, port.ReadMemory(0x4000, 0xe000ed00));
+        }
+
+        [Test]
+        public void ShouldUseMEMAPSecurityAttributesRatherThanTheHaltedCoresSecurityState()
+        {
+            var ram = new MappedMemory(machine, 0x2000);
+            machine.SystemBus.Register(ram, new BusPointRegistration(0x20000000));
+            cpu.SecureState = false;
+            cpu.VectorTableOffset = 0x20000100;
+            cpu.SecureState = true;
+            cpu.VectorTableOffset = 0x20000200;
+            cpu.SecureState = false;
+            var port = new TestDebugPort(machine, cpu, cpu);
+            port.PowerUp();
+            Assert.AreEqual(0x20000200, port.ReadMemory(0x2000, 0xe000ed08));
+            port.WriteAP(0x2d00, 0x4b800052);
+            Assert.AreEqual(0x20000100, port.ReadMemory(0x2000, 0xe000ed08));
+            Assert.IsFalse(cpu.SecureState);
+        }
+
+        [Test]
         public void ShouldHaltAndResumeFromAnotherMachinesClockCallback()
         {
             var emulation = EmulationManager.Instance.CurrentEmulation;
@@ -139,5 +192,34 @@ namespace Antmicro.Renode.PeripheralsTests
         private Machine machine;
         private NVIC nvic;
         private CortexM cpu;
+
+        private sealed class TestDebugPort : RP2350_DebugPort
+        {
+            public TestDebugPort(IMachine machine, CortexM cpu0, CortexM cpu1) : base(machine, cpu0, cpu1) { }
+            public void PowerUp() { CompleteWrite(false, 4, 0x50000000); }
+            public void WriteAP(uint address, uint value)
+            {
+                CompleteWrite(false, 8, address & ~0xfu);
+                Assert.AreEqual(1, (int)BeginTransfer(true, false, (byte)(address & 0xc), out var _));
+                CompleteWrite(true, (byte)(address & 0xc), value);
+            }
+            public uint ReadAP(uint address)
+            {
+                CompleteWrite(false, 8, address & ~0xfu);
+                Assert.AreEqual(1, (int)BeginTransfer(true, true, (byte)(address & 0xc), out var _));
+                Assert.AreEqual(1, (int)BeginTransfer(false, true, 12, out var value));
+                return value;
+            }
+            public void WriteMemory(uint ap, uint address, uint value)
+            {
+                WriteAP(ap + 0xd04, address);
+                WriteAP(ap + 0xd0c, value);
+            }
+            public uint ReadMemory(uint ap, uint address)
+            {
+                WriteAP(ap + 0xd04, address);
+                return ReadAP(ap + 0xd0c);
+            }
+        }
     }
 }

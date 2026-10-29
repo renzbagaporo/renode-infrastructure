@@ -16,6 +16,8 @@ namespace Antmicro.Renode.Peripherals.CPU
         {
             this.machine = machine;
             aps = new[] { new MemoryAccessPort(machine.SystemBus, cpu0), new MemoryAccessPort(machine.SystemBus, cpu1) };
+            if(cpu0 != null) cpu0.EnableMemoryMappedDebug = true;
+            if(cpu1 != null) cpu1.EnableMemoryMappedDebug = true;
             Reset();
         }
 
@@ -45,7 +47,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                 if(read) value = ReadDP(address);
                 return Acknowledgement.Ok;
             }
-            if((control & 0x22) != 0) return Acknowledgement.Fault;
+            if((control & 0xa2) != 0) return Acknowledgement.Fault;
             var apAddress = ((ulong)select1 << 32) | (select & 0xfffffff0u) | address;
             // The RP-AP is accessible while the switched core debug domain is powered off.
             if(apAddress < 0x80000 && (control & 0x20000000) == 0) return Acknowledgement.Wait;
@@ -99,6 +101,11 @@ namespace Antmicro.Renode.Peripherals.CPU
             control |= 0x80;
         }
 
+        protected override bool SelectTarget(uint value)
+        {
+            return value == 0x01002927;
+        }
+
         private uint ReadDP(byte address)
         {
             var bank = select & 0xf;
@@ -140,13 +147,14 @@ namespace Antmicro.Renode.Peripherals.CPU
             {
                 if(address == 0) return 0x2003;
                 if(address == 4) return 0x4003;
-                if(address == 8) return 0x80003;
-                return ComponentRegister((uint)address, 0x00093004, 9, 0x47700af7);
+                return ComponentRegister((uint)address, 0x09093004, 9, 0x47700af7);
             }
             if(address >= 0x80000)
             {
                 if(address == 0x80000) return rpControl;
-                return ComponentRegister((uint)(address & 0xfff), 0x00093005, 9, 0);
+                // The RP-AP is not a CoreSight component. The datasheet specifies
+                // an implementation-defined IDR at 0xdfc, with an undefined reset.
+                return 0;
             }
             return aps[address >= 0x4000 ? 1 : 0].Read((uint)(address & 0xfff));
         }
@@ -233,25 +241,32 @@ namespace Antmicro.Renode.Peripherals.CPU
 
             private uint ReadMemory(uint address, int size)
             {
-                if(bus.WhatIsAt(address, cpu) == null) throw new AccessFault();
+                if(bus.WhatPeripheralIsAt(address, cpu, TransactionState) == null) throw new AccessFault();
                 switch(size)
                 {
-                case 0: return (uint)bus.ReadByte(address, cpu) << (int)((address & 3) * 8);
-                case 1: return (uint)bus.ReadWord(address, cpu) << (int)((address & 2) * 8);
-                default: return bus.ReadDoubleWord(address, cpu);
+                case 0: return (uint)bus.ReadByte(address, cpu, TransactionState) << (int)((address & 3) * 8);
+                case 1: return (uint)bus.ReadWord(address, cpu, TransactionState) << (int)((address & 2) * 8);
+                default: return bus.ReadDoubleWord(address, cpu, TransactionState);
                 }
             }
 
             private void WriteMemory(uint address, int size, uint value)
             {
-                if(bus.WhatIsAt(address, cpu) == null) throw new AccessFault();
+                if(bus.WhatPeripheralIsAt(address, cpu, TransactionState) == null) throw new AccessFault();
                 switch(size)
                 {
-                case 0: bus.WriteByte(address, (byte)(value >> (int)((address & 3) * 8)), cpu); return;
-                case 1: bus.WriteWord(address, (ushort)(value >> (int)((address & 2) * 8)), cpu); return;
-                default: bus.WriteDoubleWord(address, value, cpu); return;
+                case 0: bus.WriteByte(address, (byte)(value >> (int)((address & 3) * 8)), cpu, TransactionState); return;
+                case 1: bus.WriteWord(address, (ushort)(value >> (int)((address & 2) * 8)), cpu, TransactionState); return;
+                default: bus.WriteDoubleWord(address, value, cpu, TransactionState); return;
                 }
             }
+
+            private ulong? TransactionState => cpu == null ? (ulong?)null : (ulong)new CortexM.ContextState
+            {
+                Privileged = (csw & (1u << 25)) != 0,
+                CpuSecure = (csw & (1u << 30)) == 0,
+                AttributionSecure = (csw & (1u << 30)) == 0,
+            };
 
             private readonly IBusController bus;
             private readonly CortexM cpu;

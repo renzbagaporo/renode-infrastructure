@@ -1056,6 +1056,11 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         private uint ShouldAccessBeSecure()
         {
+            if(EnableMemoryMappedDebug && machine.SystemBus.TryGetCurrentContextState<ContextState>(out var initiator, out var state)
+                && ReferenceEquals(initiator, this))
+            {
+                return state.CpuSecure ? 1u : 0u;
+            }
             var secure = 0u;
             if(TrustZoneEnabled)
             {

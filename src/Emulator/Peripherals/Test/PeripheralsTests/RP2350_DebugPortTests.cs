@@ -89,6 +89,29 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.AreEqual(4, port.TryAPRead(out var _));
         }
 
+        [Test]
+        public void ShouldNotEnumerateRPAPAsACoreSightComponent()
+        {
+            PowerUp();
+            Assert.AreEqual(0x2003, port.ReadAP(0));
+            Assert.AreEqual(0x4003, port.ReadAP(4));
+            Assert.AreEqual(0, port.ReadAP(8));
+            Assert.AreEqual(9, port.ReadAP(0xfd0));
+            Assert.AreEqual(0, port.ReadAP(0x80ff4));
+        }
+
+        [Test]
+        public void ShouldBlockAPAccessOnWriteParityErrorsUntilAbortClearsThem()
+        {
+            PowerUp();
+            port.BadParity();
+            port.Select(0x2dfc);
+            Assert.AreEqual(4, port.TryAPRead(out var _));
+            Assert.AreNotEqual(0, port.ReadDP(4) & 0x80);
+            port.WriteDP(0, 8);
+            Assert.AreEqual(1, port.TryAPRead(out var _));
+        }
+
         [TestCase(0, 1, 0x0000aa00u)]
         [TestCase(1, 2, 0xbbaa0000u)]
         [TestCase(2, 0, 0xddccbbaau)]
@@ -156,6 +179,7 @@ namespace Antmicro.Renode.PeripheralsTests
         private sealed class TestPort : RP2350_DebugPort
         {
             public TestPort(IMachine machine) : base(machine, null, null) { }
+            public void BadParity() { WriteParityError(); }
             public void Select(uint address) { apAddress = (byte)(address & 0xc); WriteDP(8, address & ~0xfu); }
             public uint ReadDP(byte address) { Assert.AreEqual(1, (int)BeginTransfer(false, true, address, out var value)); return value; }
             public void WriteDP(byte address, uint value) { CompleteWrite(false, address, value); }
