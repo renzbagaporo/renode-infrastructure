@@ -854,6 +854,74 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.IsTrue(pio.Connections[0].IsSet);
         }
 
+        [Test]
+        public void ShouldReassertTXSTALLAfterClearDuringAnEmptyBlockingPULL()
+        {
+            ConfigureMetalclawSWD();
+            pio.WriteDoubleWord(0, 1);
+            Advance(1);
+            Assert.AreNotEqual(0u, pio.ReadDoubleWord(8) & (1u << 24));
+            pio.WriteDoubleWord(8, 1u << 24);
+            Assert.AreEqual(0u, pio.ReadDoubleWord(8) & (1u << 24));
+            Advance(1);
+            Assert.AreNotEqual(0u, pio.ReadDoubleWord(8) & (1u << 24));
+            Assert.AreEqual(3u, pio.ReadDoubleWord(0xd4));
+            Advance(1000000);
+            Assert.AreEqual(3u, pio.ReadDoubleWord(0xd4));
+        }
+
+        [Test]
+        public void ShouldReassertRXSTALLWithoutPushingIntoAFullFIFO()
+        {
+            for(var value = 0; value < 4; value++)
+            {
+                Force(0, (ushort)(0xe020 | value));
+                Force(0, 0xa0c1);
+                Force(0, 0x8020);
+            }
+            Force(0, 0xe025);
+            Force(0, 0xa0c1);
+            Force(0, 0x8020);
+            Assert.AreNotEqual(0u, pio.ReadDoubleWord(8) & 1);
+            pio.WriteDoubleWord(8, 1);
+            Assert.AreEqual(0u, pio.ReadDoubleWord(8) & 1);
+            Advance(1);
+            Assert.AreNotEqual(0u, pio.ReadDoubleWord(8) & 1);
+            Assert.AreEqual(0u, pio.ReadDoubleWord(0x20));
+            Advance(1);
+            for(uint value = 1; value < 4; value++) Assert.AreEqual(value, pio.ReadDoubleWord(0x20));
+            Assert.AreEqual(5u, pio.ReadDoubleWord(0x20));
+        }
+
+        [Test]
+        public void ShouldReassertFIFOStallOnlyWhenStateMachineResumes()
+        {
+            Load(0x80a0);
+            pio.WriteDoubleWord(0xc8, 3u << 16);
+            pio.WriteDoubleWord(0, 1);
+            Advance(3);
+            pio.WriteDoubleWord(0, 0);
+            pio.WriteDoubleWord(8, 1u << 24);
+            Advance(10);
+            Assert.AreEqual(0u, pio.ReadDoubleWord(8) & (1u << 24));
+            pio.WriteDoubleWord(0, 1);
+            Advance(1);
+            Assert.AreEqual(0u, pio.ReadDoubleWord(8) & (1u << 24));
+            Advance(1);
+            Assert.AreNotEqual(0u, pio.ReadDoubleWord(8) & (1u << 24));
+        }
+
+        [Test]
+        public void ShouldNotReassertHistoricalFIFOStallDuringASeparateWAIT()
+        {
+            Force(0, 0x80a0);
+            Assert.AreNotEqual(0u, pio.ReadDoubleWord(8) & (1u << 24));
+            Force(0, 0x2084);
+            pio.WriteDoubleWord(8, 1u << 24);
+            Advance(10);
+            Assert.AreEqual(0u, pio.ReadDoubleWord(8) & (1u << 24));
+        }
+
         private uint SPIByte(uint value, bool lead, int mosi, int miso, int sck)
         {
             uint result = 0;

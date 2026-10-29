@@ -281,7 +281,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 BeginPinCycle();
                 ResolvePinWrites();
                 break;
-            case 8: debug &= ~value; break;
+            case 8:
+                debug &= ~value;
+                foreach(var sm in stateMachines) if(sm.Stalled) Reschedule(sm);
+                break;
             case 0x30: irqFlags &= ~(value & 0xff); WakeAll(); break;
             case 0x34: irqFlags |= value & 0xff; WakeAll(); break;
             case 0x38: inputSyncBypass = ApplyOperation(inputSyncBypass, value, operation); WakeAll(); break;
@@ -829,7 +832,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private void Reschedule(StateMachine sm)
         {
-            var ready = sm.Stalled && CanResume(sm);
+            // Debug stall flags reflect actual execution attempts. When W1C
+            // clears an active FIFO stall, retry once on its next clock enable;
+            // the failed instruction reasserts the flag and sleeps again.
+            var ready = sm.Stalled && (CanResume(sm) || (CurrentStallDebugFlag(sm) & ~debug) != 0);
             ulong visibleTick = 0;
             if(sm.Stalled && !ready)
             {
@@ -838,6 +844,23 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     visibleTick = inputHistory[pin].Peek().Tick;
             }
             Schedule(sm, wake: ready || visibleTick != 0, earliestTick: visibleTick);
+        }
+
+        private static uint CurrentStallDebugFlag(StateMachine sm)
+        {
+            var argument = sm.Instruction & 0xff;
+            var opcode = sm.Instruction >> 13;
+            if(opcode == 2 && AutoPush(sm) && sm.InputCount >= PushThreshold(sm) && sm.Rx.Count >= RxCapacity(sm))
+                return 1u << sm.Index;
+            if(opcode == 3 && AutoPull(sm) && sm.OutputCount >= PullThreshold(sm) && sm.Tx.Count == 0)
+                return 1u << (24 + sm.Index);
+            if(opcode != 4 || (argument & 0x20) == 0) return 0;
+            if((argument & 0x80) != 0)
+            {
+                var conditional = AutoPull(sm) || (argument & 0x40) != 0;
+                return sm.Tx.Count == 0 && (!conditional || sm.OutputCount >= PullThreshold(sm)) ? 1u << (24 + sm.Index) : 0;
+            }
+            return sm.Rx.Count >= RxCapacity(sm) && ((argument & 0x40) == 0 || sm.InputCount >= PushThreshold(sm)) ? 1u << sm.Index : 0;
         }
 
         private void OnClockChanged()
