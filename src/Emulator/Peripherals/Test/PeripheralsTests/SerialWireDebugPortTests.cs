@@ -2,6 +2,11 @@
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
 //
+using System;
+using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
+
 using Antmicro.Renode.Peripherals.CPU;
 
 using NUnit.Framework;
@@ -191,6 +196,173 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.AreEqual(0x4c013477, Read(0xa5));
         }
 
+        [TestCase(false)]
+        [TestCase(true)]
+        public void ShouldDiscardQueuedOldTransfersWhenResetRacesABlockedBackend(bool hardwareReset)
+        {
+            Wake();
+            using(var entered = new ManualResetEventSlim())
+            using(var release = new ManualResetEventSlim())
+            {
+                target.OnBegin = () =>
+                {
+                    entered.Set();
+                    Assert.IsTrue(release.Wait(TimeSpan.FromSeconds(5)), "backend was not released");
+                };
+                var header = Task.Run(() => Send(0xa5, 8));
+                try
+                {
+                    Assert.IsTrue(entered.Wait(TimeSpan.FromSeconds(5)), "read did not reach backend");
+                    // These edges arrive while the accepted read is blocked. If
+                    // replayed, they finish that read and commit a subsequent write.
+                    target.OnGPIO(0, false);
+                    for(var i = 0; i < 38; i++) RawCycle(true);
+                    RawSend(0x81, 8);
+                    for(var i = 0; i < 5; i++) RawCycle(false);
+                    RawSend(0x12345678, 32);
+                    RawCycle(Parity(0x12345678));
+                    if(hardwareReset)
+                    {
+                        target.OnGPIO(2, false);
+                        // A machine/peripheral reset may coalesce with the pin
+                        // assertion while the old transaction is unwinding.
+                        target.Reset();
+                    }
+                    else target.Reset();
+                    Assert.IsFalse(IsDriving);
+                    Assert.AreEqual(0, target.BackendOverlap);
+                    // New input cannot bypass the serialized backend reset.
+                    RawSend(0xa5, 8);
+                    Assert.AreEqual(1, target.RequestCount);
+                }
+                finally { release.Set(); }
+                Assert.IsTrue(header.Wait(TimeSpan.FromSeconds(5)), "protocol owner did not finish");
+                Assert.AreEqual(0, target.WriteCount, "stale write reached backend after reset");
+                Assert.AreEqual(0, target.BackendOverlap, "reset overlapped an in-flight backend operation");
+                Assert.AreEqual(hardwareReset ? 1 : 0, target.TargetResetCount, "physical reset request was lost when resets coalesced");
+                Assert.IsFalse(IsDriving, "old ACK/data drive was restored after reset");
+                target.OnBegin = null;
+                if(hardwareReset) target.OnGPIO(2, true);
+                Wake();
+                Assert.AreEqual(0x4c013477, Read(0xa5));
+            }
+        }
+
+        [Test]
+        public void ShouldNotHoldTheProtocolMonitorAcrossBackendOrDriveCallbacks()
+        {
+            var backendChecks = 0;
+            var driveChecks = 0;
+            target.OnBegin = () =>
+            {
+                Assert.IsTrue(Task.Run(() => target.GetOutputState(1, out var _, out var __)).Wait(TimeSpan.FromSeconds(5)),
+                    "backend callback holds protocol monitor");
+                target.OnGPIO(1, true);
+                backendChecks++;
+            };
+            target.DriveChanged += (_, level, enabled) =>
+            {
+                Assert.IsTrue(Task.Run(() => target.GetOutputState(1, out var __, out var ___)).Wait(TimeSpan.FromSeconds(5)),
+                    "drive callback holds protocol monitor");
+                target.OnGPIO(1, enabled ? level : true);
+                driveChecks++;
+            };
+            Wake();
+            Assert.AreEqual(0x4c013477, Read(0xa5));
+            Assert.AreEqual(1, backendChecks);
+            Assert.Greater(driveChecks, 3);
+        }
+
+        [Test]
+        public void ShouldDiscardOldDriveSubscribersAfterAReentrantReset()
+        {
+            var reset = false;
+            var observed = new List<bool>();
+            target.DriveChanged += (_, level, enabled) =>
+            {
+                if(enabled && !reset)
+                {
+                    reset = true;
+                    target.Reset();
+                }
+            };
+            target.DriveChanged += (_, level, enabled) => observed.Add(enabled);
+            Wake();
+            Send(0xa5, 8);
+            Cycle(null);
+            Assert.IsTrue(reset);
+            CollectionAssert.AreEqual(new[] { false }, observed, "old-epoch enable was replayed after reset");
+            Assert.IsFalse(IsDriving);
+            Assert.AreEqual(0, target.BackendOverlap);
+        }
+
+        [Test]
+        public void ShouldInvalidateABlockedDrivePublicationWhenAnotherThreadResets()
+        {
+            using(var entered = new ManualResetEventSlim())
+            using(var release = new ManualResetEventSlim())
+            {
+                var firstEnable = true;
+                var observed = new List<bool>();
+                target.DriveChanged += (_, level, enabled) =>
+                {
+                    if(enabled && firstEnable)
+                    {
+                        firstEnable = false;
+                        entered.Set();
+                        Assert.IsTrue(release.Wait(TimeSpan.FromSeconds(5)), "drive callback was not released");
+                    }
+                };
+                target.DriveChanged += (_, level, enabled) => observed.Add(enabled);
+                Wake();
+                Send(0xa5, 8);
+                var turnaround = Task.Run(() => Cycle(null));
+                try
+                {
+                    Assert.IsTrue(entered.Wait(TimeSpan.FromSeconds(5)), "ACK publication did not start");
+                    Assert.IsTrue(Task.Run(() => target.Reset()).Wait(TimeSpan.FromSeconds(5)), "reset waited for an external drive callback");
+                    Assert.IsFalse(IsDriving);
+                }
+                finally { release.Set(); }
+                Assert.IsTrue(turnaround.Wait(TimeSpan.FromSeconds(5)));
+                CollectionAssert.AreEqual(new[] { false }, observed, "old ACK notification reached a later subscriber after reset");
+                Assert.IsFalse(IsDriving);
+            }
+        }
+
+        [TestCase(false)]
+        [TestCase(true)]
+        public void ShouldDeferABackendCallbackResetUntilTheAcceptedOperationUnwinds(bool foreignThread)
+        {
+            target.OnBegin = () =>
+            {
+                if(foreignThread)
+                    Assert.IsTrue(Task.Run(() => target.Reset()).Wait(TimeSpan.FromSeconds(5)), "foreign reset callback blocked on backend owner");
+                else target.Reset();
+            };
+            Wake();
+            Send(0xa5, 8);
+            Cycle(null);
+            Assert.IsFalse(IsDriving);
+            Assert.AreEqual(0, target.BackendOverlap);
+            Assert.AreEqual(0, target.WriteCount);
+            target.OnBegin = null;
+            Wake();
+            Assert.AreEqual(0x4c013477, Read(0xa5));
+        }
+
+        private void RawSend(uint value, int count)
+        {
+            for(var i = 0; i < count; i++) RawCycle(((value >> i) & 1) != 0);
+        }
+
+        private void RawCycle(bool value)
+        {
+            target.OnGPIO(1, value);
+            target.OnGPIO(0, true);
+            target.OnGPIO(0, false);
+        }
+
         private void Write(uint header, uint value, bool parity)
         {
             Send(header, 8);
@@ -274,16 +446,41 @@ namespace Antmicro.Renode.PeripheralsTests
         private sealed class TestTarget : SerialWireDebugPort
         {
             public int RequestCount, WriteCount, ParityErrors, Ack = 1;
+            public int BackendOverlap;
+            public int TargetResetCount;
+            public Action OnBegin;
             public uint LastWrite;
             protected override Acknowledgement BeginTransfer(bool ap, bool read, byte address, out uint value)
             {
-                RequestCount++;
-                value = 0x4c013477;
-                return (Acknowledgement)Ack;
+                EnterBackend();
+                try
+                {
+                    Interlocked.Increment(ref RequestCount);
+                    OnBegin?.Invoke();
+                    value = 0x4c013477;
+                    return (Acknowledgement)Ack;
+                }
+                finally { Interlocked.Decrement(ref activeBackend); }
             }
-            protected override void CompleteWrite(bool ap, byte address, uint value) { WriteCount++; LastWrite = value; }
+            protected override void CompleteWrite(bool ap, byte address, uint value)
+            {
+                EnterBackend();
+                try { Interlocked.Increment(ref WriteCount); LastWrite = value; }
+                finally { Interlocked.Decrement(ref activeBackend); }
+            }
+            protected override void ResetBackend()
+            {
+                EnterBackend();
+                Interlocked.Decrement(ref activeBackend);
+            }
+            private void EnterBackend()
+            {
+                if(Interlocked.Increment(ref activeBackend) > 1) Interlocked.Increment(ref BackendOverlap);
+            }
             protected override void WriteParityError() { ParityErrors++; }
+            protected override void ResetTarget() { Interlocked.Increment(ref TargetResetCount); }
             protected override bool SelectTarget(uint value) { return value == 0x01002927; }
+            private int activeBackend;
         }
 
         private TestTarget target;

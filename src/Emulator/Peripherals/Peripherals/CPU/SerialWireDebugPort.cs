@@ -3,6 +3,7 @@
 // Full license text is available in 'licenses/MIT.txt'.
 //
 using System;
+using System.Collections.Generic;
 
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Peripherals.GPIOPort;
@@ -18,9 +19,24 @@ namespace Antmicro.Renode.Peripherals.CPU
             Reset();
         }
 
-        public virtual void Reset()
+        public void Reset()
         {
+            // A callback from an accepted bus transaction may request reset.
+            // Invalidate framing/output immediately; reset backend state after
+            // that transaction unwinds, before any new-generation input.
+            lock(sync) ResetProtocol(false);
+            ProcessPending();
+        }
+
+        private void ResetProtocol(bool resetTarget)
+        {
+            targetResetPending |= resetTarget;
+            generation++;
+            pending.Clear();
+            notifications.Clear();
             state = State.Dormant;
+            clock = sampledClock;
+            data = sampledData;
             consecutiveOnes = 0;
             alertPosition = 0;
             activationPosition = 0;
@@ -28,39 +44,143 @@ namespace Antmicro.Renode.Peripherals.CPU
             bitCount = 0;
             resetSequencePosition = -1;
             requireIdentification = true;
-            SetDrive(false, false);
+            output = outputEnabled = false;
+            // Publish the reset state even if a superseded release notification
+            // had already changed our latch but had not reached the wire.
+            notifications.Enqueue(new Notification(generation, false, false));
+            pending.Enqueue(new Input(generation, targetResetPending));
         }
 
         public void OnGPIO(int number, bool value)
         {
-            switch(number)
+            lock(sync)
+            {
+                switch(number)
+                {
+                case 0: sampledClock = value; break;
+                case 1: sampledData = value; break;
+                case 2:
+                    if(!value && !resetAsserted)
+                    {
+                        resetAsserted = true;
+                        ResetProtocol(true);
+                    }
+                    else if(value && resetAsserted)
+                    {
+                        resetAsserted = false;
+                        clock = sampledClock;
+                        data = sampledData;
+                    }
+                    break;
+                default: return;
+                }
+                if(number != 2 && !resetAsserted) pending.Enqueue(new Input(generation, number, value));
+            }
+            ProcessPending();
+        }
+
+        private Action ProcessInput(Input input)
+        {
+            if(input.Reset)
+            {
+                return () =>
+                {
+                    ResetBackend();
+                    var resetTarget = false;
+                    lock(sync)
+                    {
+                        if(input.Generation == generation && input.ResetTarget && targetResetPending)
+                        {
+                            targetResetPending = false;
+                            resetTarget = true;
+                        }
+                    }
+                    if(resetTarget) ResetTarget();
+                };
+            }
+            var value = input.Value;
+            switch(input.Number)
             {
             case 0:
-                if(clock == value) return;
+                if(clock == value) return null;
                 clock = value;
-                if(resetAsserted) return;
-                if(clock) RisingEdge();
-                else FallingEdge();
+                if(resetAsserted) return null;
+                if(clock) return RisingEdge(input.Generation);
+                FallingEdge();
                 break;
-            case 1:
-                data = value;
-                break;
-            case 2:
-                if(!value && !resetAsserted)
+            case 1: data = value; break;
+            }
+            return null;
+        }
+
+        private bool IsCurrent(ulong expectedGeneration)
+        {
+            lock(sync) return expectedGeneration == generation;
+        }
+
+        // The owner serializes backend operations, but never holds the protocol
+        // monitor across bus accesses, CPU halt acknowledgements or wire callbacks.
+        // Reentrant/foreign callbacks enqueue work rather than waiting for that owner.
+        private void ProcessPending()
+        {
+            lock(sync)
+            {
+                if(processing) return;
+                processing = true;
+            }
+            try
+            {
+                while(true)
                 {
-                    Reset();
-                    resetAsserted = true;
-                    ResetTarget();
+                    Action action = null;
+                    Input input = default(Input);
+                    Notification notification = default(Notification);
+                    var publish = false;
+                    lock(sync)
+                    {
+                        if(notifications.Count != 0)
+                        {
+                            notification = notifications.Dequeue();
+                            publish = true;
+                        }
+                        else if(pending.Count != 0)
+                        {
+                            input = pending.Dequeue();
+                            if(input.Generation == generation) action = ProcessInput(input);
+                        }
+                        else
+                        {
+                            processing = false;
+                            return;
+                        }
+                    }
+                    if(publish)
+                    {
+                        var handlers = DriveChanged;
+                        if(handlers == null) continue;
+                        foreach(Action<int, bool, bool> handler in handlers.GetInvocationList())
+                        {
+                            if(!IsCurrent(notification.Generation)) break;
+                            handler(1, notification.Level, notification.Enabled);
+                        }
+                    }
+                    else if(action != null && IsCurrent(input.Generation)) action();
                 }
-                else if(value) resetAsserted = false;
-                break;
+            }
+            catch
+            {
+                lock(sync) processing = false;
+                throw;
             }
         }
 
         public void GetOutputState(int number, out bool level, out bool enabled)
         {
-            level = output;
-            enabled = number == 1 && outputEnabled;
+            lock(sync)
+            {
+                level = output;
+                enabled = number == 1 && outputEnabled;
+            }
         }
 
         public event Action<int, bool, bool> DriveChanged;
@@ -68,11 +188,12 @@ namespace Antmicro.Renode.Peripherals.CPU
         protected abstract Acknowledgement BeginTransfer(bool accessPort, bool read, byte address, out uint value);
         protected abstract void CompleteWrite(bool accessPort, byte address, uint value);
         protected abstract void WriteParityError();
+        protected virtual void ResetBackend() { }
         protected virtual void LineReset() { }
         protected virtual void ResetTarget() { }
         protected virtual bool SelectTarget(uint value) { return true; }
 
-        private void RisingEdge()
+        private Action RisingEdge(ulong requestGeneration)
         {
             // A line reset must be recognized from any active protocol state,
             // including a truncated transfer and the protocol error lockout state.
@@ -85,8 +206,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                 resetSequencePosition = 0;
                 resetSequence = 0;
                 requireIdentification = true;
-                LineReset();
-                return;
+                return LineReset;
             }
             if(resetSequencePosition >= 0)
             {
@@ -98,7 +218,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                     {
                         state = State.Dormant;
                         alertPosition = 0;
-                        return;
+                        return null;
                     }
                 }
             }
@@ -116,7 +236,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                     }
                 }
                 else alertPosition = data ? 0 : 1;
-                return;
+                return null;
             case State.Activation:
                 if(activationPosition >= 4 && data) shift |= 1u << (activationPosition - 4);
                 if(++activationPosition == 12)
@@ -125,24 +245,24 @@ namespace Antmicro.Renode.Peripherals.CPU
                     alertPosition = 0;
                     consecutiveOnes = 0;
                 }
-                return;
+                return null;
             case State.Lockout:
-                return;
+                return null;
             case State.Reset:
-                if(data) return;
+                if(data) return null;
                 state = State.Request;
                 bitCount = 0;
                 shift = 0;
-                return;
+                return null;
             case State.Request:
-                if(bitCount == 0 && !data) return;
+                if(bitCount == 0 && !data) return null;
                 if(data) shift |= 1u << bitCount;
-                if(++bitCount != 8) return;
+                if(++bitCount != 8) return null;
                 // start=1, stop=0, park=1; even parity across APnDP/RnW/A[3:2].
                 if((shift & 0xc1) != 0x81 || Parity((shift >> 1) & 0x1f))
                 {
                     state = State.Lockout;
-                    return;
+                    return null;
                 }
                 accessPort = (shift & 2) != 0;
                 read = (shift & 4) != 0;
@@ -151,33 +271,45 @@ namespace Antmicro.Renode.Peripherals.CPU
                 if(requireIdentification && !targetSelection && (accessPort || !read || address != 0))
                 {
                     state = State.Lockout;
-                    return;
-                }
-                if(targetSelection) acknowledgement = 0;
-                else
-                {
-                    requireIdentification = false;
-                    acknowledgement = BeginTransfer(accessPort, read, address, out transferValue);
+                    return null;
                 }
                 state = State.RequestTurnaround;
                 bitCount = 0;
-                return;
+                if(targetSelection)
+                {
+                    acknowledgement = 0;
+                    return null;
+                }
+                requireIdentification = false;
+                var requestAP = accessPort;
+                var requestRead = read;
+                var requestAddress = address;
+                return () =>
+                {
+                    var ack = BeginTransfer(requestAP, requestRead, requestAddress, out var value);
+                    lock(sync)
+                    {
+                        if(requestGeneration != generation) return;
+                        acknowledgement = ack;
+                        transferValue = value;
+                    }
+                };
             case State.RequestTurnaround:
                 state = State.Acknowledgement;
                 bitCount = 0;
-                return;
+                return null;
             case State.Acknowledgement:
-                if(++bitCount != 3) return;
+                if(++bitCount != 3) return null;
                 bitCount = 0;
                 if(acknowledgement != Acknowledgement.Ok || !read) state = State.WriteTurnaround;
                 else state = State.ReadData;
-                return;
+                return null;
             case State.ReadData:
                 if(++bitCount == 33) state = State.ReadTurnaround;
-                return;
+                return null;
             case State.ReadTurnaround:
                 FinishTransfer();
-                return;
+                return null;
             case State.WriteTurnaround:
                 if(acknowledgement != Acknowledgement.Ok && !targetSelection) FinishTransfer();
                 else
@@ -186,27 +318,39 @@ namespace Antmicro.Renode.Peripherals.CPU
                     shift = 0;
                     bitCount = 0;
                 }
-                return;
+                return null;
             case State.WriteData:
                 if(bitCount < 32)
                 {
                     if(data) shift |= 1u << bitCount;
                     bitCount++;
-                    return;
+                    return null;
                 }
+                var writeValue = shift;
                 if(targetSelection)
                 {
-                    if(data != Parity(shift) || !SelectTarget(shift))
+                    if(data != Parity(writeValue))
                     {
                         state = State.Lockout;
-                        return;
+                        return null;
                     }
+                    FinishTransfer();
+                    return () =>
+                    {
+                        var selected = SelectTarget(writeValue);
+                        lock(sync)
+                        {
+                            if(requestGeneration == generation && !selected) state = State.Lockout;
+                        }
+                    };
                 }
-                else if(data == Parity(shift)) CompleteWrite(accessPort, address, shift);
-                else WriteParityError();
+                var parityValid = data == Parity(writeValue);
+                var writeAP = accessPort;
+                var writeAddress = address;
                 FinishTransfer();
-                return;
+                return parityValid ? (Action)(() => CompleteWrite(writeAP, writeAddress, writeValue)) : WriteParityError;
             }
+            return null;
         }
 
         private void FallingEdge()
@@ -237,7 +381,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             if(output == level && outputEnabled == enabled) return;
             output = level;
             outputEnabled = enabled;
-            DriveChanged?.Invoke(1, level, enabled);
+            notifications.Enqueue(new Notification(generation, level, enabled));
         }
 
         private static bool Parity(uint value)
@@ -258,5 +402,50 @@ namespace Antmicro.Renode.Peripherals.CPU
         private uint shift, transferValue, resetSequence;
         private byte address;
         private Acknowledgement acknowledgement;
+        private readonly object sync = new object();
+        private readonly Queue<Input> pending = new Queue<Input>();
+        private readonly Queue<Notification> notifications = new Queue<Notification>();
+        private ulong generation;
+        private bool processing;
+        private bool sampledClock;
+        private bool sampledData = true;
+        private bool targetResetPending;
+
+        private readonly struct Input
+        {
+            public Input(ulong generation, int number, bool value)
+            {
+                Generation = generation;
+                Number = number;
+                Value = value;
+                Reset = ResetTarget = false;
+            }
+
+            public Input(ulong generation, bool resetTarget)
+            {
+                Generation = generation;
+                Number = 0;
+                Value = false;
+                Reset = true;
+                ResetTarget = resetTarget;
+            }
+
+            public readonly ulong Generation;
+            public readonly int Number;
+            public readonly bool Value, Reset, ResetTarget;
+        }
+
+        private readonly struct Notification
+        {
+            public Notification(ulong generation, bool level, bool enabled)
+            {
+                Generation = generation;
+                Level = level;
+                Enabled = enabled;
+            }
+
+            public readonly ulong Generation;
+            public readonly bool Level, Enabled;
+        }
     }
 }

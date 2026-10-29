@@ -21,9 +21,8 @@ namespace Antmicro.Renode.Peripherals.CPU
             Reset();
         }
 
-        public override void Reset()
+        protected override void ResetBackend()
         {
-            base.Reset();
             select = select1 = readBuffer = rpControl = 0;
             control = 0x40;
             if(aps != null) foreach(var ap in aps) ap.Reset();
