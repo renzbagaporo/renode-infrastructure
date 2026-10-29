@@ -22,21 +22,30 @@ namespace Antmicro.Renode.Peripherals.USB
 
         public byte ReadByte(long offset)
         {
-            CheckRange(offset, 1);
-            return data[offset];
+            lock(this)
+            {
+                CheckRange(offset, 1);
+                return data[offset];
+            }
         }
 
         public ushort ReadWord(long offset)
         {
-            CheckRange(offset, 2);
-            return (ushort)(data[offset] | (data[offset + 1] << 8));
+            lock(this)
+            {
+                CheckRange(offset, 2);
+                return (ushort)(data[offset] | (data[offset + 1] << 8));
+            }
         }
 
         public uint ReadDoubleWord(long offset)
         {
-            CheckRange(offset, 4);
-            return (uint)(data[offset] | (data[offset + 1] << 8)
-                | (data[offset + 2] << 16) | (data[offset + 3] << 24));
+            lock(this)
+            {
+                CheckRange(offset, 4);
+                return (uint)(data[offset] | (data[offset + 1] << 8)
+                    | (data[offset + 2] << 16) | (data[offset + 3] << 24));
+            }
         }
 
         public void WriteByte(long offset, byte value)
@@ -56,27 +65,33 @@ namespace Antmicro.Renode.Peripherals.USB
 
         public byte[] ReadBytes(long offset, int count)
         {
-            CheckRange(offset, count);
-            var result = new byte[count];
-            Array.Copy(data, offset, result, 0, count);
-            return result;
+            lock(this)
+            {
+                CheckRange(offset, count);
+                var result = new byte[count];
+                Array.Copy(data, offset, result, 0, count);
+                return result;
+            }
         }
 
         public void WriteBytes(long offset, byte[] bytes)
         {
-            CheckRange(offset, bytes.Length);
-            Array.Copy(bytes, 0, data, offset, bytes.Length);
-            var first = Math.Max(offset, BufferControlStart);
-            var last = Math.Min(offset + bytes.Length, BufferControlEnd);
-            if(first >= last)
+            lock(this)
             {
-                return;
-            }
-            var firstControl = (int)((first - BufferControlStart) / 4);
-            var lastControl = (int)((last - 1 - BufferControlStart) / 4);
-            for(var control = firstControl; control <= lastControl; ++control)
-            {
-                BufferControlWritten?.Invoke(control);
+                CheckRange(offset, bytes.Length);
+                Array.Copy(bytes, 0, data, offset, bytes.Length);
+                var first = Math.Max(offset, BufferControlStart);
+                var last = Math.Min(offset + bytes.Length, BufferControlEnd);
+                if(first >= last)
+                {
+                    return;
+                }
+                var firstControl = (int)((first - BufferControlStart) / 4);
+                var lastControl = (int)((last - 1 - BufferControlStart) / 4);
+                for(var control = firstControl; control <= lastControl; ++control)
+                {
+                    BufferControlWritten?.Invoke(control);
+                }
             }
         }
 
