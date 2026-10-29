@@ -3,68 +3,90 @@
 // Full license text is available in 'licenses/MIT.txt'.
 //
 
-using System;
-using System.Collections.Generic;
-using System.Linq;
 using Antmicro.Renode.Core;
+using Antmicro.Renode.Peripherals.Bus;
 using Antmicro.Renode.Peripherals.CPU;
+using Antmicro.Renode.Peripherals.Miscellaneous;
 
 namespace Antmicro.Renode.Peripherals.Memory
 {
-    // 1 KiB APB boot RAM, including the standard atomic write aliases. It is
-    // retained across warm core resets and lives in the switched XIP domain.
-    public sealed class RP2350_BootRAM : RP2APBPeripheral, IMapped, IMemory, IDisposable
+    // 1 KiB APB data RAM with the standard atomic aliases. Instruction fetch
+    // is disconnected from the peripheral bus, including the boot RAM.
+    public sealed class RP2350_BootRAM : RP2APBPeripheral
     {
-        public RP2350_BootRAM(IMachine machine) : base(machine)
+        public RP2350_BootRAM(IMachine machine, RP2350_AccessControl accessControl = null) : base(machine)
         {
-            memory = new MappedMemory(machine, 0x1000);
-            machine.PeripheralsChanged += OnPeripheralsChanged;
+            this.accessControl = accessControl;
+            Reset();
         }
 
-        public override void Reset() { }
-        public ulong ReadQuadWord(long offset) => ReadDoubleWord(offset) | (ulong)ReadDoubleWord(offset + 4) << 32;
-        public void WriteQuadWord(long offset, ulong value)
+        // Retained across warm resets of either processor.
+        public override void Reset()
         {
-            WriteDoubleWord(offset, (uint)value);
-            WriteDoubleWord(offset + 4, (uint)(value >> 32));
-        }
-        public byte[] ReadBytes(long offset, int count, IPeripheral context = null)
-        {
-            var data = new byte[count];
-            for(var i = 0; i < count; i++) data[i] = ReadByte(offset + i);
-            return data;
-        }
-        public void WriteBytes(long offset, byte[] data, int startingIndex, int count, IPeripheral context = null)
-        {
-            for(var i = 0; i < count; i++) WriteByte(offset + i, data[startingIndex + i]);
-        }
-        public IEnumerable<IMappedSegment> MappedSegments => memory.MappedSegments;
-        public void Dispose()
-        {
-            machine.PeripheralsChanged -= OnPeripheralsChanged;
-            memory.Dispose();
-        }
-
-        protected override uint ReadRegister(long offset) => offset < 0x400 ? memory.ReadDoubleWord(offset) : 0;
-
-        protected override void WriteRegister(long offset, uint value, AtomicOperation operation)
-        {
-            if(offset >= 0x400) return;
-            memory.WriteDoubleWord(offset, ApplyOperation(memory.ReadDoubleWord(offset), value, operation));
-            foreach(var cpu in machine.GetSystemBus(this).GetCPUs().OfType<TranslationCPU>()) cpu.InvalidateTranslationBlocks();
-        }
-
-        private void OnPeripheralsChanged(IMachine _, PeripheralsChangedEventArgs change)
-        {
-            if(change.Peripheral != this && !(change.Peripheral is ICPUWithMappedMemory)) return;
-            var bus = machine.GetSystemBus(this);
-            foreach(var registration in bus.GetRegistrationPoints(this))
+            lock(SyncRoot)
             {
-                foreach(var cpu in bus.GetCPUs().OfType<ICPUWithMappedMemory>())
-                    cpu.RegisterAccessFlags(registration.Range.StartAddress, registration.Range.Size, isIoMemory: true);
+                writeOnce[0] = writeOnce[1] = 0;
+                unclaimedLocks = 0xff;
             }
         }
 
-        private readonly MappedMemory memory;
+        protected override uint ReadRegister(long offset)
+        {
+            RequireSecureAccess();
+            if(offset < 0x400) return words[offset / 4];
+            if(offset == 0x800 || offset == 0x804) return writeOnce[(offset - 0x800) / 4];
+            if(offset == 0x808) return unclaimedLocks;
+            if(offset >= 0x80c && offset <= 0x828 && (offset & 3) == 0)
+            {
+                var bit = 1u << (int)((offset - 0x80c) / 4);
+                var claimed = unclaimedLocks & bit;
+                unclaimedLocks &= ~bit;
+                return claimed;
+            }
+            throw new BusAccessException(BusAccessError.AddressError);
+        }
+
+        protected override void WriteRegister(long offset, uint value, AtomicOperation operation)
+        {
+            RequireSecureAccess();
+            if(offset < 0x400)
+            {
+                words[offset / 4] = ApplyOperation(words[offset / 4], value, operation);
+                return;
+            }
+            if(offset == 0x800 || offset == 0x804)
+            {
+                var index = (offset - 0x800) / 4;
+                writeOnce[index] |= ApplyOperation(writeOnce[index], value, operation);
+                return;
+            }
+            if(offset == 0x808) return;
+            if(offset >= 0x80c && offset <= 0x828 && (offset & 3) == 0)
+            {
+                unclaimedLocks |= 1u << (int)((offset - 0x80c) / 4);
+                return;
+            }
+            throw new BusAccessException(BusAccessError.AddressError);
+        }
+
+        private void RequireSecureAccess()
+        {
+            var bus = machine.SystemBus;
+            if(bus.TryGetCurrentContextState<CortexM.ContextState>(out var _, out var state))
+            {
+                if(!state.DebugAccess && bus.TryGetTransactionInitiator(out var initiator) && initiator is CortexM core
+                    && accessControl != null && accessControl.CoreIsForcedNonSecure((int)core.MultiprocessingId))
+                    throw new BusAccessException(BusAccessError.CommandError);
+                if(!state.AttributionSecure) throw new BusAccessException(BusAccessError.CommandError);
+            }
+            else if(bus.TryGetTransactionInitiator(out var initiator) && initiator is CortexM core && core.TrustZoneEnabled
+                && (!core.SecureState || accessControl != null && accessControl.CoreIsForcedNonSecure((int)core.MultiprocessingId)))
+                throw new BusAccessException(BusAccessError.CommandError);
+        }
+
+        private readonly RP2350_AccessControl accessControl;
+        private readonly uint[] writeOnce = new uint[2];
+        private uint unclaimedLocks;
+        private readonly uint[] words = new uint[0x100];
     }
 }
