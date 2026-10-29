@@ -8,6 +8,7 @@ using System.Collections.Generic;
 using System.Numerics;
 
 using Antmicro.Renode.Core;
+using Antmicro.Renode.Peripherals.CPU;
 using Antmicro.Renode.Peripherals.Timers;
 using Antmicro.Renode.Time;
 using Antmicro.Renode.Utilities;
@@ -76,6 +77,14 @@ namespace Antmicro.Renode.Peripherals.DMA
                 UpdateInterrupts();
             }
             PublishPending();
+        }
+
+        protected override void OnBeforeAccess()
+        {
+            // Report the CPU's retired instruction progress before sampling
+            // registers. Descriptor writes have this DMA as their bus initiator
+            // and must not recursively synchronize a CPU clock callback.
+            if(machine.SystemBus.TryGetTransactionInitiator(out var initiator) && initiator is ICPU cpu) cpu.SyncTime();
         }
 
         protected override void OnResetHeldChanged() => Schedule();
