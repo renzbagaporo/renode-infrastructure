@@ -5,6 +5,7 @@
 
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Peripherals.Bus;
+using Antmicro.Renode.Time;
 
 namespace Antmicro.Renode.Peripherals
 {
@@ -17,10 +18,8 @@ namespace Antmicro.Renode.Peripherals
             try
             {
                 OnBeforeAccess();
-                lock(SyncRoot)
-                {
-                    return ReadRegister(offset & RegisterOffsetMask);
-                }
+                var clock = AccessClock;
+                return clock == null ? ReadState(offset) : ReadClockState(clock, offset);
             }
             finally
             {
@@ -43,13 +42,9 @@ namespace Antmicro.Renode.Peripherals
             try
             {
                 OnBeforeAccess();
-                lock(SyncRoot)
-                {
-                    if(!resetHeld)
-                    {
-                        WriteRegister(offset & RegisterOffsetMask, value, (AtomicOperation)((offset >> 12) & 3));
-                    }
-                }
+                var clock = AccessClock;
+                if(clock == null) WriteState(offset, value);
+                else WriteClockState(clock, offset, value);
             }
             finally
             {
@@ -84,19 +79,9 @@ namespace Antmicro.Renode.Peripherals
             {
                 try
                 {
-                    lock(SyncRoot)
-                    {
-                        if(value == resetHeld)
-                        {
-                            return;
-                        }
-                        resetHeld = value;
-                        if(value)
-                        {
-                            Reset();
-                        }
-                        OnResetHeldChanged();
-                    }
+                    var clock = AccessClock;
+                    if(clock == null) SetResetState(value);
+                    else SetClockResetState(clock, value);
                 }
                 finally
                 {
@@ -113,6 +98,10 @@ namespace Antmicro.Renode.Peripherals
         // External protocol callbacks use the same monitor as register accesses
         // and reset transitions. Shared-memory peripherals can supply its lock.
         protected virtual object SyncRoot => this;
+
+        // Match timer callbacks' clock-before-state lock order for direct
+        // accesses and reset-domain transitions as well as SystemBus accesses.
+        protected virtual IClockSource AccessClock => null;
 
         // Clock synchronization may dispatch bus transfers back into this device;
         // perform it before taking the register/reset state monitor.
@@ -157,6 +146,47 @@ namespace Antmicro.Renode.Peripherals
             Xor,
             Set,
             Clear,
+        }
+
+        private uint ReadState(long offset)
+        {
+            lock(SyncRoot) return ReadRegister(offset & RegisterOffsetMask);
+        }
+
+        private uint ReadClockState(IClockSource clock, long offset)
+        {
+            uint result = 0;
+            clock.ExecuteInLock(() => result = ReadState(offset));
+            return result;
+        }
+
+        private void WriteState(long offset, uint value)
+        {
+            lock(SyncRoot)
+            {
+                if(!resetHeld) WriteRegister(offset & RegisterOffsetMask, value, (AtomicOperation)((offset >> 12) & 3));
+            }
+        }
+
+        private void WriteClockState(IClockSource clock, long offset, uint value)
+        {
+            clock.ExecuteInLock(() => WriteState(offset, value));
+        }
+
+        private void SetResetState(bool value)
+        {
+            lock(SyncRoot)
+            {
+                if(value == resetHeld) return;
+                resetHeld = value;
+                if(value) Reset();
+                OnResetHeldChanged();
+            }
+        }
+
+        private void SetClockResetState(IClockSource clock, bool value)
+        {
+            clock.ExecuteInLock(() => SetResetState(value));
         }
 
         private bool resetHeld;

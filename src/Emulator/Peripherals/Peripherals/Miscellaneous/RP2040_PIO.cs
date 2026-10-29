@@ -60,6 +60,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         public override void Reset()
         {
+            machine.ClockSource.ExecuteInLock(ResetState);
+            PublishPending();
+        }
+
+        protected override IClockSource AccessClock => machine.ClockSource;
+
+        private void ResetState()
+        {
             lock(SyncRoot)
             {
                 control = 0;
@@ -95,7 +103,6 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 for(var pin = 0; pin < 32; pin++) QueuePin(pin);
                 UpdateSignals();
             }
-            PublishPending();
         }
 
         protected override void OnResetHeldChanged()
@@ -805,6 +812,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private void OnInputChanged(int pin, bool level)
         {
             if(pin >= 32) return;
+            machine.ClockSource.ExecuteInLock(() => UpdateInput(pin, level));
+        }
+
+        private void UpdateInput(int pin, bool level)
+        {
             lock(SyncRoot)
             {
                 ReadInput(pin);
@@ -866,6 +878,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private void OnClockChanged()
         {
             SynchronizeTime();
+            machine.ClockSource.ExecuteInLock(UpdateClock);
+            PublishPending();
+        }
+
+        private void UpdateClock()
+        {
             lock(SyncRoot)
             {
                 frequency = clocks.SystemFrequency;
@@ -879,7 +897,6 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 BeginPinCycle();
                 ResolvePinWrites();
             }
-            PublishPending();
         }
 
         private void WakeAll(StateMachine except = null)
