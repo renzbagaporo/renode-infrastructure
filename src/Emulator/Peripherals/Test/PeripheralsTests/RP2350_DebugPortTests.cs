@@ -53,6 +53,21 @@ namespace Antmicro.Renode.PeripheralsTests
         }
 
         [Test]
+        public void ShouldIdentifyBothMemoryAPsAsAHB5WithEnhancedHPROT()
+        {
+            PowerUp();
+            foreach(var ap in new uint[] { 0x2000, 0x4000 })
+            {
+                var idr = port.ReadAP(ap + 0xdfc);
+                Assert.AreEqual(8, idr & 0xf, "IDR.TYPE: AHB5 with enhanced HPROT");
+                Assert.AreEqual(8, (idr >> 13) & 0xf, "IDR.CLASS: MEM-AP");
+                Assert.AreEqual(0x23b, (idr >> 17) & 0x7ff, "IDR.DESIGNER: Arm");
+                Assert.AreEqual(3, idr >> 28, "IDR.REVISION: physical RP2350 fixture");
+                Assert.AreEqual(0x10000, port.ReadAP(ap + 0xdf4), "CFG advertises the implemented 10-bit TAR incrementer");
+            }
+        }
+
+        [Test]
         public void ShouldReturnPreviousAPReadAndRetainTheLastValueInReadBuffer()
         {
             PowerUp();
@@ -61,8 +76,8 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.AreEqual(0, first);
             port.Select(0x4dfc);
             Assert.AreEqual(1, port.TryAPRead(out var previous));
-            Assert.AreEqual(0x000101a0, previous);
-            Assert.AreEqual(0x000101a0, port.ReadDP(12));
+            Assert.AreEqual(0x34770008, previous);
+            Assert.AreEqual(0x34770008, port.ReadDP(12));
         }
 
         [Test]
@@ -76,7 +91,7 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.AreEqual(4, port.TryAPRead(out var _));
             port.WriteDP(0, 4);
             Assert.AreEqual(1, port.TryAPRead(out var _));
-            Assert.AreEqual(0x000101a0, port.ReadDP(12));
+            Assert.AreEqual(0x34770008, port.ReadDP(12));
         }
 
         [Test]

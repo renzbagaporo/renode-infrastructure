@@ -204,8 +204,12 @@ namespace Antmicro.Renode.Peripherals.CPU
                 case 0xd00: return csw;
                 case 0xd04: return tar;
                 case 0xd0c: return Transfer(false, 0);
+                // Ten-bit TAR incrementer. Optional DAR and extended error
+                // control registers are not implemented by this endpoint.
+                case 0xdf4: return 0x00010000;
                 case 0xdf8: return 0xe00ff003;
-                case 0xdfc: return 0x000101a0;
+                // RP2350's AHB5 MEM-AP with enhanced HPROT, revision 3.
+                case 0xdfc: return 0x34770008;
                 default:
                     if(offset >= 0xd10 && offset <= 0xd1c) return ReadMemory((tar & ~0xfu) | (offset & 0xc), 2);
                     return ComponentRegister(offset, 0x043bb9e3, 9, 0x47700a17);
