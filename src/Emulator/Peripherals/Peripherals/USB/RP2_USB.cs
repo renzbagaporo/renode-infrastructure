@@ -5,6 +5,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Threading;
 
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.USB;
@@ -41,8 +42,10 @@ namespace Antmicro.Renode.Peripherals.USB
                     startOfFramePending = true;
                     UpdateInterrupts();
                 }
+                PublishPending();
             };
             dpram.BufferControlWritten += BufferControlWritten;
+            dpram.AccessCompleted += PublishPending;
             clockSource.ClockChanged += ClockChanged;
             Reset();
             ClockChanged();
@@ -68,16 +71,20 @@ namespace Antmicro.Renode.Peripherals.USB
                 UpdateConnection();
                 UpdateInterrupts();
             }
+            PublishPending();
         }
 
         public IUSBConnection ConnectUSB()
         {
+            IUSBConnection connection;
             lock(dpram)
             {
                 connectionCount++;
                 UpdateConnection();
-                return new Connection(this);
+                connection = new Connection(this);
             }
+            PublishPending();
+            return connection;
         }
 
         public byte Address => (byte)(registers[(int)Registers.Address / 4] & 0x7f);
@@ -85,6 +92,8 @@ namespace Antmicro.Renode.Peripherals.USB
         public GPIO IRQ { get; }
 
         protected override object SyncRoot => dpram;
+
+        protected override void OnAccessCompleted() => PublishPending();
 
         protected override void OnResetHeldChanged()
         {
@@ -220,6 +229,7 @@ namespace Antmicro.Renode.Peripherals.USB
                 UpdateConnection();
                 UpdateInterrupts();
             }
+            PublishPending();
         }
 
         private void BufferControlWritten(int control)
@@ -295,23 +305,74 @@ namespace Antmicro.Renode.Peripherals.USB
 
         private void Setup(SetupPacket packet)
         {
+            try
+            {
+                lock(dpram)
+                {
+                    if(!CanProcessPackets)
+                    {
+                        this.Log(LogLevel.Warning, "USB SETUP token received while the serial interface is inactive");
+                        return;
+                    }
+                    endpoints[0].Reset();
+                    bufferIndex[0] = 0;
+                    bufferIndex[1] = 0;
+                    // A new SETUP terminates the previous control transfer. Its
+                    // response must come from firmware handling this setup packet.
+                    dpram.WriteDoubleWord(0x80, dpram.ReadDoubleWord(0x80) & ~0x04000400u);
+                    dpram.WriteDoubleWord(0x84, dpram.ReadDoubleWord(0x84) & ~0x04000400u);
+                    dpram.WriteBytes(0, Packet.Encode(packet));
+                    sieStatus |= SetupReceivedStatus;
+                    UpdateInterrupts();
+                }
+            }
+            finally
+            {
+                PublishPending();
+            }
+        }
+
+        private void QueueInputNotification(int endpoint)
+        {
+            pendingInputNotifications |= 1u << endpoint;
+        }
+
+        // Default USB read helpers hold their packet monitor while calling
+        // TryRead. Publish outside the DPRAM monitor to avoid reversing that
+        // lock order; reentrant buffer rearming appends another notification.
+        private void PublishPending()
+        {
+            if(Monitor.IsEntered(dpram)) return;
             lock(dpram)
             {
-                if(!CanProcessPackets)
+                if(publishingInputNotifications) return;
+                publishingInputNotifications = true;
+            }
+            try
+            {
+                while(true)
                 {
-                    this.Log(LogLevel.Warning, "USB SETUP token received while the serial interface is inactive");
-                    return;
+                    int endpoint;
+                    bool ready;
+                    lock(dpram)
+                    {
+                        if(pendingInputNotifications == 0)
+                        {
+                            publishingInputNotifications = false;
+                            return;
+                        }
+                        endpoint = 0;
+                        while((pendingInputNotifications & (1u << endpoint)) == 0) endpoint++;
+                        pendingInputNotifications &= ~(1u << endpoint);
+                        ready = TryGetBuffer(endpoint, true, out var buffer) && (buffer.Control & BufferFull) != 0;
+                    }
+                    if(ready) endpoints[endpoint].PublishAvailable();
                 }
-                endpoints[0].Reset();
-                bufferIndex[0] = 0;
-                bufferIndex[1] = 0;
-                // A new SETUP terminates the previous control transfer. Its
-                // response must come from firmware handling this setup packet.
-                dpram.WriteDoubleWord(0x80, dpram.ReadDoubleWord(0x80) & ~0x04000400u);
-                dpram.WriteDoubleWord(0x84, dpram.ReadDoubleWord(0x84) & ~0x04000400u);
-                dpram.WriteBytes(0, Packet.Encode(packet));
-                sieStatus |= SetupReceivedStatus;
-                UpdateInterrupts();
+            }
+            catch
+            {
+                lock(dpram) publishingInputNotifications = false;
+                throw;
             }
         }
 
@@ -367,6 +428,8 @@ namespace Antmicro.Renode.Peripherals.USB
         private bool startOfFramePending;
         private bool connectionObserved;
         private bool timingWarningEmitted;
+        private uint pendingInputNotifications;
+        private bool publishingInputNotifications;
 
         private const int EndpointCount = 16;
         private const int RegisterBytes = 0x100;
@@ -410,6 +473,7 @@ namespace Antmicro.Renode.Peripherals.USB
             public void Reset()
             {
                 pendingWrites.Clear();
+                parent.pendingInputNotifications &= ~(1u << number);
             }
 
             public void SetupPacketWrite(SetupPacket packet)
@@ -424,41 +488,55 @@ namespace Antmicro.Renode.Peripherals.USB
 
             public bool TryRead(out byte[] data)
             {
-                lock(parent.dpram)
+                try
                 {
-                    if(!parent.TryGetBuffer(number, true, out var buffer) || (buffer.Control & BufferFull) == 0)
+                    lock(parent.dpram)
                     {
-                        data = Array.Empty<byte>();
-                        return false;
+                        if(!parent.TryGetBuffer(number, true, out var buffer) || (buffer.Control & BufferFull) == 0)
+                        {
+                            data = Array.Empty<byte>();
+                            return false;
+                        }
+                        var length = buffer.Control & BufferLengthMask;
+                        data = parent.dpram.ReadBytes(buffer.Address, length);
+                        parent.CompleteBuffer(buffer, true, length);
+                        return true;
                     }
-                    var length = buffer.Control & BufferLengthMask;
-                    data = parent.dpram.ReadBytes(buffer.Address, length);
-                    parent.CompleteBuffer(buffer, true, length);
-                    return true;
+                }
+                finally
+                {
+                    parent.PublishPending();
                 }
             }
 
             public void Write(byte[] data)
             {
-                lock(parent.dpram)
+                try
                 {
-                    if(parent.ResetHeld || !parent.PhysicalConnection) return;
-                    // IUSBPipeWrite has no NAK result. Queue host-side pending
-                    // transfers while clocks are stopped; the SIE accepts them
-                    // only when clocking and buffer ownership allow completion.
-                    // Non-isochronous full-speed endpoints carry at most 64 bytes
-                    // per token. Preserve the zero-length status packet as well.
-                    var offset = 0;
-                    do
+                    lock(parent.dpram)
                     {
-                        var count = Math.Min(64, data.Length - offset);
-                        var packet = new byte[count];
-                        Array.Copy(data, offset, packet, 0, count);
-                        pendingWrites.Enqueue(packet);
-                        offset += count;
+                        if(parent.ResetHeld || !parent.PhysicalConnection) return;
+                        // IUSBPipeWrite has no NAK result. Queue host-side pending
+                        // transfers while clocks are stopped; the SIE accepts them
+                        // only when clocking and buffer ownership allow completion.
+                        // Non-isochronous full-speed endpoints carry at most 64 bytes
+                        // per token. Preserve the zero-length status packet as well.
+                        var offset = 0;
+                        do
+                        {
+                            var count = Math.Min(64, data.Length - offset);
+                            var packet = new byte[count];
+                            Array.Copy(data, offset, packet, 0, count);
+                            pendingWrites.Enqueue(packet);
+                            offset += count;
+                        }
+                        while(offset < data.Length);
+                        BufferReady();
                     }
-                    while(offset < data.Length);
-                    BufferReady();
+                }
+                finally
+                {
+                    parent.PublishPending();
                 }
             }
 
@@ -489,7 +567,7 @@ namespace Antmicro.Renode.Peripherals.USB
                         }
                         if(parent.TryGetBuffer(number, true, out var input) && (input.Control & BufferFull) != 0)
                         {
-                            NewPacket?.Invoke();
+                            parent.QueueInputNotification(number);
                         }
                     }
                     finally
@@ -498,6 +576,8 @@ namespace Antmicro.Renode.Peripherals.USB
                     }
                 }
             }
+
+            public void PublishAvailable() => NewPacket?.Invoke();
 
             public event Action NewPacket;
 
@@ -522,15 +602,22 @@ namespace Antmicro.Renode.Peripherals.USB
 
             public void Dispose()
             {
-                lock(parent.dpram)
+                try
                 {
-                    if(disposed)
+                    lock(parent.dpram)
                     {
-                        return;
+                        if(disposed)
+                        {
+                            return;
+                        }
+                        disposed = true;
+                        parent.connectionCount--;
+                        parent.UpdateConnection();
                     }
-                    disposed = true;
-                    parent.connectionCount--;
-                    parent.UpdateConnection();
+                }
+                finally
+                {
+                    parent.PublishPending();
                 }
             }
 

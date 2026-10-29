@@ -4,6 +4,9 @@
 //
 
 using System;
+using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
 
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.USB;
@@ -359,6 +362,74 @@ namespace Antmicro.Renode.PeripheralsTests
             dpram.WriteBytes(0x100, new byte[] { 0x42 });
             dpram.WriteDoubleWord(0x80, 0x8401);
             Assert.That(connection.ConnectEndpointRead(0).TryRead(out _), Is.True);
+        }
+
+        [TestCase(false)]
+        [TestCase(true)]
+        public void ShouldPublishInputNotificationsOutsideDpramMonitor(bool restoreClock)
+        {
+            var input = connection.ConnectEndpointRead(0);
+            var notifications = 0;
+            input.NewPacket += () =>
+            {
+                Assert.IsFalse(Monitor.IsEntered(dpram));
+                notifications++;
+            };
+            if(restoreClock) clocks.Set(125000000, 0);
+            dpram.WriteByte(0x100, 0x42);
+            dpram.WriteDoubleWord(0x80, 0x8401);
+            if(restoreClock)
+            {
+                Assert.AreEqual(0, notifications);
+                clocks.Set(125000000, 48000000);
+            }
+            Assert.AreEqual(1, notifications);
+        }
+
+        [Test]
+        public void ShouldAllowAnotherThreadToReadDpramDuringInputNotification()
+        {
+            connection.ConnectEndpointRead(0).NewPacket += () =>
+            {
+                var read = Task.Run(() => dpram.ReadByte(0x100));
+                Assert.IsTrue(read.Wait(TimeSpan.FromSeconds(1)), "Input notification retained the DPRAM state monitor");
+                Assert.AreEqual(0x42, read.Result);
+            };
+            dpram.WriteByte(0x100, 0x42);
+            dpram.WriteDoubleWord(0x80, 0x8401);
+        }
+
+        [Test]
+        public void ShouldDeliverRearmedInputWithoutNestedCallbacksOrLosingTheNotification()
+        {
+            var input = connection.ConnectEndpointRead(0);
+            var packets = new List<byte>();
+            var depth = 0;
+            var maximumDepth = 0;
+            input.NewPacket += () =>
+            {
+                depth++;
+                maximumDepth = Math.Max(maximumDepth, depth);
+                try
+                {
+                    Assert.IsTrue(input.TryRead(out var packet));
+                    packets.Add(packet[0]);
+                    if(packets.Count == 1)
+                    {
+                        dpram.WriteByte(0x100, 2);
+                        dpram.WriteDoubleWord(0x80, 0x8401);
+                    }
+                }
+                finally
+                {
+                    depth--;
+                }
+            };
+            dpram.WriteByte(0x100, 1);
+            dpram.WriteDoubleWord(0x80, 0x8401);
+            Assert.That(packets, Is.EqualTo(new byte[] { 1, 2 }));
+            Assert.AreEqual(1, maximumDepth);
+            Assert.IsFalse(input.TryRead(out _));
         }
 
         private void AdvanceMicroseconds(ulong duration) => ((BaseClockSource)machine.ClockSource).Advance(TimeInterval.FromMicroseconds(duration));

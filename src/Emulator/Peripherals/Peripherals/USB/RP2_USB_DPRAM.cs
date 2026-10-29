@@ -81,23 +81,27 @@ namespace Antmicro.Renode.Peripherals.USB
 
         public void WriteBytes(long offset, byte[] bytes)
         {
-            lock(this)
+            try
             {
-                CheckRange(offset, bytes.Length);
-                if(UnavailableAccess()) return;
-                Array.Copy(bytes, 0, data, offset, bytes.Length);
-                var first = Math.Max(offset, BufferControlStart);
-                var last = Math.Min(offset + bytes.Length, BufferControlEnd);
-                if(first >= last)
+                lock(this)
                 {
-                    return;
+                    CheckRange(offset, bytes.Length);
+                    if(UnavailableAccess()) return;
+                    Array.Copy(bytes, 0, data, offset, bytes.Length);
+                    var first = Math.Max(offset, BufferControlStart);
+                    var last = Math.Min(offset + bytes.Length, BufferControlEnd);
+                    if(first >= last) return;
+                    var firstControl = (int)((first - BufferControlStart) / 4);
+                    var lastControl = (int)((last - 1 - BufferControlStart) / 4);
+                    for(var control = firstControl; control <= lastControl; ++control)
+                    {
+                        BufferControlWritten?.Invoke(control);
+                    }
                 }
-                var firstControl = (int)((first - BufferControlStart) / 4);
-                var lastControl = (int)((last - 1 - BufferControlStart) / 4);
-                for(var control = firstControl; control <= lastControl; ++control)
-                {
-                    BufferControlWritten?.Invoke(control);
-                }
+            }
+            finally
+            {
+                AccessCompleted?.Invoke();
             }
         }
 
@@ -116,6 +120,8 @@ namespace Antmicro.Renode.Peripherals.USB
         public long Size => MemorySize;
 
         public event Action<int> BufferControlWritten;
+
+        internal event Action AccessCompleted;
 
         // Access requires USBCTRL out of reset (RP2350 section 12.1.2.7).
         // Exact bus responses are unspecified: return zero, ignore writes, and
