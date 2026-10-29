@@ -11,6 +11,7 @@ using System.Numerics;
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
+using Antmicro.Renode.Peripherals.CPU;
 using Antmicro.Renode.Peripherals.GPIOPort;
 using Antmicro.Renode.Peripherals.Timers;
 using Antmicro.Renode.Time;
@@ -107,7 +108,6 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         protected override uint ReadRegister(long offset)
         {
-            SynchronizeTime();
             if(offset >= 0x20 && offset < 0x30)
             {
                 var sm = stateMachines[(offset - 0x20) / 4];
@@ -178,7 +178,6 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         protected override void WriteRegister(long offset, uint value, AtomicOperation operation)
         {
-            SynchronizeTime();
             if(offset >= 0x10 && offset < 0x20)
             {
                 var sm = stateMachines[(offset - 0x10) / 4];
@@ -976,9 +975,17 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             sm.Exec = null;
         }
 
+        protected override void OnBeforeAccess()
+        {
+            SynchronizeTime();
+        }
+
         private void SynchronizeTime()
         {
-            if(machine.SystemBus.TryGetCurrentCPU(out var cpu)) cpu.SyncTime();
+            if(machine.SystemBus.TryGetTransactionInitiator(out var initiator) && initiator is ICPU cpu)
+            {
+                cpu.SyncTime();
+            }
         }
 
         private bool Enabled(StateMachine sm) => (control & (1u << sm.Index)) != 0;

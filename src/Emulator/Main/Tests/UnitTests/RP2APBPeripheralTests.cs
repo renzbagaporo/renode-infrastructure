@@ -3,7 +3,9 @@
 // Full license text is available in 'licenses/MIT.txt'.
 //
 
+using System;
 using System.Threading;
+using System.Threading.Tasks;
 
 using Antmicro.Renode.Peripherals;
 
@@ -89,6 +91,26 @@ namespace Antmicro.Renode.UnitTests
         }
 
         [Test]
+        public void ShouldAllowClockCallbacksBeforeTakingStateMonitor()
+        {
+            var peripheral = new TestPeripheral();
+            var callbacks = 0;
+            peripheral.BeforeAccess = () =>
+            {
+                Assert.IsTrue(Task.Run(() =>
+                {
+                    lock(peripheral)
+                    {
+                        callbacks++;
+                    }
+                }).Wait(TimeSpan.FromSeconds(1)));
+            };
+            peripheral.WriteByte(1, 0x12);
+            Assert.AreEqual(0x12, peripheral.ReadByte(1));
+            Assert.AreEqual(2, callbacks);
+        }
+
+        [Test]
         public void ShouldCompleteAccessAfterReleasingStateMonitor()
         {
             var peripheral = new TestPeripheral();
@@ -166,6 +188,13 @@ namespace Antmicro.Renode.UnitTests
             public int CompletedAccesses { get; private set; }
 
             public bool CompletedUnderMonitor { get; private set; }
+
+            public Action BeforeAccess { get; set; }
+
+            protected override void OnBeforeAccess()
+            {
+                BeforeAccess?.Invoke();
+            }
 
             protected override void OnAccessCompleted()
             {

@@ -16,6 +16,7 @@ namespace Antmicro.Renode.Peripherals
         {
             try
             {
+                OnBeforeAccess();
                 lock(SyncRoot)
                 {
                     return ReadRegister(offset & RegisterOffsetMask);
@@ -41,6 +42,7 @@ namespace Antmicro.Renode.Peripherals
         {
             try
             {
+                OnBeforeAccess();
                 lock(SyncRoot)
                 {
                     if(!resetHeld)
@@ -111,6 +113,12 @@ namespace Antmicro.Renode.Peripherals
         // External protocol callbacks use the same monitor as register accesses
         // and reset transitions. Shared-memory peripherals can supply its lock.
         protected virtual object SyncRoot => this;
+
+        // Clock synchronization may dispatch bus transfers back into this device;
+        // perform it before taking the register/reset state monitor.
+        protected virtual void OnBeforeAccess()
+        {
+        }
 
         // Devices with synchronous signal receivers publish queued notifications
         // after releasing their state monitor, avoiding cross-device lock cycles.
