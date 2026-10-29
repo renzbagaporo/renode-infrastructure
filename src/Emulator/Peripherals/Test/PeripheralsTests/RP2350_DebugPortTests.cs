@@ -100,6 +100,23 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.AreEqual(0, port.ReadAP(0x80ff4));
         }
 
+        [TestCase(0u, 4, 0x30, 9, 9, 0x47700af7u)]
+        [TestCase(0x2000u, 0xe3, 0xb9, 0x3b, 4, 0x47700a17u)]
+        [TestCase(0x4000u, 0xe3, 0xb9, 0x3b, 4, 0x47700a17u)]
+        public void ShouldExposeTraceBackedCoreSightIdentificationBytes(uint component, int pidr0, int pidr1, int pidr2, int pidr4, uint architecture)
+        {
+            PowerUp();
+            Assert.AreEqual(pidr0, port.ReadAP(component + 0xfe0));
+            Assert.AreEqual(pidr1, port.ReadAP(component + 0xfe4));
+            Assert.AreEqual(pidr2, port.ReadAP(component + 0xfe8));
+            Assert.AreEqual(0, port.ReadAP(component + 0xfec));
+            Assert.AreEqual(pidr4, port.ReadAP(component + 0xfd0));
+            Assert.AreEqual(architecture, port.ReadAP(component + 0xfbc));
+            var cidr = new uint[4];
+            for(var i = 0; i < cidr.Length; i++) cidr[i] = port.ReadAP(component + 0xff0 + (uint)i * 4);
+            CollectionAssert.AreEqual(new uint[] { 0xd, 0x90, 5, 0xb1 }, cidr);
+        }
+
         [Test]
         public void ShouldBlockAPAccessOnWriteParityErrorsUntilAbortClearsThem()
         {

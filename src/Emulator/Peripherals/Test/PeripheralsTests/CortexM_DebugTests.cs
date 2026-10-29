@@ -305,13 +305,13 @@ namespace Antmicro.Renode.PeripheralsTests
                 probe.ScheduleAction(TimeInterval.FromMicroseconds(5), _ =>
                 {
                     nvic.WriteDoubleWord(0xdf0, 0xa05f0003);
-                    TestContext.WriteLine($"HALT master={emulation.MasterTimeSource.ElapsedVirtualTime}, target={machine.ElapsedVirtualTime}, probe={probe.ElapsedVirtualTime}, handle={cpu.TimeHandle.Enabled}/{cpu.TimeHandle.DeferredEnabled}, instructions={cpu.ExecutedInstructions}");
+                    TestContext.WriteLine($"HALT master={emulation.MasterTimeSource.ElapsedVirtualTime}, target={machine.ElapsedVirtualTime.TimeElapsed}, probe={probe.ElapsedVirtualTime.TimeElapsed}, handle={cpu.TimeHandle.Enabled}/{cpu.TimeHandle.DeferredEnabled}, instructions={cpu.ExecutedInstructions}");
                     sawHalt = cpu.HaltedByDebugger && (nvic.ReadDoubleWord(0xdf0) & 0x20000) != 0;
                     haltedCount = (uint)cpu.GetRegister(0);
                     probe.ScheduleAction(TimeInterval.FromMicroseconds(5), __ =>
                     {
                         nvic.WriteDoubleWord(0xdf0, 0xa05f0001);
-                        TestContext.WriteLine($"RESUME master={emulation.MasterTimeSource.ElapsedVirtualTime}, target={machine.ElapsedVirtualTime}, probe={probe.ElapsedVirtualTime}, handle={cpu.TimeHandle.Enabled}/{cpu.TimeHandle.DeferredEnabled}, instructions={cpu.ExecutedInstructions}");
+                        TestContext.WriteLine($"RESUME master={emulation.MasterTimeSource.ElapsedVirtualTime}, target={machine.ElapsedVirtualTime.TimeElapsed}, probe={probe.ElapsedVirtualTime.TimeElapsed}, handle={cpu.TimeHandle.Enabled}/{cpu.TimeHandle.DeferredEnabled}, instructions={cpu.ExecutedInstructions}");
                         sawResume = !cpu.HaltedByDebugger;
                     }, "resume_target");
                 }, "halt_target");

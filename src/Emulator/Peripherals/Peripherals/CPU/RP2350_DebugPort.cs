@@ -177,7 +177,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         {
             if(offset == 0xfbc) return architecture;
             if(offset == 0xfd0) return (peripheralId >> 24) & 0xf;
-            if(offset >= 0xfe0 && offset <= 0xfec) return (peripheralId >> (int)((offset - 0xfe0) * 2)) & 0xff;
+            if(offset >= 0xfe0 && offset <= 0xfe8) return (peripheralId >> (int)((offset - 0xfe0) * 2)) & 0xff;
             switch(offset)
             {
             case 0xff0: return 0xd;

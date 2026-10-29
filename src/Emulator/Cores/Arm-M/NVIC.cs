@@ -95,7 +95,7 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
                 }
                 var preemptNeeded = activeIRQs.Count != 0;
                 int? result = null;
-                var maskDebugInterrupts = ExternalDebugMaskInterrupts;
+                var maskDebugInterrupts = EnableMemoryMappedDebug && ExternalDebugMaskInterrupts;
 
                 foreach(int i in pendingIRQs)
                 {
