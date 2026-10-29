@@ -6,6 +6,7 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
+using System.Threading;
 
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Exceptions;
@@ -35,6 +36,7 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             interruptInput = new bool[registerCount];
             drivenValue = new bool[registerCount];
             drivenEnable = new bool[registerCount];
+            wireLevel = new bool[registerCount];
             peripheralOutput = new ulong[32];
             peripheralEnable = new ulong[32];
             edgeInterrupts = new uint[interruptGroupCount];
@@ -59,74 +61,136 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
 
         public void OnGPIO(int number, bool value)
         {
-            if(!IsBondedPin(number))
+            if(!IsBondedPin(number)) return;
+            lock(SyncRoot)
             {
-                return;
+                external[number] = value;
+                UpdatePin(number);
+                UpdateInterrupts();
             }
-            external[number] = value;
-            UpdatePin(number);
-            UpdateInterrupts();
+            PublishPending();
         }
 
         public void ReleaseInput(int pin)
         {
-            if(!IsBondedPin(pin))
+            if(!IsBondedPin(pin)) return;
+            lock(SyncRoot)
             {
-                return;
+                external[pin] = null;
+                UpdatePin(pin);
+                UpdateInterrupts();
             }
-            external[pin] = null;
-            UpdatePin(pin);
-            UpdateInterrupts();
+            PublishPending();
         }
 
         public void SetPeripheralOutput(int function, int pin, bool value, bool enabled)
         {
-            if(function < 0 || function >= peripheralOutput.Length || !IsBondedPin(pin))
+            if(function < 0 || function >= peripheralOutput.Length || !IsBondedPin(pin)) return;
+            lock(SyncRoot)
             {
-                return;
+                var mask = 1UL << pin;
+                peripheralOutput[function] = value ? peripheralOutput[function] | mask : peripheralOutput[function] & ~mask;
+                peripheralEnable[function] = enabled ? peripheralEnable[function] | mask : peripheralEnable[function] & ~mask;
+                UpdatePin(pin);
+                UpdateInterrupts();
             }
-            var mask = 1UL << pin;
-            peripheralOutput[function] = value ? peripheralOutput[function] | mask : peripheralOutput[function] & ~mask;
-            peripheralEnable[function] = enabled ? peripheralEnable[function] | mask : peripheralEnable[function] & ~mask;
-            UpdatePin(pin);
-            UpdateInterrupts();
+            PublishPending();
         }
 
         public void SetPadConfiguration(int pin, uint value)
         {
-            if(pin < 0 || pin >= registerCount)
+            if(pin < 0 || pin >= registerCount) return;
+            lock(SyncRoot)
             {
-                return;
+                pads[pin] = value;
+                UpdatePin(pin);
+                UpdateInterrupts();
             }
-            pads[pin] = value;
-            UpdatePin(pin);
-            UpdateInterrupts();
+            PublishPending();
         }
 
         public bool GetInput(int pin)
         {
-            return IsBondedPin(pin) && sampled[pin];
+            lock(SyncRoot)
+            {
+                return IsBondedPin(pin) && sampled[pin];
+            }
         }
 
         public override void Reset()
         {
-            resetting = true;
+            lock(SyncRoot)
+            {
+                resetting = true;
+                try
+                {
+                    for(var pin = 0; pin < control.Length; pin++) control[pin] = 0x1f;
+                    Array.Clear(edgeInterrupts, 0, edgeInterrupts.Length);
+                    Array.Clear(interruptEnable, 0, interruptEnable.Length);
+                    Array.Clear(interruptForce, 0, interruptForce.Length);
+                    UpdatePinsLocked();
+                }
+                finally
+                {
+                    resetting = false;
+                }
+            }
+            PublishPending();
+        }
+
+        // Composite IO/PADS blocks share the state monitor and publish only
+        // after their outer APB access has released it.
+        internal object SynchronizationRoot => SyncRoot;
+
+        internal void PublishPending()
+        {
+            if(Monitor.IsEntered(SyncRoot)) return;
+            lock(SyncRoot)
+            {
+                if(publishing) return;
+                publishing = true;
+            }
             try
             {
-                for(var pin = 0; pin < control.Length; pin++)
+                while(true)
                 {
-                    control[pin] = 0x1f;
+                    Notification notification;
+                    lock(SyncRoot)
+                    {
+                        if(notifications.Count == 0)
+                        {
+                            publishing = false;
+                            return;
+                        }
+                        notification = notifications.Dequeue();
+                    }
+                    switch(notification.Kind)
+                    {
+                    case NotificationKind.Input:
+                        sio?.OnGPIO(notification.Pin, notification.Value);
+                        InputChanged?.Invoke(notification.Pin, notification.Value);
+                        break;
+                    case NotificationKind.Wire:
+                        Connections[notification.Pin].Set(notification.Value);
+                        break;
+                    case NotificationKind.Drive:
+                        DriveChanged?.Invoke(notification.Pin, notification.Value, notification.Enabled);
+                        break;
+                    case NotificationKind.Interrupt:
+                        var irq = notification.Pin == 0 ? Core0IRQ : notification.Pin == 1 ? Core1IRQ : DormantWakeIRQ;
+                        irq.Set(notification.Value);
+                        break;
+                    }
                 }
-                Array.Clear(edgeInterrupts, 0, edgeInterrupts.Length);
-                Array.Clear(interruptEnable, 0, interruptEnable.Length);
-                Array.Clear(interruptForce, 0, interruptForce.Length);
-                UpdatePins();
             }
-            finally
+            catch
             {
-                resetting = false;
+                lock(SyncRoot) publishing = false;
+                throw;
             }
         }
+
+        protected override void OnAccessCompleted() => PublishPending();
 
         public IReadOnlyDictionary<int, IGPIO> Connections { get; }
 
@@ -202,7 +266,7 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
                 if((offset & 4) != 0)
                 {
                     var pin = (int)(offset / 8);
-                    control[pin] = ApplyOperation(control[pin], value, operation, 0x3003f01f);
+                    control[pin] = ApplyOperation(control[pin], value, operation, rp2350 ? 0x3003f01fu : 0x3003331fu);
                     UpdatePin(pin);
                     UpdateInterrupts();
                 }
@@ -276,6 +340,12 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
 
         private void UpdatePins()
         {
+            lock(SyncRoot) UpdatePinsLocked();
+            PublishPending();
+        }
+
+        private void UpdatePinsLocked()
+        {
             for(var pin = 0; pin < numberOfPins; pin++)
             {
                 UpdatePin(pin);
@@ -286,8 +356,8 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
         private void UpdatePin(int pin)
         {
             var function = control[pin] & 0x1f;
-            var value = Override(PeripheralValue(pin, function), (control[pin] >> 12) & 3);
-            var enabled = Override(PeripheralEnabled(pin, function), (control[pin] >> 14) & 3);
+            var value = Override(PeripheralValue(pin, function), (control[pin] >> (rp2350 ? 12 : 8)) & 3);
+            var enabled = Override(PeripheralEnabled(pin, function), (control[pin] >> (rp2350 ? 14 : 12)) & 3);
             enabled &= (pads[pin] & 0x80) == 0 && (!rp2350 || (pads[pin] & 0x100) == 0);
             var driveChanged = value != drivenValue[pin] || enabled != drivenEnable[pin];
             drivenValue[pin] = value;
@@ -297,8 +367,7 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             if(sampled[pin] != input)
             {
                 sampled[pin] = input;
-                sio?.OnGPIO(pin, input);
-                InputChanged?.Invoke(pin, input);
+                notifications.Enqueue(new Notification(NotificationKind.Input, pin, input));
             }
             var irqInput = Override(padInput, (control[pin] >> 28) & 3);
             if(irqInput != interruptInput[pin])
@@ -309,10 +378,15 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
                 }
                 interruptInput[pin] = irqInput;
             }
-            Connections[pin].Set(ReadWireLevel(pin));
+            var wire = ReadWireLevel(pin);
+            if(wire != wireLevel[pin])
+            {
+                wireLevel[pin] = wire;
+                notifications.Enqueue(new Notification(NotificationKind.Wire, pin, wire));
+            }
             if(driveChanged)
             {
-                DriveChanged?.Invoke(pin, value, enabled);
+                notifications.Enqueue(new Notification(NotificationKind.Drive, pin, value, enabled));
             }
         }
 
@@ -349,17 +423,16 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
 
         private void UpdateInterrupts()
         {
-            var state = new bool[3];
-            for(var target = 0; target < state.Length; target++)
+            for(var target = 0; target < interruptState.Length; target++)
             {
-                for(var group = 0; group < interruptGroupCount; group++)
+                var state = false;
+                for(var group = 0; group < interruptGroupCount; group++) state |= MaskedInterrupts(target, group) != 0;
+                if(state != interruptState[target])
                 {
-                    state[target] |= MaskedInterrupts(target, group) != 0;
+                    interruptState[target] = state;
+                    notifications.Enqueue(new Notification(NotificationKind.Interrupt, target, state));
                 }
             }
-            Core0IRQ.Set(state[0]);
-            Core1IRQ.Set(state[1]);
-            DormantWakeIRQ.Set(state[2]);
         }
 
         private bool IsBondedPin(int pin) => pin >= 0 && pin < numberOfPins;
@@ -375,7 +448,34 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             }
         }
 
+        private readonly struct Notification
+        {
+            public Notification(NotificationKind kind, int pin, bool value, bool enabled = false)
+            {
+                Kind = kind;
+                Pin = pin;
+                Value = value;
+                Enabled = enabled;
+            }
+
+            public readonly NotificationKind Kind;
+            public readonly int Pin;
+            public readonly bool Value;
+            public readonly bool Enabled;
+        }
+
+        private enum NotificationKind
+        {
+            Input,
+            Wire,
+            Drive,
+            Interrupt,
+        }
+
         private bool resetting;
+        private bool publishing;
+        private readonly Queue<Notification> notifications = new Queue<Notification>();
+        private readonly bool[] interruptState = new bool[3];
 
         private readonly IRP2GPIO sio;
         private readonly bool rp2350;
@@ -390,6 +490,7 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
         private readonly bool[] interruptInput;
         private readonly bool[] drivenValue;
         private readonly bool[] drivenEnable;
+        private readonly bool[] wireLevel;
         private readonly ulong[] peripheralOutput;
         private readonly ulong[] peripheralEnable;
         private readonly uint[] edgeInterrupts;

@@ -20,14 +20,22 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
 
         public override void Reset()
         {
-            voltageSelect = 0;
-            for(var pin = 0; pin < pads.Length; pin++)
+            lock(SyncRoot)
             {
-                // The RP2040's final two registers are dedicated debug pads.
-                pads[pin] = rp2350 ? 0x116u : pin == 30 ? 0xdau : pin == 31 ? 0x5au : 0x56u;
-                gpio.SetPadConfiguration(pin, pads[pin]);
+                voltageSelect = 0;
+                for(var pin = 0; pin < pads.Length; pin++)
+                {
+                    // The RP2040's final two registers are dedicated debug pads.
+                    pads[pin] = rp2350 ? 0x116u : pin == 30 ? 0xdau : pin == 31 ? 0x5au : 0x56u;
+                    gpio.SetPadConfiguration(pin, pads[pin]);
+                }
             }
+            gpio.PublishPending();
         }
+
+        protected override object SyncRoot => gpio.SynchronizationRoot;
+
+        protected override void OnAccessCompleted() => gpio.PublishPending();
 
         protected override uint ReadRegister(long offset)
         {
