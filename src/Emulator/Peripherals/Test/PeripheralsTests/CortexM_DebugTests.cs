@@ -453,31 +453,62 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.AreEqual(0x20002000u, (uint)cpu.GetRegister(13));
         }
 
-        [Test]
-        public void ShouldRaiseInvalidStateAfterAThumbClearDebugReturnAddressWrite()
+        [TestCase(false, false)]
+        [TestCase(false, true)]
+        [TestCase(true, false)]
+        [TestCase(true, true)]
+        public void ShouldRaiseInvalidStateAfterAThumbClearDebugReturnAddressWrite(bool enableUsageFault, bool warmCodeCache)
         {
+            nvic.IRQ.Connect(cpu, 0);
+            var secureAccess = new CortexM.ContextState { Privileged = true, CpuSecure = true, AttributionSecure = true };
             var ram = new MappedMemory(machine, 0x4000);
             machine.SystemBus.Register(ram, new BusPointRegistration(0x20000000));
             ram.WriteDoubleWord(0, 0x20003000);
             ram.WriteDoubleWord(4, 0x20000101);
-            ram.WriteDoubleWord(0xc, 0x20000301);
+            ram.WriteDoubleWord(0xc, 0x20000301); // HardFault
+            ram.WriteDoubleWord(0x18, 0x20000341); // UsageFault
             ram.WriteWord(0x100, 0xe7fe);
-            ram.WriteWord(0x200, 0x2001); // Must not execute with EPSR.T clear.
+            ram.WriteWord(0x200, 0x2001); // movs r0, #1: forbidden with EPSR.T clear.
+            ram.WriteWord(0x202, 0xbe00);
             ram.WriteWord(0x300, 0xbe00);
+            ram.WriteWord(0x340, 0xbe00);
             cpu.InitVectorTableOffset = 0x20000000;
             nvic.WriteDoubleWord(0xdf0, 0xa05f0003);
             WaitForHalt();
             WriteDebugRegister(13, 0x20002000);
+            if(warmCodeCache)
+            {
+                WriteDebugRegister(16, 0x01000000);
+                WriteDebugRegister(15, 0x20000201);
+                nvic.WriteDoubleWord(0xdf0, 0xa05f0001);
+                WaitForHalt(false);
+                EmulationManager.Instance.CurrentEmulation.RunFor(TimeInterval.FromMicroseconds(100));
+                WaitForHalt();
+                Assert.AreEqual(1, (uint)cpu.GetRegister(0), "The same instruction page must execute before the Thumb-clear attempt");
+                Assert.AreEqual(0x20000202u, (uint)cpu.PC);
+                WriteDebugRegister(0, 0);
+            }
+            machine.SystemBus.WriteDoubleWord(0xe000ed24, enableUsageFault ? 1u << 18 : 0u, cpu, (ulong)secureAccess);
             WriteDebugRegister(16, 0);
             WriteDebugRegister(15, 0x20000201);
             nvic.WriteDoubleWord(0xdf0, 0xa05f0001);
             WaitForHalt(false);
             EmulationManager.Instance.CurrentEmulation.RunFor(TimeInterval.FromMicroseconds(100));
             EmulationManager.Instance.CurrentEmulation.RunFor(TimeInterval.FromMicroseconds(100));
-            var faultStatus = nvic.ReadDoubleWord(0xd28);
-            Assert.AreEqual(0x20000u, faultStatus & 0x20000u,
-                $"PC={cpu.PC}, XPSR={cpu.XProgramStatusRegister}, VTOR={cpu.VectorTableOffset:X}, CFSR={faultStatus:X}, Lockup={nvic.Lockup.IsSet}, Executed={cpu.ExecutedInstructions}, State={cpu.EmulationState}, Clocked={cpu.Clocked}, DHCSR={nvic.ReadDoubleWord(0xdf0):X}");
-            Assert.AreEqual(0, (uint)cpu.GetRegister(0));
+            WaitForHalt();
+            var faultStatus = machine.SystemBus.ReadDoubleWord(0xe000ed28, cpu, (ulong)secureAccess);
+            Assert.AreEqual(0x20000u, faultStatus & 0x20000u);
+            var hardFaultStatus = machine.SystemBus.ReadDoubleWord(0xe000ed2c, cpu, (ulong)secureAccess);
+            Assert.AreEqual(enableUsageFault ? 0u : 0x40000000u, hardFaultStatus & 0x40000000u);
+            Assert.AreEqual(0, cpu.FaultStatusNonSecure & 0x20000u, "The Secure fault must not set the Non-secure syndrome");
+            Assert.AreEqual(enableUsageFault ? 6u : 3u, (uint)cpu.XProgramStatusRegister & 0x1ffu);
+            Assert.AreEqual(enableUsageFault ? 0x20000340u : 0x20000300u, (uint)cpu.PC);
+            Assert.AreEqual(0, (uint)cpu.GetRegister(0), "The instruction with EPSR.T clear must not execute");
+            var stackPointer = (uint)cpu.GetRegister(13);
+            Assert.AreEqual(0x20001fe0u, stackPointer);
+            Assert.AreEqual(0x20000200u, ram.ReadDoubleWord(stackPointer - 0x20000000 + 24));
+            Assert.AreEqual(0, ram.ReadDoubleWord(stackPointer - 0x20000000 + 28) & 0x01000000u,
+                "The frame must preserve the faulting EPSR.T state");
         }
 
         private void WriteDebugRegister(int selector, uint value)
