@@ -52,6 +52,18 @@ namespace Antmicro.Renode.PeripheralsTests
         }
 
         [Test]
+        public void ShouldForceInterruptWithoutEnableMask()
+        {
+            Assert.That(usb.ReadDoubleWord(0x90), Is.Zero);
+            usb.WriteDoubleWord(0x2094, 1u << 16);
+            Assert.That(usb.ReadDoubleWord(0x8c), Is.Zero);
+            Assert.That(usb.ReadDoubleWord(0x98), Is.EqualTo(1u << 16));
+            Assert.That(usb.IRQ.IsSet, Is.True);
+            usb.WriteDoubleWord(0x3094, 1u << 16);
+            Assert.That(usb.IRQ.IsSet, Is.False);
+        }
+
+        [Test]
         public void ShouldWaitForFirmwareToMakeAnInputBufferAvailable()
         {
             var input = connection.ConnectEndpointRead(0);
@@ -76,6 +88,34 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.That(dpram.ReadBytes(0x100, 2), Is.EqualTo(new byte[] { 0xa5, 0x5a }));
             Assert.That(dpram.ReadWord(0x84), Is.EqualTo(0x8002));
             Assert.That(usb.ReadDoubleWord(0x58), Is.EqualTo(2));
+        }
+
+        [Test]
+        public void ShouldNotOverwriteFullOutputBuffer()
+        {
+            dpram.WriteBytes(0x100, new byte[] { 0x42 });
+            dpram.WriteDoubleWord(0x84, 0x8440);
+            connection.ConnectEndpointWrite(0).Write(new byte[] { 0xa5 });
+            Assert.That(dpram.ReadByte(0x100), Is.EqualTo(0x42));
+            Assert.That(usb.ReadDoubleWord(0x58), Is.Zero);
+            dpram.WriteWord(0x84, 0x0440);
+            Assert.That(dpram.ReadByte(0x100), Is.EqualTo(0xa5));
+            Assert.That(usb.ReadDoubleWord(0x58), Is.EqualTo(2));
+        }
+
+        [Test]
+        public void ShouldRequireStallArmForEndpointZero()
+        {
+            var input = connection.ConnectEndpointRead(0);
+            dpram.WriteByte(0x100, 0x42);
+            dpram.WriteDoubleWord(0x80, 0x8c01);
+            Assert.That(input.TryRead(out _), Is.True);
+            dpram.WriteDoubleWord(0x80, 0x8c01);
+            usb.WriteDoubleWord(0x68, 1);
+            Assert.That(input.TryRead(out _), Is.False);
+            usb.WriteDoubleWord(0x3068, 1);
+            Assert.That(input.TryRead(out var bytes), Is.True);
+            Assert.That(bytes, Is.EqualTo(new byte[] { 0x42 }));
         }
 
         [Test]

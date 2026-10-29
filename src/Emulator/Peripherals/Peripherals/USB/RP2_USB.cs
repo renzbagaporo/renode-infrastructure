@@ -213,7 +213,9 @@ namespace Antmicro.Renode.Peripherals.USB
             var half = (ushort)(controlWord >> (index * 16));
             var enabled = endpoint == 0 || (endpointControl & (1u << 31)) != 0;
             var aborted = (registers[(int)Registers.Abort / 4] & (1u << control)) != 0;
-            var stalled = (controlWord & BufferStall) != 0;
+            var stallArmed = endpoint != 0
+                || (registers[(int)Registers.StallArm / 4] & (input ? 1u : 2u)) != 0;
+            var stalled = (controlWord & BufferStall) != 0 && stallArmed;
             var address = endpoint == 0 ? 0x100 : (int)(endpointControl & 0xffff);
             if(index != 0)
             {
@@ -221,7 +223,8 @@ namespace Antmicro.Renode.Peripherals.USB
                 address += isochronous ? 128 << (int)((controlWord >> 27) & 3) : 64;
             }
             buffer = new Buffer(control, index, offset, address, half, doubleBuffered);
-            return IsConnected && enabled && !aborted && !stalled && (half & BufferAvailable) != 0;
+            return IsConnected && enabled && !aborted && !stalled && (half & BufferAvailable) != 0
+                && (input || (half & BufferFull) == 0);
         }
 
         private void CompleteBuffer(Buffer buffer, bool input, int length)
@@ -298,8 +301,8 @@ namespace Antmicro.Renode.Peripherals.USB
             | ((sieStatus & SetupReceivedStatus) != 0 ? 1u << 16 : 0)
             | (startOfFramePending ? 1u << 17 : 0);
 
-        private uint EnabledInterrupts => (RawInterrupts | registers[(int)Registers.InterruptForce / 4])
-            & registers[(int)Registers.InterruptEnable / 4] & 0xfffff;
+        private uint EnabledInterrupts => ((RawInterrupts & registers[(int)Registers.InterruptEnable / 4])
+            | registers[(int)Registers.InterruptForce / 4]) & 0xfffff;
 
         private bool IsConnected => connectionCount != 0
             && (registers[(int)Registers.MainControl / 4] & 3) == 1
@@ -499,6 +502,7 @@ namespace Antmicro.Renode.Peripherals.USB
             BufferCPU = 0x5c,
             Abort = 0x60,
             AbortDone = 0x64,
+            StallArm = 0x68,
             InterruptRaw = 0x8c,
             InterruptEnable = 0x90,
             InterruptForce = 0x94,
