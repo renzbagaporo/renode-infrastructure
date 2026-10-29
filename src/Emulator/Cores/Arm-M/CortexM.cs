@@ -100,6 +100,11 @@ namespace Antmicro.Renode.Peripherals.CPU
 
                 InnerReset();
 
+                if(Model == "cortex-m33-rp2350")
+                {
+                    nvic?.OnGPIO(-14, false);
+                }
+
                 if(nvic != null && nvic.EnableMemoryMappedDebug)
                 {
                     var catchReset = nvic.HandleExternalDebugReset();
