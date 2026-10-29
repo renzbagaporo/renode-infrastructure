@@ -12,6 +12,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.IO;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
@@ -59,17 +60,21 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
             server = new SocketServerProvider(false, flushOnConnect: true, serverName: "USBIP");
             server.DataReceived += HandleIncomingData;
             server.ConnectionClosed += Reset;
+            server.ConnectionAccepted += stream =>
+            {
+                lock(transferLock) clientStream = stream;
+            };
 
             // setting initial size is just an optimization
             buffer = new List<byte>(Packet.CalculateLength<URBRequest>());
-            cancellationToken = new CancellationTokenSource();
         }
 
         public override void Dispose()
         {
             Shutdown();
-            foreach(var (_, conn) in deviceToConnection)
+            foreach(var (device, conn) in deviceToConnection)
             {
+                DetachConnectionEvents(device);
                 conn.Dispose();
             }
             base.Dispose();
@@ -83,25 +88,30 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
         public void Reset()
         {
             PendingTransfer[] transfers;
-            CancellationTokenSource previousToken;
             lock(transferLock)
             {
-                generation++;
-                transfers = pendingTransfers.Values.ToArray();
-                pendingTransfers.Clear();
-                endpointTasks.Clear();
-                previousToken = cancellationToken;
-                cancellationToken = new CancellationTokenSource();
+                transfers = InvalidateTransfers();
+                importedConnection = null;
+                descriptorConnections.Clear();
+                clientStream = null;
+                disconnecting = false;
             }
-            previousToken.Cancel();
-            foreach(var transfer in transfers)
-            {
-                transfer.Cancel();
-            }
+            foreach(var transfer in transfers) transfer.Cancel();
             state = State.WaitForCommand;
             urbHeader = default(URBHeader);
             additionalDataCount = 0;
             buffer.Clear();
+        }
+
+        private PendingTransfer[] InvalidateTransfers()
+        {
+            generation++;
+            var transfers = pendingTransfers.Values.Concat(metadataTransfer == null
+                ? Enumerable.Empty<PendingTransfer>() : new[] { metadataTransfer }).ToArray();
+            pendingTransfers.Clear();
+            endpointTasks.Clear();
+            metadataTransfer = null;
+            return transfers;
         }
 
         public override void Register(IUSBDevice device, NumberRegistrationPoint<int> registrationPoint)
@@ -114,10 +124,27 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
             base.Register(device, registrationPoint);
             deviceToConnection[device] = device.ConnectUSB();
             deviceSpeeds[device] = speed;
+            var registration = new DeviceConnectionState { Source = device as IUSBDeviceConnectionState };
+            registration.Connected = registration.Source == null;
+            registration.Handler = value => PhysicalConnectionChanged(device, registration, value);
+            lock(transferLock) deviceStates.Add(device, registration);
+            if(registration.Source != null)
+            {
+                registration.Source.ConnectionStateChanged += registration.Handler;
+                int version;
+                lock(transferLock) version = registration.Version;
+                var connected = registration.Source.IsConnected;
+                lock(transferLock)
+                {
+                    if(registration.Version == version) registration.Connected = connected;
+                }
+            }
         }
 
         public override void Unregister(IUSBDevice device)
         {
+            if(deviceStates.TryGetValue(device, out var registration)) PhysicalConnectionChanged(device, registration, false);
+            DetachConnectionEvents(device);
             if(deviceToConnection.Remove(device, out var conn))
             {
                 PendingTransfer[] transfers;
@@ -141,6 +168,97 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
             base.Unregister(device);
         }
 
+        private void DetachConnectionEvents(IUSBDevice device)
+        {
+            DeviceConnectionState registration;
+            lock(transferLock) deviceStates.Remove(device, out registration);
+            if(registration?.Source != null) registration.Source.ConnectionStateChanged -= registration.Handler;
+        }
+
+        private void PhysicalConnectionChanged(IUSBDevice device, DeviceConnectionState registration, bool connected)
+        {
+            Stream stream = null;
+            PendingTransfer[] transfers = Array.Empty<PendingTransfer>();
+            lock(transferLock)
+            {
+                if(!deviceStates.TryGetValue(device, out var current) || current != registration) return;
+                registration.Connected = connected;
+                registration.Version++;
+                if(connected) return;
+                var connection = deviceToConnection[device];
+                deviceMetadata.Remove(connection);
+                endpointZeroPacketSizes.Remove(connection);
+                if((importedConnection == connection || descriptorConnections.Contains(connection))
+                    && (clientStream != null || metadataTransfer != null || pendingTransfers.Count != 0))
+                {
+                    disconnecting = true;
+                    stream = clientStream;
+                    transfers = InvalidateTransfers();
+                }
+            }
+            if(transfers.Length == 0 && stream == null) return;
+            // Firmware callbacks only fence the old session. Cancellation can
+            // acquire pipe monitors, and socket teardown belongs on a host worker.
+            ThreadPool.UnsafeQueueUserWorkItem(_ =>
+            {
+                try
+                {
+                    foreach(var transfer in transfers) transfer.Cancel();
+                }
+                finally
+                {
+                    server.DisconnectClient(stream);
+                }
+            }, null);
+        }
+
+        private void DisconnectClient(Stream expectedStream = null, int? expectedGeneration = null)
+        {
+            Stream stream;
+            PendingTransfer[] transfers;
+            lock(transferLock)
+            {
+                if(expectedGeneration.HasValue && (expectedGeneration.Value != generation || expectedStream != clientStream)) return;
+                disconnecting = true;
+                stream = clientStream;
+                transfers = InvalidateTransfers();
+            }
+            foreach(var transfer in transfers) transfer.Cancel();
+            server.DisconnectClient(stream);
+        }
+
+        private void DispatchMetadata(Func<int, (bool Imported, IEnumerable<byte> Response)> command)
+        {
+            Stream stream;
+            int epoch;
+            lock(transferLock)
+            {
+                stream = clientStream;
+                epoch = generation;
+                state = State.WaitForResponse;
+            }
+            Task.Run(() =>
+            {
+                try
+                {
+                    var (imported, response) = command(epoch);
+                    var bytes = response.ToArray();
+                    lock(transferLock)
+                    {
+                        if(epoch != generation || stream != clientStream || disconnecting) return;
+                        state = imported ? State.WaitForURBHeader : State.WaitForCommand;
+                        SendResponse(bytes);
+                    }
+                }
+                catch(OperationCanceledException) { DisconnectClient(stream, epoch); }
+                catch(Exception e)
+                {
+                    this.Log(LogLevel.Warning, "USB/IP discovery failed: {0}", e.Message);
+                    DisconnectClient(stream, epoch);
+                }
+            });
+        }
+
         private void SendResponse(IEnumerable<byte> bytes)
         {
             server.Send(bytes);
@@ -155,11 +273,27 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
             this.Log(LogLevel.Info, "Shutting down the server...");
 
             Reset();
-            cancellationToken.Cancel();
             server.Stop();
         }
 
         private void HandleIncomingData(int b)
+        {
+            if(disconnecting) return;
+            try
+            {
+                HandleIncomingByte(b);
+            }
+            catch(OperationCanceledException)
+            {
+                DisconnectClient();
+            }
+            catch(USBStallException)
+            {
+                DisconnectClient();
+            }
+        }
+
+        private void HandleIncomingByte(int b)
         {
 #if DEBUG_PACKETS
             this.Log(LogLevel.Noisy, "Incoming byte: 0x{0:X}; state = {1}; buffer size = {2}", b, state, buffer.Count);
@@ -189,9 +323,7 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
                     {
                     case USBIP.Command.ListDevices:
                     {
-                        SendResponse(HandleListDevicesCommand());
-
-                        state = State.WaitForCommand;
+                        DispatchMetadata(epoch => (false, HandleListDevicesCommand(epoch)));
                         break;
                     }
 
@@ -220,15 +352,14 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
                     var busId = System.Text.Encoding.ASCII.GetString(buffer.ToArray());
                     buffer.Clear();
 
-                    var (success, response) = HandleDeviceAttachCommand(busId);
-                    state = success
-                        ? State.WaitForURBHeader
-                        : State.WaitForCommand;
-
-                    SendResponse(response);
+                    DispatchMetadata(epoch => HandleDeviceAttachCommand(busId, epoch));
                 }
                 break;
             }
+
+            case State.WaitForResponse:
+                DisconnectClient();
+                break;
 
             case State.WaitForURBHeader:
             {
@@ -315,7 +446,8 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
 
         private void DispatchRequest(URBHeader header, URBRequest request, SetupPacket setup, byte[] payload)
         {
-            if(header.BusId != ExportedBusId || !TryGetByAddress((int)header.DeviceId, out var device))
+            if(header.BusId != ExportedBusId || !TryGetByAddress((int)header.DeviceId, out var device)
+                || !deviceStates.TryGetValue(device, out var physical) || !physical.Connected)
             {
                 SendResponse(GenerateURBReply(header, request, status: NoDevice));
                 return;
@@ -368,8 +500,7 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
                     else
                     {
                         var length = Math.Min(transfer.Setup.Count, transfer.Request.TransferBufferLength);
-                        endpointZeroPacketSizes.TryGetValue(transfer.Connection, out var packetSize);
-                        if(packetSize == 0) packetSize = 64;
+                        var packetSize = GetEndpointZeroPacketSize(transfer.Connection);
                         var (response, status) = ReadData(transfer, ep, (int)length, packetSize);
                         WritePacket(transfer, ep, Array.Empty<byte>());
                         CompleteTransfer(transfer, response, status);
@@ -606,75 +737,111 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
             return result;
         }
 
-        private IEnumerable<byte> GenerateDeviceDescriptor(IUSBDevice device, uint deviceNumber, bool includeInterfaces)
+        private byte GetEndpointZeroPacketSize(IUSBConnection connection)
         {
-            var conn = deviceToConnection[device];
-            var ep0 = conn.ConnectEndpointSetup(0);
-            var deviceDescriptor = ep0.ReadDeviceDescriptorBlocking(cancellationToken.Token);
-            endpointZeroPacketSizes[conn] = deviceDescriptor.MaximumPacketSize;
-            var interfaceDescriptors = new List<USB.InterfaceDescriptor>();
-
-            var metadata = new DeviceMetadata();
-            for(var i = 0; i < deviceDescriptor.NumberOfConfigurations; i++)
-            {
-                var (configuration, descs) = ep0.ReadConfigurationDescriptorBlocking((byte)i, cancellationToken.Token);
-                foreach(var (iface, children) in USB.IDescriptor.EnumerateInterfaceDescriptors(descs))
-                {
-                    if(i == 0 && iface.AlternateSetting == 0) interfaceDescriptors.Add(iface);
-                    foreach(var endpoint in children.OfType<USB.EndpointDescriptor>())
-                    {
-                        metadata.Endpoints.Add((configuration.ConfigurationValue, iface.Number, iface.AlternateSetting, endpoint));
-                    }
-                }
-            }
             lock(transferLock)
             {
-                if(deviceMetadata.TryGetValue(conn, out var previous))
+                return endpointZeroPacketSizes.TryGetValue(connection, out var value) && value != 0 ? value : (byte)64;
+            }
+        }
+
+        private byte[] ReadDescriptor(PendingTransfer transfer, IUSBPipeSetup ep0, SetupPacket setup)
+        {
+            transfer.Invoke(() => ep0.SetupPacketWrite(setup));
+            var packetSize = GetEndpointZeroPacketSize(transfer.Connection);
+            var bytes = new List<byte>();
+            while(bytes.Count < setup.Count)
+            {
+                var packet = ReadPacket(transfer, ep0);
+                if(packet.Length > setup.Count - bytes.Count) throw new InvalidOperationException("USB descriptor exceeds requested length");
+                bytes.AddRange(packet);
+                if(packet.Length == 0 || packet.Length % packetSize != 0) break;
+            }
+            WritePacket(transfer, ep0, Array.Empty<byte>());
+            return bytes.ToArray();
+        }
+
+        private IEnumerable<byte> GenerateDeviceDescriptor(IUSBDevice device, uint deviceNumber, bool includeInterfaces, int? expectedGeneration = null)
+        {
+            var conn = deviceToConnection[device];
+            PendingTransfer transfer;
+            int version;
+            lock(transferLock)
+            {
+                if(disconnecting || (expectedGeneration.HasValue && expectedGeneration.Value != generation)
+                    || !deviceStates.TryGetValue(device, out var physical) || !physical.Connected) throw new OperationCanceledException();
+                version = physical.Version;
+                transfer = new PendingTransfer(default(URBHeader), default(URBRequest), default(SetupPacket), Array.Empty<byte>(), conn, generation);
+                metadataTransfer = transfer;
+                descriptorConnections.Add(conn);
+            }
+            try
+            {
+                var ep0 = transfer.Invoke(() => conn.ConnectEndpointSetup(0));
+                var setup = new SetupPacket { Direction = Direction.DeviceToHost, Request = (byte)StandardRequest.GetDescriptor,
+                    Value = (ushort)((int)DescriptorType.Device << 8), Count = 8 };
+                var prefix = ReadDescriptor(transfer, ep0, setup);
+                if(prefix.Length != 8 || prefix[7] == 0) throw new InvalidOperationException("Incomplete USB device descriptor prefix");
+                lock(transferLock)
                 {
-                    metadata.Configuration = previous.Configuration;
-                    foreach(var setting in previous.AlternateSettings) metadata.AlternateSettings.Add(setting.Key, setting.Value);
+                    if(generation != transfer.Generation) throw new OperationCanceledException();
+                    endpointZeroPacketSizes[conn] = prefix[7];
                 }
-                deviceMetadata[conn] = metadata;
-            }
-
-            var devDescriptor = new USBIP.DeviceDescriptor
-            {
-                Path = new byte[256],
-                BusId = new byte[32],
-
-                BusNumber = ExportedBusId,
-                DeviceNumber = deviceNumber,
-                Speed = (uint)deviceSpeeds[device],
-
-                IdVendor = deviceDescriptor.VendorId,
-                IdProduct = deviceDescriptor.ProductId,
-
-                DeviceClass = deviceDescriptor.Class,
-                DeviceSubClass = deviceDescriptor.Subclass,
-                DeviceProtocol = deviceDescriptor.Protocol,
-
-                NumberOfConfigurations = deviceDescriptor.NumberOfConfigurations,
-                NumberOfInterfaces = (byte)interfaceDescriptors.Count
-            };
-
-            SetText(devDescriptor.BusId, "{0}-{1}", ExportedBusId, deviceNumber);
-            SetText(devDescriptor.Path, "/renode/virtual/{0}-{1}", ExportedBusId, deviceNumber);
-
-            var result = Packet.Encode(devDescriptor).AsEnumerable();
-
-            foreach(var iface in interfaceDescriptors.Where(_ => includeInterfaces))
-            {
-                var intDescriptor = new USBIP.InterfaceDescriptor
+                setup.Count = (ushort)Packet.CalculateLength<USB.DeviceDescriptor>();
+                var deviceDescriptor = Packet.Decode<USB.DeviceDescriptor>(ReadDescriptor(transfer, ep0, setup));
+                var interfaces = new List<USB.InterfaceDescriptor>();
+                var metadata = new DeviceMetadata();
+                for(var i = 0; i < deviceDescriptor.NumberOfConfigurations; i++)
                 {
-                    InterfaceClass = iface.Class,
-                    InterfaceSubClass = iface.Subclass,
-                    InterfaceProtocol = iface.Protocol
+                    setup.Value = (ushort)(((int)DescriptorType.Configuration << 8) | i);
+                    setup.Count = (ushort)Packet.CalculateLength<USB.ConfigurationDescriptor>();
+                    var configuration = Packet.Decode<USB.ConfigurationDescriptor>(ReadDescriptor(transfer, ep0, setup));
+                    setup.Count = configuration.TotalLength;
+                    var descs = USB.IDescriptor.EnumerateDescriptors(ReadDescriptor(transfer, ep0, setup));
+                    foreach(var (iface, children) in USB.IDescriptor.EnumerateInterfaceDescriptors(descs))
+                    {
+                        if(i == 0 && iface.AlternateSetting == 0) interfaces.Add(iface);
+                        foreach(var endpoint in children.OfType<USB.EndpointDescriptor>())
+                            metadata.Endpoints.Add((configuration.ConfigurationValue, iface.Number, iface.AlternateSetting, endpoint));
+                    }
+                }
+                lock(transferLock)
+                {
+                    if(generation != transfer.Generation || !deviceStates.TryGetValue(device, out var physical)
+                        || physical.Version != version || !physical.Connected) throw new OperationCanceledException();
+                    if(deviceMetadata.TryGetValue(conn, out var previous))
+                    {
+                        metadata.Configuration = previous.Configuration;
+                        foreach(var setting in previous.AlternateSettings) metadata.AlternateSettings.Add(setting.Key, setting.Value);
+                    }
+                    deviceMetadata[conn] = metadata;
+                }
+                var descriptor = new USBIP.DeviceDescriptor
+                {
+                    Path = new byte[256], BusId = new byte[32], BusNumber = ExportedBusId, DeviceNumber = deviceNumber,
+                    Speed = (uint)deviceSpeeds[device], IdVendor = deviceDescriptor.VendorId, IdProduct = deviceDescriptor.ProductId,
+                    DeviceClass = deviceDescriptor.Class, DeviceSubClass = deviceDescriptor.Subclass, DeviceProtocol = deviceDescriptor.Protocol,
+                    NumberOfConfigurations = deviceDescriptor.NumberOfConfigurations, NumberOfInterfaces = (byte)interfaces.Count
                 };
-
-                result = result.Concat(Packet.Encode(intDescriptor));
+                SetText(descriptor.BusId, "{0}-{1}", ExportedBusId, deviceNumber);
+                SetText(descriptor.Path, "/renode/virtual/{0}-{1}", ExportedBusId, deviceNumber);
+                var result = Packet.Encode(descriptor).AsEnumerable();
+                if(includeInterfaces)
+                {
+                    foreach(var iface in interfaces)
+                        result = result.Concat(Packet.Encode(new USBIP.InterfaceDescriptor { InterfaceClass = iface.Class,
+                            InterfaceSubClass = iface.Subclass, InterfaceProtocol = iface.Protocol }));
+                }
+                return result.ToArray();
             }
-
-            return result;
+            finally
+            {
+                lock(transferLock)
+                {
+                    if(metadataTransfer == transfer) metadataTransfer = null;
+                }
+                transfer.Dispose();
+            }
         }
 
         private void SetText(byte[] destination, string format, params object[] param)
@@ -683,7 +850,7 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
             Array.Copy(textBuffer, destination, textBuffer.Length);
         }
 
-        private IEnumerable<byte> HandleListDevicesCommand()
+        private IEnumerable<byte> HandleListDevicesCommand(int? expectedGeneration = null)
         {
             var header = new USBIP.Header
             {
@@ -693,22 +860,35 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
 
             var regCount = new USBIP.DeviceListCount
             {
-                NumberOfExportedDevices = (uint)ChildCollection.Count
+                NumberOfExportedDevices = 0
             };
 
+            KeyValuePair<int, IUSBDevice>[] visible;
+            lock(transferLock)
+            {
+                if(expectedGeneration.HasValue && expectedGeneration.Value != generation) throw new OperationCanceledException();
+                visible = ChildCollection.Where(c => deviceStates.TryGetValue(c.Value, out var physical) && physical.Connected).ToArray();
+                foreach(var child in visible) descriptorConnections.Add(deviceToConnection[child.Value]);
+            }
+            regCount.NumberOfExportedDevices = (uint)visible.Length;
             var result = Packet.Encode(header).Concat(Packet.Encode(regCount));
 
-            foreach(var child in ChildCollection)
+            foreach(var child in visible)
             {
-                result = result.Concat(GenerateDeviceDescriptor(child.Value, (uint)child.Key, true));
+                result = result.Concat(GenerateDeviceDescriptor(child.Value, (uint)child.Key, true, expectedGeneration));
             }
 
             return result;
         }
 
-        private (bool, IEnumerable<byte>) HandleDeviceAttachCommand(string deviceIdString)
+        private (bool, IEnumerable<byte>) HandleDeviceAttachCommand(string deviceIdString, int? expectedGeneration = null)
         {
             var success = true;
+            lock(transferLock)
+            {
+                if(expectedGeneration.HasValue && expectedGeneration.Value != generation) throw new OperationCanceledException();
+                descriptorConnections.Clear();
+            }
             var deviceId = 0;
             IUSBDevice device = null;
 
@@ -728,7 +908,8 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
                     this.Log(LogLevel.Warning, "Trying to attach to a non-existing bus 0x{0:X}", busId);
                     success = false;
                 }
-                else if(!TryGetByAddress(deviceId, out device))
+                else if(!TryGetByAddress(deviceId, out device)
+                    || !deviceStates.TryGetValue(device, out var physical) || !physical.Connected)
                 {
                     this.Log(LogLevel.Warning, "Trying to attach to a non-existing device 0x{0:X}", deviceId);
                     success = false;
@@ -746,10 +927,25 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
             if(success)
             {
                 var conn = deviceToConnection[device];
-                response = response.Concat(GenerateDeviceDescriptor(device, (uint)deviceId, false));
+                response = response.Concat(GenerateDeviceDescriptor(device, (uint)deviceId, false, expectedGeneration));
+                lock(transferLock)
+                {
+                    if(disconnecting || !deviceStates[device].Connected
+                    || (expectedGeneration.HasValue && expectedGeneration.Value != generation)) throw new OperationCanceledException();
+                    importedConnection = conn;
+                    descriptorConnections.Clear();
+                }
             }
 
             return (success, response);
+        }
+
+        private sealed class DeviceConnectionState
+        {
+            public IUSBDeviceConnectionState Source;
+            public Action<bool> Handler;
+            public bool Connected;
+            public int Version;
         }
 
         private sealed class DeviceMetadata
@@ -829,10 +1025,15 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
         private const int InputOutputError = -5;
         private const int Overflow = -75;
 
-        private State state;
+        private volatile State state;
         private URBHeader urbHeader;
         private int additionalDataCount;
-        private CancellationTokenSource cancellationToken;
+        private readonly Dictionary<IUSBDevice, DeviceConnectionState> deviceStates = new Dictionary<IUSBDevice, DeviceConnectionState>();
+        private readonly HashSet<IUSBConnection> descriptorConnections = new HashSet<IUSBConnection>();
+        private PendingTransfer metadataTransfer;
+        private IUSBConnection importedConnection;
+        private Stream clientStream;
+        private volatile bool disconnecting;
 
         private readonly int port;
         private readonly List<byte> buffer;
@@ -856,6 +1057,7 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
         private enum State
         {
             WaitForCommand,
+            WaitForResponse,
             WaitForBusId,
             WaitForURBHeader,
             HandleUnlinkCommand,

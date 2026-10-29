@@ -299,6 +299,15 @@ public interface IUSBConnection : IDisposable
     IUSBPipeWrite? ConnectEndpointWrite(byte endpoint);
 }
 
+// Optional physical link state. Notifications are ordered and published without
+// the peripheral's state monitor; stopping its clocks is not a cable unplug.
+public interface IUSBDeviceConnectionState
+{
+    bool IsConnected { get; }
+
+    event Action<bool> ConnectionStateChanged;
+}
+
 public interface IUSBDevice : IPeripheral
 {
     IUSBConnection ConnectUSB();

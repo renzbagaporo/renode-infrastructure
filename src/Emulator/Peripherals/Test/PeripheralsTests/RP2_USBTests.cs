@@ -662,6 +662,64 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.That(dpram.ReadWord(0x84), Is.EqualTo(0x440));
         }
 
+        [Test]
+        public void ShouldPublishPhysicalPullupEdgesOutsideTheDpramMonitor()
+        {
+            var changed = typeof(RP2_USB).GetEvent("ConnectionStateChanged");
+            Assert.That(changed, Is.Not.Null, "Host connections need physical link notifications");
+            var edges = new List<bool>();
+            changed.AddEventHandler(usb, new Action<bool>(connected =>
+            {
+                Assert.That(Monitor.IsEntered(dpram), Is.False);
+                edges.Add(connected);
+            }));
+            usb.WriteDoubleWord(0x304c, 1u << 16);
+            usb.WriteDoubleWord(0x204c, 1u << 16);
+            Assert.That(edges, Is.EqualTo(new[] { false, true }));
+        }
+
+        [Test]
+        public void ShouldNotTreatStoppedClocksAsAUsbCableDisconnect()
+        {
+            var changed = typeof(RP2_USB).GetEvent("ConnectionStateChanged");
+            Assert.That(changed, Is.Not.Null);
+            var edges = new List<bool>();
+            changed.AddEventHandler(usb, new Action<bool>(connected => edges.Add(connected)));
+            clocks.Set(0, 0);
+            clocks.Set(125000000, 48000000);
+            Assert.That(edges, Is.Empty);
+        }
+
+        [Test]
+        public void ShouldAdvertiseElectricalReadinessWithoutAHostLease()
+        {
+            connection.Dispose();
+            Assert.That(usb.IsConnected, Is.True);
+            usb.WriteDoubleWord(0x304c, 1u << 16);
+            Assert.That(usb.IsConnected, Is.False);
+            usb.WriteDoubleWord(0x204c, 1u << 16);
+            Assert.That(usb.IsConnected, Is.True);
+        }
+
+        [Test]
+        public void ShouldPreserveReentrantPhysicalEdgesInOrder()
+        {
+            var edges = new List<bool>();
+            var depth = 0;
+            var maximumDepth = 0;
+            usb.ConnectionStateChanged += connected =>
+            {
+                depth++;
+                maximumDepth = Math.Max(maximumDepth, depth);
+                edges.Add(connected);
+                if(!connected) usb.WriteDoubleWord(0x204c, 1u << 16);
+                depth--;
+            };
+            usb.WriteDoubleWord(0x304c, 1u << 16);
+            Assert.That(edges, Is.EqualTo(new[] { false, true }));
+            Assert.That(maximumDepth, Is.EqualTo(1));
+        }
+
         private void AdvanceMicroseconds(ulong duration) => ((BaseClockSource)machine.ClockSource).Advance(TimeInterval.FromMicroseconds(duration));
 
         private sealed class ControlledClockSource : IRP2ClockSource

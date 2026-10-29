@@ -22,7 +22,7 @@ namespace Antmicro.Renode.Peripherals.USB
 {
     // Full-speed device controller. USB host requests exchange packets with
     // the buffers owned by the SIE; firmware services the corresponding IRQs.
-    public sealed class RP2_USB : RP2APBPeripheral, IUSBDevice
+    public sealed class RP2_USB : RP2APBPeripheral, IUSBDevice, IUSBDeviceConnectionState
     {
         public RP2_USB(IMachine machine, RP2_USB_DPRAM dpram, IRP2ClockSource clockSource) : base(machine)
         {
@@ -92,6 +92,16 @@ namespace Antmicro.Renode.Peripherals.USB
         }
 
         public byte Address => (byte)(registers[(int)Registers.Address / 4] & 0x7f);
+
+        public bool IsConnected
+        {
+            get
+            {
+                lock(dpram) return !ResetHeld && AttachmentReady;
+            }
+        }
+
+        public event Action<bool> ConnectionStateChanged;
 
         public GPIO IRQ { get; }
 
@@ -203,6 +213,12 @@ namespace Antmicro.Renode.Peripherals.USB
 
         private void UpdateConnection()
         {
+            var physicalState = !ResetHeld && AttachmentReady;
+            if(physicalState != lastPhysicalState)
+            {
+                lastPhysicalState = physicalState;
+                pendingConnectionNotifications.Enqueue(physicalState);
+            }
             if(!PhysicalConnection)
             {
                 connectionObserved = false;
@@ -373,24 +389,32 @@ namespace Antmicro.Renode.Peripherals.USB
             {
                 while(true)
                 {
-                    int endpoint;
-                    bool ready;
-                    bool statusChanged;
+                    int endpoint = 0;
+                    bool ready = false;
+                    bool statusChanged = false;
+                    bool? connectionChange = null;
                     lock(dpram)
                     {
-                        if((pendingInputNotifications | pendingStatusNotifications) == 0)
+                        if(pendingConnectionNotifications.Count != 0)
+                        {
+                            connectionChange = pendingConnectionNotifications.Dequeue();
+                        }
+                        else if((pendingInputNotifications | pendingStatusNotifications) == 0)
                         {
                             publishingInputNotifications = false;
                             return;
                         }
-                        endpoint = 0;
-                        while(((pendingInputNotifications | pendingStatusNotifications) & (1u << endpoint)) == 0) endpoint++;
-                        statusChanged = (pendingStatusNotifications & (1u << endpoint)) != 0;
-                        ready = (pendingInputNotifications & (1u << endpoint)) != 0
-                            && TryGetBuffer(endpoint, true, out var buffer) && (buffer.Control & BufferFull) != 0;
-                        pendingInputNotifications &= ~(1u << endpoint);
-                        pendingStatusNotifications &= ~(1u << endpoint);
+                        if(!connectionChange.HasValue)
+                        {
+                            while(((pendingInputNotifications | pendingStatusNotifications) & (1u << endpoint)) == 0) endpoint++;
+                            statusChanged = (pendingStatusNotifications & (1u << endpoint)) != 0;
+                            ready = (pendingInputNotifications & (1u << endpoint)) != 0
+                                && TryGetBuffer(endpoint, true, out var buffer) && (buffer.Control & BufferFull) != 0;
+                            pendingInputNotifications &= ~(1u << endpoint);
+                            pendingStatusNotifications &= ~(1u << endpoint);
+                        }
                     }
+                    if(connectionChange.HasValue) ConnectionStateChanged?.Invoke(connectionChange.Value);
                     if(statusChanged) endpoints[endpoint].PublishStatusChanged();
                     if(ready) endpoints[endpoint].PublishAvailable();
                 }
@@ -436,8 +460,9 @@ namespace Antmicro.Renode.Peripherals.USB
 
         private bool ClocksAvailable => clockSource.USBFrequency == 48000000 && clockSource.SystemFrequency != 0;
 
-        private bool PhysicalConnection => connectionCount != 0
-            && (registers[(int)Registers.MainControl / 4] & 3) == 1
+        private bool PhysicalConnection => connectionCount != 0 && AttachmentReady;
+
+        private bool AttachmentReady => (registers[(int)Registers.MainControl / 4] & 3) == 1
             && (registers[(int)Registers.SIEControl / 4] & (1u << 16)) != 0;
 
         private readonly IRP2ClockSource clockSource;
@@ -454,6 +479,8 @@ namespace Antmicro.Renode.Peripherals.USB
         private bool startOfFramePending;
         private bool connectionObserved;
         private bool timingWarningEmitted;
+        private bool lastPhysicalState;
+        private readonly Queue<bool> pendingConnectionNotifications = new Queue<bool>();
         private uint pendingInputNotifications;
         private uint pendingStatusNotifications;
         private bool publishingInputNotifications;

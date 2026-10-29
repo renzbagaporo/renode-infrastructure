@@ -61,18 +61,42 @@ namespace Antmicro.Renode.Utilities
                 Logger.LogAs(this, LogLevel.Debug, "Shutting down socket");
                 socket?.Shutdown(SocketShutdown.Both);
             }
+            catch(SocketException) { }
+            catch(ObjectDisposedException) { }
             finally
             {
                 socket?.Close();
             }
             stopRequested = true;
             cancellationToken?.Cancel();
+            enqueuedEvent.Set();
 
             var currentThreadId = Thread.CurrentThread.ManagedThreadId;
             if(readerThread?.ManagedThreadId != currentThreadId)
             {
                 listenerThread?.Join();
                 listenerThread = null;
+            }
+        }
+
+        // Close only the specified accepted connection. The listener stays up,
+        // and a delayed close for an earlier stream cannot affect its successor.
+        public void DisconnectClient(Stream connection)
+        {
+            lock(connectionLock)
+            {
+                if(connection == null || !ReferenceEquals(currentStream, connection)) return;
+                try
+                {
+                    socket?.Shutdown(SocketShutdown.Both);
+                }
+                catch(SocketException) { }
+                catch(ObjectDisposedException) { }
+                finally
+                {
+                    socket?.Close();
+                    enqueuedEvent.Set();
+                }
             }
         }
 
@@ -382,8 +406,13 @@ namespace Antmicro.Renode.Utilities
             {
                 try
                 {
-                    socket = server.Accept();
-                    stream = new NetworkStream(socket);
+                    var accepted = server.Accept();
+                    stream = new NetworkStream(accepted);
+                    lock(connectionLock)
+                    {
+                        socket = accepted;
+                        currentStream = stream;
+                    }
                 }
                 catch(SocketException)
                 {
@@ -451,6 +480,10 @@ namespace Antmicro.Renode.Utilities
                 writerThread = null;
                 readerThread = null;
 
+                lock(connectionLock)
+                {
+                    currentStream = null;
+                }
                 var connectionClosed = ConnectionClosed;
                 if(connectionClosed != null)
                 {
@@ -466,6 +499,8 @@ namespace Antmicro.Renode.Utilities
         private Thread writerThread;
         private Socket server;
         private Socket socket;
+        private readonly object connectionLock = new object();
+        private Stream currentStream;
 
         private TelnetReadState telnetReadState;
         private List<byte> subnegotiationBuffer;

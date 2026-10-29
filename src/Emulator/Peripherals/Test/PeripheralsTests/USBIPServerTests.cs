@@ -9,6 +9,10 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.IO;
 using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
@@ -174,7 +178,7 @@ namespace Antmicro.Renode.PeripheralsTests
             server.Unregister(device);
             server.Register(device, new NumberRegistrationPoint<int>(0), speed);
             var descriptor = (IEnumerable<byte>)typeof(USBIPServer).GetMethod("GenerateDeviceDescriptor",
-                BindingFlags.Instance | BindingFlags.NonPublic).Invoke(server, new object[] { device, 0u, false });
+                BindingFlags.Instance | BindingFlags.NonPublic).Invoke(server, new object[] { device, 0u, false, null });
             Assert.That(Packet.Decode<DeviceDescriptor>(descriptor.ToArray()).Speed, Is.EqualTo(expected));
         }
 
@@ -309,10 +313,199 @@ namespace Antmicro.Renode.PeripheralsTests
             }
         }
 
+        [Test]
+        public void ShouldHideAnUnpluggedDeviceFromDiscovery()
+        {
+            device.SetConnection(false);
+            var response = (IEnumerable<byte>)typeof(USBIPServer).GetMethod("HandleListDevicesCommand",
+                BindingFlags.Instance | BindingFlags.NonPublic).Invoke(server, new object[] { null });
+            var bytes = response.ToArray();
+            Assert.That(Packet.Decode<DeviceListCount>(bytes, 8).NumberOfExportedDevices, Is.Zero);
+            Assert.That(bytes.Length, Is.EqualTo(12));
+        }
+
+        [Test]
+        public void ShouldDisconnectTheImportedTransportOnPhysicalUnplug()
+        {
+            server.Reset();
+            server.Run();
+            using(var client = ImportDevice())
+            {
+                device.SetConnection(false);
+                Assert.That(client.GetStream().ReadByte(), Is.EqualTo(-1), "Physical unplug must terminate the old import");
+            }
+        }
+
+        [Test]
+        public void ShouldKeepListenerAndReadFreshDescriptorsAfterReplug()
+        {
+            server.Reset();
+            server.Run();
+            using(var first = ImportDevice())
+            {
+                device.SetConnection(false);
+                Assert.That(first.GetStream().ReadByte(), Is.EqualTo(-1));
+            }
+            device.Connection.Setup.AdditionalInterface = true;
+            device.SetConnection(true);
+            using(var second = ImportDevice())
+            {
+                // ImportDevice validates the fresh descriptor against this flag.
+                Assert.That(second.Connected, Is.True);
+            }
+        }
+
+        [Test]
+        public void ShouldNotDisconnectAnImportWhenAnotherDeviceIsUnplugged()
+        {
+            var other = new TestDevice();
+            server.Register(other, new NumberRegistrationPoint<int>(1));
+            server.Reset();
+            server.Run();
+            using(var client = ImportDevice())
+            {
+                other.SetConnection(false);
+                var request = Packet.Encode(new URBHeader { Command = URBCommand.Unlink, SequenceNumber = 77 })
+                    .Concat(new byte[24]).ToArray();
+                client.GetStream().Write(request, 0, request.Length);
+                var reply = ReadExactly(client.GetStream(), 48);
+                Assert.That(Packet.Decode<URBHeader>(reply).SequenceNumber, Is.EqualTo(77));
+            }
+            server.Unregister(other);
+        }
+
+        [Test]
+        public void ShouldImportAnInitiallyAbsentDeviceWhenItsLinkComesUp()
+        {
+            server.Unregister(device);
+            device.SetConnection(false);
+            server.Register(device, new NumberRegistrationPoint<int>(0));
+            server.Reset();
+            server.Run();
+            var provider = GetField<SocketServerProvider>(server, "server");
+            using(var absent = new TcpClient())
+            {
+                absent.ReceiveTimeout = Timeout;
+                absent.Connect(IPAddress.Loopback, provider.Port.Value);
+                var busId = new byte[32];
+                Encoding.ASCII.GetBytes("1-0").CopyTo(busId, 0);
+                var request = Packet.Encode(new Header { Version = 0x111, Command = Command.AttachDevice }).Concat(busId).ToArray();
+                absent.GetStream().Write(request, 0, request.Length);
+                Assert.That(Packet.Decode<Header>(ReadExactly(absent.GetStream(), 8)).Status, Is.Not.Zero);
+            }
+            device.SetConnection(true);
+            using(var present = ImportDevice()) Assert.That(present.Connected, Is.True);
+        }
+
+        [Test]
+        public void ShouldCancelDescriptorReadOnUnplugWithoutStealingReimportData()
+        {
+            server.Reset();
+            server.Run();
+            var provider = GetField<SocketServerProvider>(server, "server");
+            device.Connection.Setup.HoldDescriptors = true;
+            device.Connection.Setup.DescriptorRequested.Reset();
+            using(var first = new TcpClient())
+            {
+                first.ReceiveTimeout = Timeout;
+                first.Connect(IPAddress.Loopback, provider.Port.Value);
+                SendImport(first.GetStream());
+                Assert.That(device.Connection.Setup.DescriptorRequested.Wait(Timeout), Is.True);
+                Assert.DoesNotThrow(() => device.SetConnection(false));
+                Assert.That(first.GetStream().ReadByte(), Is.EqualTo(-1));
+            }
+            device.Connection.Setup.HoldDescriptors = false;
+            device.SetConnection(true);
+            using(var second = ImportDevice()) Assert.That(second.Connected, Is.True);
+        }
+
+        [Test]
+        public void ShouldIgnorePhysicalEventsAfterUnregister()
+        {
+            var other = new TestDevice();
+            server.Register(other, new NumberRegistrationPoint<int>(1));
+            server.Unregister(other);
+            Assert.DoesNotThrow(() => other.SetConnection(false));
+        }
+
+        [Test]
+        public void ShouldIgnoreAStaleSocketDisconnectAfterAnotherClientConnects()
+        {
+            var provider = GetField<SocketServerProvider>(server, "server");
+            var accepted = new ConcurrentQueue<Stream>();
+            provider.ConnectionAccepted += stream => accepted.Enqueue(stream);
+            server.Reset();
+            server.Run();
+            Stream firstStream;
+            using(var first = ImportDevice()) Assert.That(accepted.TryDequeue(out firstStream), Is.True);
+            using(var second = ImportDevice())
+            {
+                provider.DisconnectClient(firstStream);
+                var request = Packet.Encode(new URBHeader { Command = URBCommand.Unlink, SequenceNumber = 88 })
+                    .Concat(new byte[24]).ToArray();
+                second.GetStream().Write(request, 0, request.Length);
+                Assert.That(Packet.Decode<URBHeader>(ReadExactly(second.GetStream(), 48)).SequenceNumber, Is.EqualTo(88));
+            }
+        }
+
+        [Test]
+        public void ShouldCancelDiscoveryWhenClientClosesBeforeDescriptorsArrive()
+        {
+            server.Reset();
+            server.Run();
+            var provider = GetField<SocketServerProvider>(server, "server");
+            device.Connection.Setup.HoldDescriptors = true;
+            device.Connection.Setup.DescriptorRequested.Reset();
+            using(var first = new TcpClient())
+            {
+                first.Connect(IPAddress.Loopback, provider.Port.Value);
+                SendImport(first.GetStream());
+                Assert.That(device.Connection.Setup.DescriptorRequested.Wait(Timeout), Is.True);
+            }
+            device.Connection.Setup.HoldDescriptors = false;
+            using(var second = ImportDevice()) Assert.That(second.Connected, Is.True);
+        }
+
+        private static void SendImport(Stream stream)
+        {
+            var busId = new byte[32];
+            Encoding.ASCII.GetBytes("1-0").CopyTo(busId, 0);
+            var bytes = Packet.Encode(new Header { Version = 0x111, Command = Command.AttachDevice }).Concat(busId).ToArray();
+            stream.Write(bytes, 0, bytes.Length);
+        }
+
+        private TcpClient ImportDevice()
+        {
+            var provider = GetField<SocketServerProvider>(server, "server");
+            var client = new TcpClient();
+            client.ReceiveTimeout = Timeout;
+            client.SendTimeout = Timeout;
+            client.Connect(IPAddress.Loopback, provider.Port.Value);
+            SendImport(client.GetStream());
+            var reply = ReadExactly(client.GetStream(), 8 + Packet.CalculateLength<DeviceDescriptor>());
+            Assert.That(Packet.Decode<Header>(reply).Status, Is.Zero);
+            Assert.That(Packet.Decode<DeviceDescriptor>(reply, 8).NumberOfInterfaces,
+                Is.EqualTo(device.Connection.Setup.AdditionalInterface ? 2 : 1));
+            return client;
+        }
+
+        private static byte[] ReadExactly(Stream stream, int length)
+        {
+            var bytes = new byte[length];
+            var offset = 0;
+            while(offset < length)
+            {
+                var count = stream.Read(bytes, offset, length - offset);
+                Assert.That(count, Is.Not.Zero, "Unexpected EOF");
+                offset += count;
+            }
+            return bytes;
+        }
+
         private void CacheDescriptors()
         {
             var descriptors = (IEnumerable<byte>)typeof(USBIPServer).GetMethod("GenerateDeviceDescriptor",
-                BindingFlags.Instance | BindingFlags.NonPublic).Invoke(server, new object[] { device, 0u, true });
+                BindingFlags.Instance | BindingFlags.NonPublic).Invoke(server, new object[] { device, 0u, true, null });
             descriptors.ToArray();
         }
 
@@ -405,12 +598,15 @@ namespace Antmicro.Renode.PeripheralsTests
 
         private static T GetField<T>(object target, string name) => (T)target.GetType().GetField(name, BindingFlags.Instance | BindingFlags.NonPublic).GetValue(target);
 
-        private sealed class TestDevice : IUSBDevice
+        private sealed class TestDevice : IUSBDevice, IUSBDeviceConnectionState
         {
             public IUSBConnection ConnectUSB() => Connection;
             public void Reset() { }
             public byte Address => 0;
             public readonly TestConnection Connection = new TestConnection();
+            public bool IsConnected { get; private set; } = true;
+            public event Action<bool> ConnectionStateChanged;
+            public void SetConnection(bool value) { IsConnected = value; ConnectionStateChanged?.Invoke(value); }
         }
 
         private sealed class TestConnection : IUSBConnection
@@ -438,14 +634,38 @@ namespace Antmicro.Renode.PeripheralsTests
                 return true;
             }
             public void Write(byte[] data) => Writes.Enqueue(data);
-            public void SetupPacketWrite(SetupPacket setup) => Push(SetupResponse);
+            public void SetupPacketWrite(SetupPacket setup)
+            {
+                if(setup.Request == 6 && setup.Value >> 8 != 0)
+                {
+                    DescriptorRequested.Set();
+                    if(HoldDescriptors) return;
+                }
+                if(setup.Direction == USBDirection.DeviceToHost && setup.Request == 6 && setup.Value >> 8 == 1)
+                {
+                    Push(Packet.Encode(new USB.DeviceDescriptor { Length = 18, Type = 1, MaximumPacketSize = 64,
+                        NumberOfConfigurations = 1 }).Take(setup.Count).ToArray());
+                }
+                else if(setup.Direction == USBDirection.DeviceToHost && setup.Request == 6 && setup.Value >> 8 == 2)
+                {
+                    var children = new USB.IDescriptor[] {
+                        new USB.InterfaceDescriptor { Length = 9, Type = 4, Number = 0 },
+                        new USB.EndpointDescriptor { Length = 7, Type = 5, EndpointNumber = 1, Direction = USB.EndpointDirection.In, Attributes = 2, MaxPacketSize = EndpointPacketSize },
+                        new USB.EndpointDescriptor { Length = 7, Type = 5, EndpointNumber = 2, Direction = USB.EndpointDirection.Out, Attributes = 2, MaxPacketSize = EndpointPacketSize }
+                    }.Concat(AdditionalInterface ? new USB.IDescriptor[] { new USB.InterfaceDescriptor { Length = 9, Type = 4, Number = 1, Class = 255 } } : Array.Empty<USB.IDescriptor>()).ToArray();
+                    var config = new USB.ConfigurationDescriptor { Length = 9, Type = 2, ConfigurationValue = 1,
+                        TotalLength = (ushort)(9 + children.Sum(c => c.AsBytes.Length)) };
+                    Push(Packet.Encode(config).Concat(children.SelectMany(c => c.AsBytes)).Take(setup.Count).ToArray());
+                }
+                else Push(SetupResponse);
+            }
             public void ReadDeviceDescriptor(Action<USB.DeviceDescriptor> callback) => callback(new USB.DeviceDescriptor { MaximumPacketSize = 64, NumberOfConfigurations = 1 });
             public void ReadConfigurationDescriptor(byte index, Action<(USB.ConfigurationDescriptor, IEnumerable<USB.IDescriptor>)> callback)
                 => callback((new USB.ConfigurationDescriptor { ConfigurationValue = 1 }, new USB.IDescriptor[] {
                     new USB.InterfaceDescriptor { Number = 0 },
                     new USB.EndpointDescriptor { EndpointNumber = 1, Direction = USB.EndpointDirection.In, Attributes = 2, MaxPacketSize = EndpointPacketSize },
                     new USB.EndpointDescriptor { EndpointNumber = 2, Direction = USB.EndpointDirection.Out, Attributes = 2, MaxPacketSize = EndpointPacketSize }
-                }));
+                }.Concat(AdditionalInterface ? new USB.IDescriptor[] { new USB.InterfaceDescriptor { Number = 1, Class = 255 } } : Array.Empty<USB.IDescriptor>())));
             public void SetupRead(SetupPacket setup, Action<byte[]> callback)
             {
                 SetupPacketWrite(setup);
@@ -464,6 +684,9 @@ namespace Antmicro.Renode.PeripheralsTests
             private bool stalledInput;
             public event Action NewPacket;
             public byte[] SetupResponse = Array.Empty<byte>();
+            public bool HoldDescriptors;
+            public readonly ManualResetEventSlim DescriptorRequested = new ManualResetEventSlim();
+            public bool AdditionalInterface;
             public ushort EndpointPacketSize = 64;
             public int SuccessfulReads;
             public readonly ManualResetEventSlim WaitingAfterPacket = new ManualResetEventSlim();
