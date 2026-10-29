@@ -532,6 +532,53 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.AreEqual(expected, machine.SystemBus.ReadDoubleWordWithState(0x40038004, master, state));
         }
 
+        [Test]
+        public void ShouldDisconnectSecurePeripheralWhenGpioOrPeripheralPermissionsChange()
+        {
+            var access = new RP2350_AccessControl(machine);
+            var gpio = new RP2_GPIOBank0(machine, rp2350: true, accessControl: access);
+            gpio.WriteDoubleWord(12 * 8 + 4, 0); // HSTX, Secure-only at reset
+            Assert.AreEqual(0u, gpio.ReadDoubleWord(12 * 8 + 4));
+            access.WriteDoubleWord(0xc, 1u << 12);
+            Assert.AreEqual(31u, gpio.ReadDoubleWord(12 * 8 + 4));
+            gpio.WriteDoubleWord(12 * 8 + 4, 0);
+            Assert.AreEqual(31u, gpio.ReadDoubleWord(12 * 8 + 4));
+            access.WriteDoubleWord(0x80, 0xacce00ff);
+            gpio.WriteDoubleWord(12 * 8 + 4, 0);
+            Assert.AreEqual(0u, gpio.ReadDoubleWord(12 * 8 + 4));
+            access.WriteDoubleWord(0x80, 0xacce00fc);
+            Assert.AreEqual(31u, gpio.ReadDoubleWord(12 * 8 + 4));
+            gpio.WriteDoubleWord(12 * 8 + 4, 5);
+            Assert.AreEqual(5u, gpio.ReadDoubleWord(12 * 8 + 4));
+        }
+
+        [TestCase(47, 1u, 0x94)]
+        [TestCase(47, 2u, 0xa0)]
+        [TestCase(47, 3u, 0x88)]
+        [TestCase(47, 4u, 0x8c)]
+        [TestCase(47, 6u, 0x4c)]
+        [TestCase(47, 7u, 0x50)]
+        [TestCase(47, 8u, 0x54)]
+        [TestCase(47, 9u, 0xe4)]
+        [TestCase(47, 10u, 0x48)]
+        [TestCase(47, 11u, 0xa0)]
+        [TestCase(8, 2u, 0xa4)]
+        [TestCase(12, 2u, 0xa0)]
+        [TestCase(26, 11u, 0xa4)]
+        [TestCase(30, 11u, 0xa0)]
+        public void ShouldUsePeripheralSecurityForMuxFunction(int pin, uint function, long permission)
+        {
+            var access = new RP2350_AccessControl(machine);
+            var gpio = new RP2_GPIOBank0(machine, rp2350: true, accessControl: access);
+            access.WriteDoubleWord(pin < 32 ? 0xc : 0x10, 1u << (pin & 31));
+            access.WriteDoubleWord(permission, 0xacce00fc);
+            gpio.WriteDoubleWord(pin * 8 + 4, function);
+            Assert.AreEqual(31u, gpio.ReadDoubleWord(pin * 8 + 4));
+            access.WriteDoubleWord(permission, 0xacce00ff);
+            gpio.WriteDoubleWord(pin * 8 + 4, function);
+            Assert.AreEqual(function, gpio.ReadDoubleWord(pin * 8 + 4));
+        }
+
         private sealed class TestBusMaster : IPeripheralWithTransactionState, IBusPeripheral
         {
             public void Reset() { }

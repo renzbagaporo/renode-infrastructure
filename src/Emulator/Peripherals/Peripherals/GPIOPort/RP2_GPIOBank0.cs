@@ -73,7 +73,7 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             interruptState = new bool[interruptOutputs.Length];
             if(accessControl != null)
             {
-                accessControl.GPIOAccessChanged += UpdatePins;
+                accessControl.GPIOAccessChanged += OnGPIOAccessChanged;
             }
             if(sio != null)
             {
@@ -345,7 +345,8 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
                 {
                     var pin = (int)(offset / 8);
                     if(!CanAccessPin(pin)) return;
-                    control[pin] = ApplyOperation(control[pin], value, operation, rp2350 ? 0x3003f01fu : 0x3003331fu);
+                    control[pin] = ApplyFunctionSecurity(pin,
+                        ApplyOperation(control[pin], value, operation, rp2350 ? 0x3003f01fu : 0x3003331fu));
                     if(IsBondedPin(pin)) UpdatePin(pin);
                     UpdateInterrupts();
                 }
@@ -415,6 +416,60 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
         {
             var pins = Math.Min(8, Math.Max(0, numberOfPins - group * 8));
             return pins == 8 ? uint.MaxValue : (1u << (pins * 4)) - 1;
+        }
+
+        private void OnGPIOAccessChanged()
+        {
+            lock(SyncRoot)
+            {
+                for(var pin = 0; pin < numberOfPins; pin++)
+                {
+                    control[pin] = ApplyFunctionSecurity(pin, control[pin]);
+                }
+                UpdatePinsLocked();
+            }
+            PublishPending();
+        }
+
+        private uint ApplyFunctionSecurity(int pin, uint value)
+        {
+            if(rp2350 && (accessControl?.GPIOIsNonSecure(pin + securityPinOffset) ?? false)
+                && !IsFunctionNonSecure(pin, (int)(value & 0x1f)))
+            {
+                return value | 0x1f;
+            }
+            return value;
+        }
+
+        private bool IsFunctionNonSecure(int pin, int function)
+        {
+            if(function == 5 || function == 31) return true;
+            long permission;
+            if(securityPinOffset >= 56)
+            {
+                if(function != 0) return false;
+                permission = pin + securityPinOffset < 58 ? 0x48 : 0xe4; // USB or QMI
+            }
+            else
+            {
+                switch(function)
+                {
+                case 0: permission = 0x80; break; // HSTX
+                case 1: permission = 0x90 + ((pin >> 3) & 1) * 4; break; // SPI
+                case 2: case 11: permission = 0xa0 + (((pin >> 2) ^ (pin >> 3)) & 1) * 4; break; // UART
+                case 3: permission = 0x84 + ((pin >> 1) & 1) * 4; break; // I2C
+                case 4: permission = 0x8c; break; // PWM
+                case 6: case 7: case 8: permission = 0x4c + (function - 6) * 4; break; // PIO
+                case 9:
+                    permission = pin == 0 || pin == 8 || pin == 19 || pin == 47 ? 0xe4 // QMI CS1n
+                        : pin >= 1 && pin <= 5 ? 0xe8 // CoreSight trace
+                        : 0xc0; // clock inputs and outputs
+                    break;
+                case 10: permission = 0x48; break; // USB power signals
+                default: return false;
+                }
+            }
+            return accessControl?.PeripheralIsNonSecure(permission) ?? false;
         }
 
         private uint NonSecureInterruptMask(int group)
