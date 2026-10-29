@@ -6,6 +6,7 @@
 using System;
 
 using Antmicro.Renode.Exceptions;
+using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.Bus;
 
 namespace Antmicro.Renode.Peripherals.USB
@@ -13,7 +14,7 @@ namespace Antmicro.Renode.Peripherals.USB
     // USB DPRAM uses byte lanes, unlike the peripheral APB register bridge.
     // Buffer control writes notify the USB controller when firmware hands a
     // buffer to the serial interface engine.
-    public sealed class RP2_USB_DPRAM : IBytePeripheral, IWordPeripheral, IDoubleWordPeripheral, IKnownSize
+    public sealed class RP2_USB_DPRAM : IBytePeripheral, IWordPeripheral, IDoubleWordPeripheral, IKnownSize, IRP2ResettablePeripheral
     {
         public RP2_USB_DPRAM()
         {
@@ -25,6 +26,7 @@ namespace Antmicro.Renode.Peripherals.USB
             lock(this)
             {
                 CheckRange(offset, 1);
+                if(UnavailableAccess()) return 0;
                 return data[offset];
             }
         }
@@ -34,6 +36,7 @@ namespace Antmicro.Renode.Peripherals.USB
             lock(this)
             {
                 CheckRange(offset, 2);
+                if(UnavailableAccess()) return 0;
                 return (ushort)(data[offset] | (data[offset + 1] << 8));
             }
         }
@@ -43,6 +46,7 @@ namespace Antmicro.Renode.Peripherals.USB
             lock(this)
             {
                 CheckRange(offset, 4);
+                if(UnavailableAccess()) return 0;
                 return (uint)(data[offset] | (data[offset + 1] << 8)
                     | (data[offset + 2] << 16) | (data[offset + 3] << 24));
             }
@@ -69,6 +73,7 @@ namespace Antmicro.Renode.Peripherals.USB
             {
                 CheckRange(offset, count);
                 var result = new byte[count];
+                if(UnavailableAccess()) return result;
                 Array.Copy(data, offset, result, 0, count);
                 return result;
             }
@@ -79,6 +84,7 @@ namespace Antmicro.Renode.Peripherals.USB
             lock(this)
             {
                 CheckRange(offset, bytes.Length);
+                if(UnavailableAccess()) return;
                 Array.Copy(bytes, 0, data, offset, bytes.Length);
                 var first = Math.Max(offset, BufferControlStart);
                 var last = Math.Min(offset + bytes.Length, BufferControlEnd);
@@ -97,12 +103,29 @@ namespace Antmicro.Renode.Peripherals.USB
 
         public void Reset()
         {
-            // Like SRAM, the memory contents are left to firmware to initialize.
+            // The model retains backing bytes across reset. Firmware initializes
+            // DPRAM after release; hardware retention is not specified here.
+        }
+
+        public bool ResetHeld
+        {
+            get { lock(this) return resetHeld; }
+            set { lock(this) resetHeld = value; }
         }
 
         public long Size => MemorySize;
 
         public event Action<int> BufferControlWritten;
+
+        // Access requires USBCTRL out of reset (RP2350 section 12.1.2.7).
+        // Exact bus responses are unspecified: return zero, ignore writes, and
+        // diagnose access rather than inventing an AHB fault or clearing SRAM.
+        private bool UnavailableAccess()
+        {
+            if(!resetHeld) return false;
+            this.Log(LogLevel.Warning, "USB DPRAM access while USBCTRL reset is held");
+            return true;
+        }
 
         private void CheckRange(long offset, int count)
         {
@@ -113,6 +136,7 @@ namespace Antmicro.Renode.Peripherals.USB
         }
 
         private readonly byte[] data;
+        private bool resetHeld;
 
         private const int MemorySize = 0x1000;
         private const int BufferControlStart = 0x80;

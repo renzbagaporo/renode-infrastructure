@@ -74,6 +74,27 @@ namespace Antmicro.Renode.PeripheralsTests
         }
 
         [Test]
+        public void ShouldDiagnoseResetHeldAccessWithoutMutatingOrNotifying()
+        {
+            var memory = new RP2_USB_DPRAM();
+            memory.WriteDoubleWord(0x80, 0x12345678);
+            var controls = new List<int>();
+            memory.BufferControlWritten += controls.Add;
+            memory.ResetHeld = true;
+            memory.WriteByte(0x80, 0);
+            memory.WriteWord(0x82, 0);
+            memory.WriteDoubleWord(0x80, 0);
+            memory.WriteBytes(0x80, new byte[4]);
+            Assert.That(memory.ReadByte(0x80), Is.Zero);
+            Assert.That(memory.ReadWord(0x80), Is.Zero);
+            Assert.That(memory.ReadDoubleWord(0x80), Is.Zero);
+            Assert.That(memory.ReadBytes(0x80, 4), Is.EqualTo(new byte[4]));
+            Assert.That(controls, Is.Empty);
+            memory.ResetHeld = false;
+            Assert.That(memory.ReadDoubleWord(0x80), Is.EqualTo(0x12345678));
+        }
+
+        [Test]
         public void ShouldRejectAccessOutsideDPRAM()
         {
             var memory = new RP2_USB_DPRAM();

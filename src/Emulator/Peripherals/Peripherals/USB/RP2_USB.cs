@@ -19,9 +19,10 @@ namespace Antmicro.Renode.Peripherals.USB
     // the buffers owned by the SIE; firmware services the corresponding IRQs.
     public sealed class RP2_USB : RP2APBPeripheral, IUSBDevice
     {
-        public RP2_USB(IMachine machine, RP2_USB_DPRAM dpram) : base(machine)
+        public RP2_USB(IMachine machine, RP2_USB_DPRAM dpram, IRP2ClockSource clockSource) : base(machine)
         {
             this.dpram = dpram;
+            this.clockSource = clockSource ?? throw new ArgumentNullException(nameof(clockSource));
             endpoints = new Endpoint[EndpointCount];
             bufferIndex = new int[EndpointCount * 2];
             for(var endpoint = 0; endpoint < EndpointCount; ++endpoint)
@@ -35,13 +36,16 @@ namespace Antmicro.Renode.Peripherals.USB
             {
                 lock(dpram)
                 {
+                    if(!CanProcessPackets) return;
                     frameNumber = (frameNumber + 1) & 0x7ff;
                     startOfFramePending = true;
                     UpdateInterrupts();
                 }
             };
             dpram.BufferControlWritten += BufferControlWritten;
+            clockSource.ClockChanged += ClockChanged;
             Reset();
+            ClockChanged();
         }
 
         public override void Reset()
@@ -60,6 +64,8 @@ namespace Antmicro.Renode.Peripherals.USB
                 bufferCPU = 0;
                 sieStatus = 0;
                 startOfFramePending = false;
+                connectionObserved = false;
+                UpdateConnection();
                 UpdateInterrupts();
             }
         }
@@ -69,7 +75,6 @@ namespace Antmicro.Renode.Peripherals.USB
             lock(dpram)
             {
                 connectionCount++;
-                BusReset();
                 UpdateConnection();
                 return new Connection(this);
             }
@@ -78,6 +83,15 @@ namespace Antmicro.Renode.Peripherals.USB
         public byte Address => (byte)(registers[(int)Registers.Address / 4] & 0x7f);
 
         public GPIO IRQ { get; }
+
+        protected override object SyncRoot => dpram;
+
+        protected override void OnResetHeldChanged()
+        {
+            dpram.ResetHeld = ResetHeld;
+            UpdateConnection();
+            UpdateInterrupts();
+        }
 
         protected override uint ReadRegister(long offset)
         {
@@ -90,7 +104,7 @@ namespace Antmicro.Renode.Peripherals.USB
                     UpdateInterrupts();
                     return frameNumber;
                 case Registers.SIEStatus:
-                    return sieStatus | (IsConnected ? 1u << 16 : 0);
+                    return sieStatus | (connectionObserved ? 1u << 16 : 0);
                 case Registers.BufferStatus:
                     return bufferStatus;
                 case Registers.BufferCPU:
@@ -172,8 +186,19 @@ namespace Antmicro.Renode.Peripherals.USB
 
         private void UpdateConnection()
         {
-            frameTimer.Enabled = IsConnected;
-            if(IsConnected)
+            if(!PhysicalConnection)
+            {
+                connectionObserved = false;
+                foreach(var endpoint in endpoints) endpoint.Reset();
+            }
+            if(!ResetHeld && ClocksAvailable && PhysicalConnection && !connectionObserved)
+            {
+                connectionObserved = true;
+                BusReset();
+            }
+            frameTimer.Enabled = connectionObserved;
+            frameTimer.Clocked = CanProcessPackets;
+            if(CanProcessPackets)
             {
                 foreach(var endpoint in endpoints)
                 {
@@ -182,10 +207,26 @@ namespace Antmicro.Renode.Peripherals.USB
             }
         }
 
+        private void ClockChanged()
+        {
+            lock(dpram)
+            {
+                if(clockSource.USBFrequency == 48000000 && clockSource.SystemFrequency != 0
+                    && clockSource.SystemFrequency < 52800000 && !timingWarningEmitted)
+                {
+                    timingWarningEmitted = true;
+                    this.Log(LogLevel.Warning, "USB clk_sys below 52.8 MHz: RP2040-E16/RP2350-E12 event loss is not emulated");
+                }
+                UpdateConnection();
+                UpdateInterrupts();
+            }
+        }
+
         private void BufferControlWritten(int control)
         {
             lock(dpram)
             {
+                if(ResetHeld) return;
                 // The RESET bit resets the SIE's buffer selector independently for
                 // each endpoint direction. Clear it before notifying consumers.
                 var offset = BufferControlOffset + control * 4;
@@ -193,7 +234,7 @@ namespace Antmicro.Renode.Peripherals.USB
                 if((value & BufferReset) != 0)
                 {
                     bufferIndex[control] = 0;
-                dpram.WriteDoubleWord(offset, value & ~(uint)BufferReset);
+                    dpram.WriteDoubleWord(offset, value & ~(uint)BufferReset);
                     return;
                 }
                 endpoints[control / 2].BufferReady();
@@ -223,7 +264,7 @@ namespace Antmicro.Renode.Peripherals.USB
                 address += isochronous ? 128 << (int)((controlWord >> 27) & 3) : 64;
             }
             buffer = new Buffer(control, index, offset, address, half, doubleBuffered);
-            return IsConnected && enabled && !aborted && !stalled && (half & BufferAvailable) != 0
+            return CanProcessPackets && enabled && !aborted && !stalled && (half & BufferAvailable) != 0
                 && (input || (half & BufferFull) == 0);
         }
 
@@ -256,9 +297,9 @@ namespace Antmicro.Renode.Peripherals.USB
         {
             lock(dpram)
             {
-                if(!IsConnected)
+                if(!CanProcessPackets)
                 {
-                    this.Log(LogLevel.Warning, "USB SETUP token received while device is disconnected");
+                    this.Log(LogLevel.Warning, "USB SETUP token received while the serial interface is inactive");
                     return;
                 }
                 endpoints[0].Reset();
@@ -276,7 +317,7 @@ namespace Antmicro.Renode.Peripherals.USB
 
         private void UpdateInterrupts()
         {
-            IRQ.Set(EnabledInterrupts != 0);
+            IRQ.Set(!ResetHeld && EnabledInterrupts != 0);
         }
 
         private static void ClearStatus(ref uint status, uint value, AtomicOperation operation)
@@ -304,10 +345,15 @@ namespace Antmicro.Renode.Peripherals.USB
         private uint EnabledInterrupts => ((RawInterrupts & registers[(int)Registers.InterruptEnable / 4])
             | registers[(int)Registers.InterruptForce / 4]) & 0xfffff;
 
-        private bool IsConnected => connectionCount != 0
+        private bool CanProcessPackets => !ResetHeld && ClocksAvailable && connectionObserved && PhysicalConnection;
+
+        private bool ClocksAvailable => clockSource.USBFrequency == 48000000 && clockSource.SystemFrequency != 0;
+
+        private bool PhysicalConnection => connectionCount != 0
             && (registers[(int)Registers.MainControl / 4] & 3) == 1
             && (registers[(int)Registers.SIEControl / 4] & (1u << 16)) != 0;
 
+        private readonly IRP2ClockSource clockSource;
         private readonly RP2_USB_DPRAM dpram;
         private readonly Endpoint[] endpoints;
         private readonly int[] bufferIndex;
@@ -319,6 +365,8 @@ namespace Antmicro.Renode.Peripherals.USB
         private uint frameNumber;
         private int connectionCount;
         private bool startOfFramePending;
+        private bool connectionObserved;
+        private bool timingWarningEmitted;
 
         private const int EndpointCount = 16;
         private const int RegisterBytes = 0x100;
@@ -394,6 +442,10 @@ namespace Antmicro.Renode.Peripherals.USB
             {
                 lock(parent.dpram)
                 {
+                    if(parent.ResetHeld || !parent.PhysicalConnection) return;
+                    // IUSBPipeWrite has no NAK result. Queue host-side pending
+                    // transfers while clocks are stopped; the SIE accepts them
+                    // only when clocking and buffer ownership allow completion.
                     // Non-isochronous full-speed endpoints carry at most 64 bytes
                     // per token. Preserve the zero-length status packet as well.
                     var offset = 0;

@@ -3,8 +3,11 @@
 // Full license text is available in 'licenses/MIT.txt'.
 //
 
+using System;
+
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.USB;
+using Antmicro.Renode.Peripherals;
 using Antmicro.Renode.Peripherals.USB;
 using Antmicro.Renode.Time;
 using Antmicro.Renode.Utilities.Packets;
@@ -23,7 +26,8 @@ namespace Antmicro.Renode.PeripheralsTests
         {
             machine = new Machine();
             dpram = new RP2_USB_DPRAM();
-            usb = new RP2_USB(machine, dpram);
+            clocks = new ControlledClockSource();
+            usb = new RP2_USB(machine, dpram, clocks);
             usb.WriteDoubleWord(0x40, 1);
             usb.WriteDoubleWord(0x4c, 0x20010000);
             connection = usb.ConnectUSB();
@@ -183,6 +187,197 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.That(usb.ReadDoubleWord(0x48), Is.EqualTo(3));
         }
 
+        [Test]
+        public void ShouldFreezeFramesAndPreserveFramePhaseWhileClockStopped()
+        {
+            AdvanceMicroseconds(500);
+            clocks.Set(125000000, 0);
+            AdvanceMicroseconds(5000);
+            Assert.That(usb.ReadDoubleWord(0x48), Is.Zero);
+            clocks.Set(125000000, 48000000);
+            AdvanceMicroseconds(499);
+            Assert.That(usb.ReadDoubleWord(0x48), Is.Zero);
+            AdvanceMicroseconds(1);
+            Assert.That(usb.ReadDoubleWord(0x48), Is.EqualTo(1));
+        }
+
+        [TestCase(0ul, 48000000ul)]
+        [TestCase(125000000ul, 0ul)]
+        [TestCase(125000000ul, 24000000ul)]
+        public void ShouldFreezePacketOwnershipAndPendingStatusWhenClocksUnavailable(ulong system, ulong usbFrequency)
+        {
+            usb.WriteDoubleWord(0, 37);
+            usb.WriteDoubleWord(0x2094, 1u << 16);
+            dpram.WriteBytes(0x100, new byte[] { 0x42 });
+            dpram.WriteDoubleWord(0x80, 0x8401);
+            var control = dpram.ReadDoubleWord(0x80);
+            clocks.Set(system, usbFrequency);
+            Assert.That(connection.ConnectEndpointRead(0).TryRead(out _), Is.False);
+            connection.ConnectEndpointSetup(0).SetupPacketWrite(new SetupPacket { Request = 6 });
+            connection.ConnectEndpointWrite(0).Write(new byte[] { 0xa5 });
+            dpram.WriteDoubleWord(0x84, 0x440);
+            Assert.That(dpram.ReadDoubleWord(0x80), Is.EqualTo(control));
+            Assert.That(dpram.ReadByte(0x100), Is.EqualTo(0x42));
+            Assert.That(usb.ReadDoubleWord(0x58), Is.Zero);
+            Assert.That(usb.ReadDoubleWord(0x8c) & (1u << 16), Is.Zero);
+            Assert.That(usb.IRQ.IsSet, Is.True);
+            usb.WriteDoubleWord(0, 38);
+            Assert.That(usb.Address, Is.EqualTo(38));
+            clocks.Set(125000000, 48000000);
+            Assert.That(usb.Address, Is.EqualTo(38));
+            Assert.That(usb.ReadDoubleWord(0x50) & (1u << 19), Is.Zero);
+            Assert.That(usb.ReadDoubleWord(0x58), Is.EqualTo(2));
+            Assert.That(dpram.ReadByte(0x100), Is.EqualTo(0xa5));
+        }
+
+        [Test]
+        public void ShouldRetainCompletedBufferInterruptWhileClockStopped()
+        {
+            dpram.WriteBytes(0x100, new byte[] { 0x42 });
+            dpram.WriteDoubleWord(0x80, 0x8401);
+            Assert.IsTrue(connection.ConnectEndpointRead(0).TryRead(out _));
+            usb.WriteDoubleWord(0x90, 1u << 4);
+            clocks.Set(125000000, 0);
+            Assert.That(usb.ReadDoubleWord(0x58), Is.EqualTo(1));
+            Assert.That(usb.IRQ.IsSet, Is.True);
+            clocks.Set(125000000, 48000000);
+            Assert.That(usb.ReadDoubleWord(0x58), Is.EqualTo(1));
+            Assert.That(usb.IRQ.IsSet, Is.True);
+        }
+
+        [Test]
+        public void ShouldObserveHostAttachOnlyAfterAValidClockBecomesAvailable()
+        {
+            connection.Dispose();
+            clocks.Set(125000000, 0);
+            usb.WriteDoubleWord(0x50, 1u << 19);
+            usb.WriteDoubleWord(0, 23);
+            connection = usb.ConnectUSB();
+            Assert.That(usb.Address, Is.EqualTo(23));
+            Assert.That(usb.ReadDoubleWord(0x50) & (1u << 19), Is.Zero);
+            clocks.Set(125000000, 48000000);
+            Assert.That(usb.Address, Is.Zero);
+            Assert.That(usb.ReadDoubleWord(0x50) & (1u << 19), Is.Not.Zero);
+            usb.WriteDoubleWord(0x50, 1u << 19);
+            usb.WriteDoubleWord(0, 24);
+            clocks.Set(125000000, 0);
+            clocks.Set(125000000, 48000000);
+            Assert.That(usb.Address, Is.EqualTo(24));
+            Assert.That(usb.ReadDoubleWord(0x50) & (1u << 19), Is.Zero);
+        }
+
+        [Test]
+        public void ShouldDiscardTrafficReceivedDuringResetAndPreserveHostAttachment()
+        {
+            connection.ConnectEndpointWrite(0).Write(new byte[] { 0xa5 });
+            usb.ResetHeld = true;
+            connection.ConnectEndpointWrite(0).Write(new byte[] { 0x5a });
+            connection.ConnectEndpointSetup(0).SetupPacketWrite(new SetupPacket { Request = 6 });
+            Assert.That(connection.ConnectEndpointRead(0).TryRead(out _), Is.False);
+            Assert.That(usb.IRQ.IsSet, Is.False);
+            usb.ResetHeld = false;
+            usb.WriteDoubleWord(0x40, 1);
+            usb.WriteDoubleWord(0x4c, 0x20010000);
+            Assert.That(usb.ReadDoubleWord(0x50) & (1u << 19), Is.Not.Zero);
+            dpram.WriteDoubleWord(0x84, 0x440);
+            Assert.That(usb.ReadDoubleWord(0x58), Is.Zero);
+            connection.ConnectEndpointWrite(0).Write(new byte[] { 0x33 });
+            Assert.That(dpram.ReadByte(0x100), Is.EqualTo(0x33));
+        }
+
+        [Test]
+        public void ShouldNotNotifyInputAvailabilityUntilClocksResume()
+        {
+            var input = connection.ConnectEndpointRead(0);
+            var notifications = 0;
+            input.NewPacket += () => notifications++;
+            clocks.Set(125000000, 0);
+            dpram.WriteByte(0x100, 0x42);
+            dpram.WriteDoubleWord(0x80, 0x8401);
+            Assert.That(notifications, Is.Zero);
+            clocks.Set(125000000, 48000000);
+            Assert.That(notifications, Is.EqualTo(1));
+            Assert.That(input.TryRead(out var bytes), Is.True);
+            Assert.That(bytes, Is.EqualTo(new byte[] { 0x42 }));
+            Assert.That(input.TryRead(out _), Is.False);
+            Assert.That(notifications, Is.EqualTo(1));
+        }
+
+        [Test]
+        public void ShouldPreserveHostPendingOutputOrderAcrossClockStopExactlyOnce()
+        {
+            clocks.Set(125000000, 0);
+            var output = connection.ConnectEndpointWrite(0);
+            output.Write(new byte[] { 1 });
+            output.Write(new byte[] { 2 });
+            dpram.WriteDoubleWord(0x84, 0x440);
+            clocks.Set(125000000, 48000000);
+            Assert.That(dpram.ReadByte(0x100), Is.EqualTo(1));
+            Assert.That(dpram.ReadWord(0x84), Is.EqualTo(0x8001));
+            dpram.WriteDoubleWord(0x84, 0x440);
+            Assert.That(dpram.ReadByte(0x100), Is.EqualTo(2));
+            Assert.That(dpram.ReadWord(0x84), Is.EqualTo(0x8001));
+            dpram.WriteDoubleWord(0x84, 0x440);
+            Assert.That(dpram.ReadWord(0x84), Is.EqualTo(0x440));
+        }
+
+        [Test]
+        public void ShouldCancelHostPendingOutputOnPhysicalDisconnect()
+        {
+            clocks.Set(125000000, 0);
+            connection.ConnectEndpointWrite(0).Write(new byte[] { 0xa5 });
+            connection.Dispose();
+            dpram.WriteDoubleWord(0x84, 0x440);
+            clocks.Set(125000000, 48000000);
+            connection = usb.ConnectUSB();
+            Assert.That(usb.ReadDoubleWord(0x58), Is.Zero);
+            Assert.That(dpram.ReadWord(0x84), Is.EqualTo(0x440));
+        }
+
+        [Test]
+        public void ShouldNotObserveHostAttachWhileResetIsHeld()
+        {
+            connection.Dispose();
+            usb.ResetHeld = true;
+            connection = usb.ConnectUSB();
+            AdvanceMicroseconds(2000);
+            Assert.That(usb.ReadDoubleWord(0x50), Is.Zero);
+            Assert.That(usb.ReadDoubleWord(0x48), Is.Zero);
+            usb.ResetHeld = false;
+            Assert.That(usb.ReadDoubleWord(0x50), Is.Zero);
+            usb.WriteDoubleWord(0x40, 1);
+            usb.WriteDoubleWord(0x4c, 0x20010000);
+            Assert.That(usb.ReadDoubleWord(0x50) & (1u << 19), Is.Not.Zero);
+        }
+
+        [Test]
+        public void ShouldRunWithALowNonzeroSystemClockWithoutInventingDeterministicEventLoss()
+        {
+            clocks.Set(12000000, 48000000);
+            AdvanceMicroseconds(1000);
+            Assert.That(usb.ReadDoubleWord(0x48), Is.EqualTo(1));
+            dpram.WriteBytes(0x100, new byte[] { 0x42 });
+            dpram.WriteDoubleWord(0x80, 0x8401);
+            Assert.That(connection.ConnectEndpointRead(0).TryRead(out _), Is.True);
+        }
+
+        private void AdvanceMicroseconds(ulong duration) => ((BaseClockSource)machine.ClockSource).Advance(TimeInterval.FromMicroseconds(duration));
+
+        private sealed class ControlledClockSource : IRP2ClockSource
+        {
+            public ulong SystemFrequency { get; private set; } = 125000000;
+            public ulong PeripheralFrequency => SystemFrequency;
+            public ulong USBFrequency { get; private set; } = 48000000;
+            public event Action ClockChanged;
+            public void Set(ulong system, ulong usb)
+            {
+                SystemFrequency = system;
+                USBFrequency = usb;
+                ClockChanged?.Invoke();
+            }
+        }
+
+        private ControlledClockSource clocks;
         private Machine machine;
         private RP2_USB_DPRAM dpram;
         private RP2_USB usb;

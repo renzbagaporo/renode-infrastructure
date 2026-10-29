@@ -11,7 +11,7 @@ using Antmicro.Renode.Peripherals.IRQControllers;
 
 namespace Antmicro.Renode.Peripherals.Miscellaneous
 {
-    public sealed class RP2040_Clocks : RP2APBPeripheral
+    public sealed class RP2040_Clocks : RP2APBPeripheral, IRP2ClockSource
     {
         public RP2040_Clocks(IMachine machine, RP2_XOSC xosc, RP2040_ROSC rosc,
             RP2_PLL pllSys, RP2_PLL pllUsb, NVIC nvic0 = null, NVIC nvic1 = null, RP2040_SIO sio = null) : base(machine)
@@ -70,6 +70,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
             return source * 0x100 / division;
         }
+
+        public ulong SystemFrequency => GetFrequency(SystemClock);
+
+        public ulong PeripheralFrequency => GetFrequency(PeripheralClock);
+
+        public ulong USBFrequency => GetFrequency(7);
 
         public event Action ClockChanged;
 
