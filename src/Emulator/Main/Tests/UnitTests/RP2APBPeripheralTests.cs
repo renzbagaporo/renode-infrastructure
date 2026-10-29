@@ -48,6 +48,44 @@ namespace Antmicro.Renode.UnitTests
             Assert.AreEqual(0x92349234u, peripheral.Value);
         }
 
+        [TestCase(0x34)]
+        [TestCase(0xffc)]
+        public void ShouldDecodeAliasesAtNonzeroRegisterOffsets(long offset)
+        {
+            var peripheral = new TestPeripheral(registerOffset: offset);
+            peripheral.WriteDoubleWord(offset, 0x12345678);
+            peripheral.WriteDoubleWord(0x1000 + offset, 0xff);
+            peripheral.WriteDoubleWord(0x2000 + offset, 0x80000000);
+            peripheral.WriteDoubleWord(0x3000 + offset, 0x5600);
+            Assert.AreEqual(0x92340087u, peripheral.ReadDoubleWord(0x2000 + offset));
+        }
+
+        [Test]
+        public void ShouldPreserveBitsOutsideWritableMaskForAllOperations()
+        {
+            var peripheral = new TestPeripheral(writableMask: 0xff00, initialValue: 0xaabbccdd);
+            peripheral.WriteDoubleWord(0, 0);
+            Assert.AreEqual(0xaabb00ddu, peripheral.Value);
+            peripheral.WriteDoubleWord(0x1000, 0xffffffff);
+            Assert.AreEqual(0xaabbffddu, peripheral.Value);
+            peripheral.WriteDoubleWord(0x3000, 0x0f00);
+            Assert.AreEqual(0xaabbf0ddu, peripheral.Value);
+            peripheral.WriteDoubleWord(0x2000, 0x0300);
+            Assert.AreEqual(0xaabbf3ddu, peripheral.Value);
+        }
+
+        [Test]
+        public void ShouldInvokeReadSideEffectsExactlyOncePerAccess()
+        {
+            var peripheral = new TestPeripheral();
+            peripheral.ReadByte(0x1001);
+            Assert.AreEqual(1, peripheral.ReadCount);
+            peripheral.ReadWord(0x2002);
+            Assert.AreEqual(2, peripheral.ReadCount);
+            peripheral.ReadDoubleWord(0x3000);
+            Assert.AreEqual(3, peripheral.ReadCount);
+        }
+
         [Test]
         public void ShouldHoldRegistersInResetUntilReleased()
         {
@@ -74,8 +112,11 @@ namespace Antmicro.Renode.UnitTests
 
         private sealed class TestPeripheral : RP2APBPeripheral
         {
-            public TestPeripheral() : base(null)
+            public TestPeripheral(long registerOffset = 0, uint writableMask = uint.MaxValue, uint initialValue = 0) : base(null)
             {
+                this.registerOffset = registerOffset;
+                this.writableMask = writableMask;
+                Value = initialValue;
             }
 
             public override void Reset()
@@ -90,16 +131,19 @@ namespace Antmicro.Renode.UnitTests
 
             protected override uint ReadRegister(long offset)
             {
-                Assert.AreEqual(0, offset);
+                Assert.AreEqual(registerOffset, offset);
                 ReadCount++;
                 return Value;
             }
 
             protected override void WriteRegister(long offset, uint value, AtomicOperation operation)
             {
-                Assert.AreEqual(0, offset);
-                Value = ApplyOperation(Value, value, operation);
+                Assert.AreEqual(registerOffset, offset);
+                Value = ApplyOperation(Value, value, operation, writableMask);
             }
+
+            private readonly long registerOffset;
+            private readonly uint writableMask;
         }
     }
 }
