@@ -19,9 +19,7 @@ namespace Antmicro.Renode.Peripherals.Timers
         public RP2_Timer(IMachine machine, ulong frequency = 1000000, bool clocked = false, bool rp2350 = false) : base(machine)
         {
             this.frequency = frequency;
-            initialFrequency = frequency;
             this.clocked = clocked;
-            initialClocked = clocked;
             this.rp2350 = rp2350;
             interruptOffset = rp2350 ? 0x3c : 0x34;
             counter = new LimitTimer(machine.ClockSource, Math.Max(1ul, frequency), this, "counter",
@@ -69,8 +67,8 @@ namespace Antmicro.Renode.Peripherals.Timers
                 alarm.Reset();
             }
             Array.Clear(alarmValues, 0, alarmValues.Length);
-            frequency = initialFrequency;
-            clocked = initialClocked;
+            // Tick clock inputs belong to their source's reset domain.
+            // Resetting this timer resets its counter, not the incoming clock.
             pendingLowTime = 0;
             latchedHighTime = 0;
             armed = 0;
@@ -333,8 +331,6 @@ namespace Antmicro.Renode.Peripherals.Timers
         private bool locked;
         private uint source;
 
-        private readonly ulong initialFrequency;
-        private readonly bool initialClocked;
         private readonly bool rp2350;
         private readonly long interruptOffset;
         private readonly LimitTimer counter;
