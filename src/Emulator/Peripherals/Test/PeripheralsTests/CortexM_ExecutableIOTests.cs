@@ -137,30 +137,31 @@ namespace Antmicro.Renode.PeripheralsTests
         [Test]
         public void ShouldPreserveSharedAndBankedCcrFieldsAcrossSecurityViews()
         {
-            cpu.ConfigurationAndControlRegister = 0x300;
-            Assert.AreEqual(0x300u, cpu.ConfigurationAndControlRegister & 0x310u);
-            Assert.AreEqual(0x100u, cpu.ConfigurationAndControlRegisterNonSecure & 0x310u);
-            cpu.ConfigurationAndControlRegisterNonSecure = 0x10;
-            Assert.AreEqual(0x200u, cpu.ConfigurationAndControlRegister & 0x310u);
-            Assert.AreEqual(0x10u, cpu.ConfigurationAndControlRegisterNonSecure & 0x310u);
+            cpu.ConfigurationAndControlRegister = 0x110;
+            Assert.AreEqual(0x110u, cpu.ConfigurationAndControlRegister & 0x118u);
+            Assert.AreEqual(0x100u, cpu.ConfigurationAndControlRegisterNonSecure & 0x118u);
+            cpu.ConfigurationAndControlRegisterNonSecure = 0x8;
+            Assert.AreEqual(0x10u, cpu.ConfigurationAndControlRegister & 0x118u);
+            Assert.AreEqual(0x8u, cpu.ConfigurationAndControlRegisterNonSecure & 0x118u);
             cpu.ConfigurationAndControlRegister = 0x100;
-            Assert.AreEqual(0x100u, cpu.ConfigurationAndControlRegister & 0x310u);
-            Assert.AreEqual(0x110u, cpu.ConfigurationAndControlRegisterNonSecure & 0x310u);
+            Assert.AreEqual(0x100u, cpu.ConfigurationAndControlRegister & 0x118u);
+            Assert.AreEqual(0x108u, cpu.ConfigurationAndControlRegisterNonSecure & 0x118u);
         }
+
         [Test]
         public void ShouldIgnoreNonSecureWritesToTheSecureOnlyCcrTrapBit()
         {
             var secondNvic = new NVIC(machine);
             var m55 = new CortexM("cortex-m55", machine, secondNvic, cpuId: 1, enableTrustZone: true);
             machine.SystemBus.Register(m55, new CPURegistrationPoint(1));
-            m55.ConfigurationAndControlRegister = 0x100200;
-            m55.ConfigurationAndControlRegisterNonSecure = 0x10;
-            Assert.AreEqual(0x100200u, m55.ConfigurationAndControlRegister & 0x100310u);
-            Assert.AreEqual(0x10u, m55.ConfigurationAndControlRegisterNonSecure & 0x100310u);
+            m55.ConfigurationAndControlRegister = 0x100010;
+            m55.ConfigurationAndControlRegisterNonSecure = 0x8;
+            Assert.AreEqual(0x100010u, m55.ConfigurationAndControlRegister & 0x100118u);
+            Assert.AreEqual(0x8u, m55.ConfigurationAndControlRegisterNonSecure & 0x100118u);
             m55.ConfigurationAndControlRegister = 0;
-            m55.ConfigurationAndControlRegisterNonSecure = 0x100010;
+            m55.ConfigurationAndControlRegisterNonSecure = 0x100008;
             Assert.AreEqual(0, m55.ConfigurationAndControlRegister & 0x100000u);
-            Assert.AreEqual(0x10u, m55.ConfigurationAndControlRegisterNonSecure & 0x100310u);
+            Assert.AreEqual(0x8u, m55.ConfigurationAndControlRegisterNonSecure & 0x100118u);
         }
 
         [Test]
