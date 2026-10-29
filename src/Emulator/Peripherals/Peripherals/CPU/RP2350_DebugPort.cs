@@ -244,23 +244,39 @@ namespace Antmicro.Renode.Peripherals.CPU
 
             private uint ReadMemory(uint address, int size)
             {
-                if(bus.WhatPeripheralIsAt(address, cpu, TransactionState) == null) throw new AccessFault();
-                switch(size)
+                try
                 {
-                case 0: return (uint)bus.ReadByte(address, cpu, TransactionState) << (int)((address & 3) * 8);
-                case 1: return (uint)bus.ReadWord(address, cpu, TransactionState) << (int)((address & 2) * 8);
-                default: return bus.ReadDoubleWord(address, cpu, TransactionState);
+                    if(bus.WhatPeripheralIsAt(address, cpu, TransactionState) == null) throw new AccessFault();
+                    switch(size)
+                    {
+                    case 0: return (uint)bus.ReadByte(address, cpu, TransactionState) << (int)((address & 3) * 8);
+                    case 1: return (uint)bus.ReadWord(address, cpu, TransactionState) << (int)((address & 2) * 8);
+                    default: return bus.ReadDoubleWord(address, cpu, TransactionState);
+                    }
+                }
+                catch(BusAccessException)
+                {
+                    // An AHB error response becomes the MEM-AP sticky fault.
+                    throw new AccessFault();
                 }
             }
 
             private void WriteMemory(uint address, int size, uint value)
             {
-                if(bus.WhatPeripheralIsAt(address, cpu, TransactionState) == null) throw new AccessFault();
-                switch(size)
+                try
                 {
-                case 0: bus.WriteByte(address, (byte)(value >> (int)((address & 3) * 8)), cpu, TransactionState); return;
-                case 1: bus.WriteWord(address, (ushort)(value >> (int)((address & 2) * 8)), cpu, TransactionState); return;
-                default: bus.WriteDoubleWord(address, value, cpu, TransactionState); return;
+                    if(bus.WhatPeripheralIsAt(address, cpu, TransactionState) == null) throw new AccessFault();
+                    switch(size)
+                    {
+                    case 0: bus.WriteByte(address, (byte)(value >> (int)((address & 3) * 8)), cpu, TransactionState); return;
+                    case 1: bus.WriteWord(address, (ushort)(value >> (int)((address & 2) * 8)), cpu, TransactionState); return;
+                    default: bus.WriteDoubleWord(address, value, cpu, TransactionState); return;
+                    }
+                }
+                catch(BusAccessException)
+                {
+                    // An AHB error response becomes the MEM-AP sticky fault.
+                    throw new AccessFault();
                 }
             }
 

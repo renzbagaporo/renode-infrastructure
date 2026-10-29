@@ -364,6 +364,26 @@ namespace Antmicro.Renode.PeripheralsTests
             }
         }
 
+        [TestCase(2, false)]
+        [TestCase(0, true)]
+        [TestCase(1, true)]
+        public void ShouldReturnMEMAPFaultForRejectedFPBTransactions(int size, bool privileged)
+        {
+            var fpb = new ARM_FlashPatchBreakpoint(machine, cpu);
+            machine.SystemBus.Register(fpb, new BusPointRegistration(0xe0002000, cpu: cpu));
+            var port = new TestDebugPort(machine, cpu, null);
+            port.PowerUp();
+            var csw = (privileged ? 0x0b800040u : 0x09800040u) | (uint)size;
+            port.WriteAP(0x2d00, csw);
+            port.WriteAP(0x2d04, 0xe0002000);
+            port.AssertReadFault(0x2d0c);
+            port.WriteAP(0x2d04, 0xe0002008);
+            port.WriteAP(0x2d0c, 0x101);
+            port.AssertStickyFaultAndClear();
+            Assert.AreEqual(0, fpb.ReadDoubleWord(8), "Rejected bus write changed the comparator");
+            Assert.AreEqual(0x10000080, fpb.ReadDoubleWord(0));
+        }
+
         [TestCase(false)]
         [TestCase(true)]
         public void ShouldDiscardQueuedRegisterWritesSupersededByResumeOrReset(bool resetCore)
@@ -411,6 +431,20 @@ namespace Antmicro.Renode.PeripheralsTests
                 CompleteWrite(false, 8, address & ~0xfu);
                 Assert.AreEqual(1, (int)BeginTransfer(true, false, (byte)(address & 0xc), out var _));
                 CompleteWrite(true, (byte)(address & 0xc), value);
+            }
+            public void AssertReadFault(uint address)
+            {
+                CompleteWrite(false, 8, address & ~0xfu);
+                Assert.AreEqual(4, (int)BeginTransfer(true, true, (byte)(address & 0xc), out var _));
+                AssertStickyFaultAndClear();
+            }
+            public void AssertStickyFaultAndClear()
+            {
+                Assert.AreEqual(1, (int)BeginTransfer(false, true, 4, out var control));
+                Assert.AreNotEqual(0, control & 0x20);
+                CompleteWrite(false, 0, 4);
+                Assert.AreEqual(1, (int)BeginTransfer(false, true, 4, out control));
+                Assert.AreEqual(0, control & 0x20);
             }
             public uint ReadAP(uint address)
             {
