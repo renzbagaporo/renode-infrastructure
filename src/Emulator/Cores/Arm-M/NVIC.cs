@@ -42,6 +42,7 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             currentSevOnPending = new SecurityBanked<bool>();
             basepri = new SecurityBanked<byte>();
             irqs = new ExceptionSimpleArray<IRQState>();
+            assertedExternalIRQs = new HashSet<int>();
             targetInterruptSecurityState = new InterruptTargetSecurityState[IRQCount];
             interruptEnabled = new Dictionary<SystemException, bool>();
             IRQ = new GPIO();
@@ -82,10 +83,16 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
         /// NOTE: RFKXX is not respected here. `tlib_nvic_find_pending_irq()`
         /// does not respect PRIMASK/BASEPRI/FAULTMASK.
         /// </remarks>
-        public int? FindPendingInterrupt()
+        public int? FindPendingInterrupt() => FindPendingInterrupt(sampleExternalLevels: true);
+
+        private int? FindPendingInterrupt(bool sampleExternalLevels)
         {
             lock(irqs)
             {
+                if(sampleExternalLevels)
+                {
+                    SampleExternalInterruptLevels();
+                }
                 var preemptNeeded = activeIRQs.Count != 0;
                 int? result = null;
 
@@ -155,14 +162,18 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             {
                 if(value)
                 {
+                    assertedExternalIRQs.Add(number);
                     irqs[number] |= IRQState.Running;
                     SetPending(number);
                 }
                 else
                 {
+                    assertedExternalIRQs.Remove(number);
                     irqs[number] &= ~IRQState.Running;
                 }
-                pendingInterrupt = FindPendingInterrupt();
+                // This input update already sampled its source. Other inputs
+                // may still be transitioning during a whole-machine reset.
+                pendingInterrupt = FindPendingInterrupt(sampleExternalLevels: false);
             }
             if(pendingInterrupt != null && value)
             {
@@ -831,32 +842,35 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
 
         public void Reset()
         {
-            debugResetStatus = true;
-            debugFaultStatus = CatchCoreReset ? 8u : 0;
-            RegisterCollection.Reset();
-            InitInterrupts();
-            for(var i = 0; i < priorities.Length; i++)
+            lock(irqs)
             {
-                priorities[i] = 0x00;
-            }
-            activeIRQs.Clear();
-            systick.NonSecureVal.Reset();
-            systick.SecureVal?.Reset();
+                debugResetStatus = true;
+                debugFaultStatus = CatchCoreReset ? 8u : 0;
+                RegisterCollection.Reset();
+                InitInterrupts();
+                for(var i = 0; i < priorities.Length; i++)
+                {
+                    priorities[i] = 0x00;
+                }
+                activeIRQs.Clear();
+                systick.NonSecureVal.Reset();
+                systick.SecureVal?.Reset();
 
-            IRQ.Unset();
-            SystemResetRequest.Unset();
-            InSleep.Unset();
-            InDeepSleep.Unset();
-            Lockup.Unset();
-            isLockedUp = false;
-            currentSevOnPending.Reset();
-            mpuControlRegister = 0;
-            HaltSystickOnDeepSleep = defaultHaltSystickOnDeepSleep;
-            canResetOnlyFromSecure = false;
-            deepSleepOnlyFromSecure = false;
-            binaryPointPosition.Reset();
-            basepri.Reset();
-            hardFaultForced = false;
+                IRQ.Unset();
+                SystemResetRequest.Unset();
+                InSleep.Unset();
+                InDeepSleep.Unset();
+                Lockup.Unset();
+                isLockedUp = false;
+                currentSevOnPending.Reset();
+                mpuControlRegister = 0;
+                HaltSystickOnDeepSleep = defaultHaltSystickOnDeepSleep;
+                canResetOnlyFromSecure = false;
+                deepSleepOnlyFromSecure = false;
+                binaryPointPosition.Reset();
+                basepri.Reset();
+                hardFaultForced = false;
+            }
         }
 
         [ConnectionRegion("NonSecure")]
@@ -2717,8 +2731,26 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
 
         private uint GetPending(int offset, bool isSecure)
         {
-            int startIndex = 16 + offset * 8;
-            return BitHelper.GetValueFromBitsArray(irqs.Skip(startIndex).Take(32).Select((irq, idx) => (isSecure || IsInterruptTargetNonSecure(startIndex + idx)) && ((irq & IRQState.Pending) != 0)));
+            lock(irqs)
+            {
+                SampleExternalInterruptLevels();
+                int startIndex = 16 + offset * 8;
+                return BitHelper.GetValueFromBitsArray(irqs.Skip(startIndex).Take(32).Select((irq, idx) => (isSecure || IsInterruptTargetNonSecure(startIndex + idx)) && ((irq & IRQState.Pending) != 0)));
+            }
+        }
+
+        private void SampleExternalInterruptLevels()
+        {
+            // External pins retain their levels across processor reset. Sample
+            // them when evaluating pending interrupts, after reset state clears.
+            foreach(var number in assertedExternalIRQs)
+            {
+                irqs[number] |= IRQState.Running;
+                if((irqs[number] & (IRQState.Pending | IRQState.Active)) == 0)
+                {
+                    SetPendingWithoutEscalation(number);
+                }
+            }
         }
 
         private uint GetActive(int offset, bool isSecure)
@@ -2813,6 +2845,7 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
         private readonly RegisterMapper mapper;
 
         private readonly ExceptionSimpleArray<IRQState> irqs;
+        private readonly HashSet<int> assertedExternalIRQs;
 
         // This is configurable through NVIC_ITNSx only for Hardware Interrupts (exception numbered 16 and above)
         // for configuring selected exceptions, look at AIRCR.BFHFNMINS
