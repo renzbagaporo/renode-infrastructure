@@ -432,6 +432,99 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.IsFalse(input.TryRead(out _));
         }
 
+        [Test]
+        public void ShouldInvalidateOldInputHandlesWhenAConnectionIsDisposed()
+        {
+            var oldInput = connection.ConnectEndpointRead(0);
+            connection.Dispose();
+            connection = usb.ConnectUSB();
+            dpram.WriteByte(0x100, 0x42);
+            dpram.WriteDoubleWord(0x80, 0x8401);
+            Assert.IsFalse(oldInput.TryRead(out _));
+            Assert.IsTrue(connection.ConnectEndpointRead(0).TryRead(out var packet));
+            Assert.That(packet, Is.EqualTo(new byte[] { 0x42 }));
+        }
+
+        [Test]
+        public void ShouldDetachOldPendingReadsBeforeAnotherConnectionUsesTheEndpoint()
+        {
+            var oldInput = connection.ConnectEndpointRead(0);
+            var oldNotifications = 0;
+            oldInput.NewPacket += () => oldNotifications++;
+            oldInput.ReadPacket(_ => { });
+            connection.Dispose();
+            connection = usb.ConnectUSB();
+            dpram.WriteByte(0x100, 0x42);
+            dpram.WriteDoubleWord(0x80, 0x8401);
+            Assert.AreEqual(0, oldNotifications);
+            Assert.IsTrue(connection.ConnectEndpointRead(0).TryRead(out var packet));
+            Assert.That(packet, Is.EqualTo(new byte[] { 0x42 }));
+        }
+
+        [Test]
+        public void ShouldIgnoreOldOutputHandlesAfterReconnect()
+        {
+            var oldOutput = connection.ConnectEndpointWrite(0);
+            connection.Dispose();
+            connection = usb.ConnectUSB();
+            dpram.WriteByte(0x100, 0x42);
+            dpram.WriteDoubleWord(0x84, 0x440);
+            usb.WriteDoubleWord(0x50, 1u << 19);
+            oldOutput.Write(new byte[] { 0xa5 });
+            Assert.That(dpram.ReadByte(0x100), Is.EqualTo(0x42));
+            Assert.That(dpram.ReadWord(0x84), Is.EqualTo(0x440));
+            Assert.That(usb.ReadDoubleWord(0x58), Is.Zero);
+            Assert.That(usb.ReadDoubleWord(0x8c), Is.Zero);
+        }
+
+        [Test]
+        public void ShouldIgnoreOldSetupHandlesAfterReconnect()
+        {
+            var oldSetup = connection.ConnectEndpointSetup(0);
+            connection.Dispose();
+            connection = usb.ConnectUSB();
+            usb.WriteDoubleWord(0x50, 1u << 19);
+            var before = dpram.ReadBytes(0, 8);
+            oldSetup.SetupPacketWrite(new SetupPacket { Request = 6, Count = 18 });
+            Assert.That(dpram.ReadBytes(0, 8), Is.EqualTo(before));
+            Assert.That(usb.ReadDoubleWord(0x8c), Is.Zero);
+        }
+
+        [Test]
+        public void ShouldCancelOnlyTheDisposedConnectionsHostPendingOutput()
+        {
+            using(var other = usb.ConnectUSB())
+            {
+                clocks.Set(125000000, 0);
+                connection.ConnectEndpointWrite(0).Write(new byte[] { 1 });
+                other.ConnectEndpointWrite(0).Write(new byte[] { 2 });
+                connection.Dispose();
+                dpram.WriteDoubleWord(0x84, 0x440);
+                clocks.Set(125000000, 48000000);
+                Assert.That(dpram.ReadByte(0x100), Is.EqualTo(2));
+                Assert.That(dpram.ReadWord(0x84), Is.EqualTo(0x8001));
+                dpram.WriteDoubleWord(0x84, 0x440);
+                Assert.That(dpram.ReadWord(0x84), Is.EqualTo(0x440));
+            }
+        }
+
+        [Test]
+        public void ShouldPreserveActiveInputSubscriptionsAcrossControllerReset()
+        {
+            var input = connection.ConnectEndpointRead(0);
+            var notifications = 0;
+            input.NewPacket += () => notifications++;
+            usb.ResetHeld = true;
+            usb.ResetHeld = false;
+            usb.WriteDoubleWord(0x40, 1);
+            usb.WriteDoubleWord(0x4c, 0x20010000);
+            dpram.WriteByte(0x100, 0x42);
+            dpram.WriteDoubleWord(0x80, 0x8401);
+            Assert.AreEqual(1, notifications);
+            Assert.IsTrue(input.TryRead(out var packet));
+            Assert.That(packet, Is.EqualTo(new byte[] { 0x42 }));
+        }
+
         private void AdvanceMicroseconds(ulong duration) => ((BaseClockSource)machine.ClockSource).Advance(TimeInterval.FromMicroseconds(duration));
 
         private sealed class ControlledClockSource : IRP2ClockSource

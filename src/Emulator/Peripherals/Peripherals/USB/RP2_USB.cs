@@ -462,7 +462,7 @@ namespace Antmicro.Renode.Peripherals.USB
             public readonly bool DoubleBuffered;
         }
 
-        private sealed class Endpoint : IUSBPipeSetup
+        private sealed class Endpoint
         {
             public Endpoint(RP2_USB parent, int number)
             {
@@ -509,7 +509,7 @@ namespace Antmicro.Renode.Peripherals.USB
                 }
             }
 
-            public void Write(byte[] data)
+            public void Write(byte[] data, Connection owner)
             {
                 try
                 {
@@ -527,7 +527,7 @@ namespace Antmicro.Renode.Peripherals.USB
                             var count = Math.Min(64, data.Length - offset);
                             var packet = new byte[count];
                             Array.Copy(data, offset, packet, 0, count);
-                            pendingWrites.Enqueue(packet);
+                            pendingWrites.Enqueue(new PendingWrite(owner, packet));
                             offset += count;
                         }
                         while(offset < data.Length);
@@ -553,7 +553,9 @@ namespace Antmicro.Renode.Peripherals.USB
                     {
                         while(pendingWrites.Count != 0 && parent.TryGetBuffer(number, false, out var buffer))
                         {
-                            var data = pendingWrites.Dequeue();
+                            var pending = pendingWrites.Dequeue();
+                            if(pending.Owner.Disposed) continue;
+                            var data = pending.Data;
                             var capacity = buffer.Control & BufferLengthMask;
                             if(data.Length > capacity)
                             {
@@ -577,13 +579,35 @@ namespace Antmicro.Renode.Peripherals.USB
                 }
             }
 
+            public void CancelPendingWrites(Connection owner)
+            {
+                var count = pendingWrites.Count;
+                for(var i = 0; i < count; i++)
+                {
+                    var pending = pendingWrites.Dequeue();
+                    if(pending.Owner != owner) pendingWrites.Enqueue(pending);
+                }
+            }
+
             public void PublishAvailable() => NewPacket?.Invoke();
 
             public event Action NewPacket;
 
             private readonly RP2_USB parent;
             private readonly int number;
-            private readonly Queue<byte[]> pendingWrites = new Queue<byte[]>();
+            private readonly Queue<PendingWrite> pendingWrites = new Queue<PendingWrite>();
+
+            private readonly struct PendingWrite
+            {
+                public PendingWrite(Connection owner, byte[] data)
+                {
+                    Owner = owner;
+                    Data = data;
+                }
+
+                public readonly Connection Owner;
+                public readonly byte[] Data;
+            }
             private bool processingBuffers;
         }
 
@@ -592,7 +616,10 @@ namespace Antmicro.Renode.Peripherals.USB
             public Connection(RP2_USB parent)
             {
                 this.parent = parent;
+                leases = new EndpointLease[EndpointCount];
             }
+
+            public bool Disposed => disposed;
 
             public IUSBPipeSetup ConnectEndpointSetup(byte endpoint) => GetEndpoint(endpoint);
 
@@ -611,6 +638,8 @@ namespace Antmicro.Renode.Peripherals.USB
                             return;
                         }
                         disposed = true;
+                        foreach(var lease in leases) lease?.Detach();
+                        foreach(var endpoint in parent.endpoints) endpoint.CancelPendingWrites(this);
                         parent.connectionCount--;
                         parent.UpdateConnection();
                     }
@@ -621,12 +650,117 @@ namespace Antmicro.Renode.Peripherals.USB
                 }
             }
 
-            private Endpoint GetEndpoint(byte endpoint)
+            private EndpointLease GetEndpoint(byte endpoint)
             {
-                return !disposed && (endpoint & 0x7f) < EndpointCount ? parent.endpoints[endpoint & 0x7f] : null;
+                lock(parent.dpram)
+                {
+                    var number = endpoint & 0x7f;
+                    if(disposed || number >= EndpointCount) return null;
+                    if(leases[number] == null) leases[number] = new EndpointLease(this, parent.endpoints[number]);
+                    return leases[number];
+                }
+            }
+
+            // Handles and pending host transfers belong to this attachment.
+            // SIE/bus resets retain its subscriptions; disposal invalidates them.
+            private sealed class EndpointLease : IUSBPipeSetup
+            {
+                public EndpointLease(Connection owner, Endpoint endpoint)
+                {
+                    this.owner = owner;
+                    this.endpoint = endpoint;
+                    endpoint.NewPacket += PublishAvailable;
+                }
+
+                public bool TryRead(out byte[] data)
+                {
+                    try
+                    {
+                        lock(owner.parent.dpram)
+                        {
+                            if(owner.disposed)
+                            {
+                                data = Array.Empty<byte>();
+                                return false;
+                            }
+                            return endpoint.TryRead(out data);
+                        }
+                    }
+                    finally
+                    {
+                        owner.parent.PublishPending();
+                    }
+                }
+
+                public void Write(byte[] data)
+                {
+                    try
+                    {
+                        lock(owner.parent.dpram)
+                        {
+                            if(!owner.disposed) endpoint.Write(data, owner);
+                        }
+                    }
+                    finally
+                    {
+                        owner.parent.PublishPending();
+                    }
+                }
+
+                public void SetupPacketWrite(SetupPacket packet)
+                {
+                    try
+                    {
+                        lock(owner.parent.dpram)
+                        {
+                            if(!owner.disposed) endpoint.SetupPacketWrite(packet);
+                        }
+                    }
+                    finally
+                    {
+                        owner.parent.PublishPending();
+                    }
+                }
+
+                public event Action NewPacket
+                {
+                    add
+                    {
+                        lock(owner.parent.dpram)
+                        {
+                            if(!owner.disposed) handlers += value;
+                        }
+                    }
+                    remove
+                    {
+                        lock(owner.parent.dpram) handlers -= value;
+                    }
+                }
+
+                public void Detach()
+                {
+                    endpoint.NewPacket -= PublishAvailable;
+                    handlers = null;
+                }
+
+                private void PublishAvailable()
+                {
+                    Action callback;
+                    lock(owner.parent.dpram)
+                    {
+                        if(owner.disposed) return;
+                        callback = handlers;
+                    }
+                    callback?.Invoke();
+                }
+
+                private readonly Connection owner;
+                private readonly Endpoint endpoint;
+                private Action handlers;
             }
 
             private readonly RP2_USB parent;
+            private readonly EndpointLease[] leases;
             private bool disposed;
         }
 
