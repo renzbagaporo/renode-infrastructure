@@ -10,11 +10,17 @@ namespace Antmicro.Renode.Peripherals.CPU
     // debug component implemented by NVIC's memory-mapped debug registers.
     public class CortexM_ROMTable : IDoubleWordPeripheral, IKnownSize
     {
+        public CortexM_ROMTable(ARM_FlashPatchBreakpoint fpb = null)
+        {
+            this.fpb = fpb;
+        }
+
         public uint ReadDoubleWord(long offset)
         {
             switch(offset)
             {
             case 0: return 0xfff0f003; // e000e000 - e00ff000, present, 32-bit entry
+            case 4: return fpb != null ? 0xfff03003u : 0; // e0002000, FPB
             case 0xfcc: return 1;
             case 0xfd0: return 4;
             case 0xfe0: return 0xc9;
@@ -31,5 +37,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         public void WriteDoubleWord(long offset, uint value) { }
         public void Reset() { }
         public long Size => 0x1000;
+
+        private readonly ARM_FlashPatchBreakpoint fpb;
     }
 }
