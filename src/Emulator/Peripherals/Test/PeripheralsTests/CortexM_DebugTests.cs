@@ -405,6 +405,88 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.AreEqual(0, nvic.ReadDoubleWord(0xdf0) & 0x10000);
         }
 
+        [TestCase(0x20000100u, false)]
+        [TestCase(0x20000101u, false)]
+        [TestCase(0x20000102u, false)]
+        [TestCase(0x20000103u, false)]
+        [TestCase(0x20000100u, true)]
+        [TestCase(0x20000101u, true)]
+        [TestCase(0x20000102u, true)]
+        [TestCase(0x20000103u, true)]
+        public void ShouldTransferAnAlignedDebugReturnAddressWithoutChangingThumbState(uint address, bool thumb)
+        {
+            nvic.WriteDoubleWord(0xdf0, 0xa05f0003);
+            WaitForHalt();
+            WriteDebugRegister(16, thumb ? 0x01000000u : 0u);
+            WriteDebugRegister(15, address);
+            Assert.AreEqual(address & ~1u, (uint)cpu.PC);
+            Assert.AreEqual(thumb ? 0x01000000u : 0u, (uint)cpu.XProgramStatusRegister & 0x01000000u);
+            nvic.WriteDoubleWord(0xdf4, 15);
+            WaitForRegisterTransfer();
+            Assert.AreEqual(address & ~1u, nvic.ReadDoubleWord(0xdf8));
+        }
+
+        [Test]
+        public void ShouldLaunchDebugCodeBeforeTheFirstNativeInstructionWithoutReloadingResetVectors()
+        {
+            var ram = new MappedMemory(machine, 0x4000);
+            machine.SystemBus.Register(ram, new BusPointRegistration(0x20000000));
+            ram.WriteDoubleWord(0, 0x20003000);
+            ram.WriteDoubleWord(4, 0x20000101);
+            ram.WriteWord(0x100, 0xe7fe); // Reset vector: b .
+            ram.WriteWord(0x202, 0x3001); // Debug entry: adds r0, #1
+            ram.WriteWord(0x204, 0xbe00); // bkpt #0
+            cpu.InitVectorTableOffset = 0x20000000;
+            nvic.WriteDoubleWord(0xdf0, 0xa05f0003);
+            WaitForHalt();
+            WriteDebugRegister(0, 7);
+            WriteDebugRegister(13, 0x20002000);
+            WriteDebugRegister(15, 0x20000203);
+            WriteDebugRegister(16, 0x01000000);
+            nvic.WriteDoubleWord(0xdf0, 0xa05f0001);
+            WaitForHalt(false);
+            EmulationManager.Instance.CurrentEmulation.RunFor(TimeInterval.FromMicroseconds(100));
+            EmulationManager.Instance.CurrentEmulation.RunFor(TimeInterval.FromMicroseconds(100));
+            WaitForHalt();
+            Assert.AreEqual(8, (uint)cpu.GetRegister(0));
+            Assert.AreEqual(0x20000204u, (uint)cpu.PC);
+            Assert.AreEqual(0x20002000u, (uint)cpu.GetRegister(13));
+        }
+
+        [Test]
+        public void ShouldRaiseInvalidStateAfterAThumbClearDebugReturnAddressWrite()
+        {
+            var ram = new MappedMemory(machine, 0x4000);
+            machine.SystemBus.Register(ram, new BusPointRegistration(0x20000000));
+            ram.WriteDoubleWord(0, 0x20003000);
+            ram.WriteDoubleWord(4, 0x20000101);
+            ram.WriteDoubleWord(0xc, 0x20000301);
+            ram.WriteWord(0x100, 0xe7fe);
+            ram.WriteWord(0x200, 0x2001); // Must not execute with EPSR.T clear.
+            ram.WriteWord(0x300, 0xbe00);
+            cpu.InitVectorTableOffset = 0x20000000;
+            nvic.WriteDoubleWord(0xdf0, 0xa05f0003);
+            WaitForHalt();
+            WriteDebugRegister(13, 0x20002000);
+            WriteDebugRegister(16, 0);
+            WriteDebugRegister(15, 0x20000201);
+            nvic.WriteDoubleWord(0xdf0, 0xa05f0001);
+            WaitForHalt(false);
+            EmulationManager.Instance.CurrentEmulation.RunFor(TimeInterval.FromMicroseconds(100));
+            EmulationManager.Instance.CurrentEmulation.RunFor(TimeInterval.FromMicroseconds(100));
+            var faultStatus = nvic.ReadDoubleWord(0xd28);
+            Assert.AreEqual(0x20000u, faultStatus & 0x20000u,
+                $"PC={cpu.PC}, XPSR={cpu.XProgramStatusRegister}, VTOR={cpu.VectorTableOffset:X}, CFSR={faultStatus:X}, Lockup={nvic.Lockup.IsSet}, Executed={cpu.ExecutedInstructions}, State={cpu.EmulationState}, Clocked={cpu.Clocked}, DHCSR={nvic.ReadDoubleWord(0xdf0):X}");
+            Assert.AreEqual(0, (uint)cpu.GetRegister(0));
+        }
+
+        private void WriteDebugRegister(int selector, uint value)
+        {
+            nvic.WriteDoubleWord(0xdf8, value);
+            nvic.WriteDoubleWord(0xdf4, 0x10000u | (uint)selector);
+            WaitForRegisterTransfer();
+        }
+
         private void WaitForHalt(bool halted = true)
         {
             Assert.IsTrue(SpinWait.SpinUntil(() =>

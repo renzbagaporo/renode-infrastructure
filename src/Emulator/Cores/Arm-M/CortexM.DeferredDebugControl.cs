@@ -122,6 +122,17 @@ namespace Antmicro.Renode.Peripherals.CPU
                         | ((uint)GetRegister((int)CortexMRegisters.FAULTMASK) << 16)
                         | ((uint)GetRegister((int)CortexMRegisters.Control) << 24);
                 }
+                else if(transfer.Selector == 15)
+                {
+                    // DebugReturnAddress bit 0 is RAZ/SBZ and independent of
+                    // EPSR.T. The normal PC property also selects Thumb state.
+                    if(transfer.Write)
+                    {
+                        SetRegister((int)CortexMRegisters.PC, value & ~1u);
+                        pcNotInitialized = false;
+                    }
+                    else value = (uint)PC & ~1u;
+                }
                 else
                 {
                     var register = NVIC.DebugRegisterIndex(transfer.Selector);
