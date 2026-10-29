@@ -12,6 +12,11 @@ namespace Antmicro.Renode.Peripherals.CPU
         public override ExecutionResult ExecuteInstructions(ulong numberOfInstructionsToExecute, out ulong numberOfExecutedInstructions)
         {
             ApplyFlashPatchBreakpoints();
+            if(IsHeldInReset)
+            {
+                numberOfExecutedInstructions = 0;
+                return ExecutionResult.Interrupted;
+            }
             if(nvic.ExternalDebugHaltRequested)
             {
                 RequestExternalDebugControl();

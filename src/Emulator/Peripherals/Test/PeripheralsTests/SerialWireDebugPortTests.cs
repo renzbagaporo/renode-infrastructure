@@ -365,6 +365,42 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.AreEqual(0x4c013477, Read(0xa5));
         }
 
+        [Test]
+        public void ShouldPublishOnlyRealResetReleaseEdgesOutsideProtocolMonitor()
+        {
+            target.OnRelease = () =>
+            {
+                Assert.IsFalse(target.PhysicalResetAsserted);
+                Assert.IsTrue(Task.Run(() => target.GetOutputState(1, out var _, out var __))
+                    .Wait(TimeSpan.FromSeconds(5)), "release callback owns the protocol monitor");
+            };
+            target.OnGPIO(2, false);
+            target.Reset();
+            target.OnGPIO(2, false);
+            Assert.IsTrue(target.PhysicalResetAsserted);
+            Assert.AreEqual(1, target.TargetResetCount);
+            Assert.AreEqual(0, target.TargetReleaseCount);
+            target.OnGPIO(2, true);
+            target.OnGPIO(2, true);
+            Assert.AreEqual(1, target.TargetReleaseCount);
+        }
+
+        [Test]
+        public void ShouldKeepLatestPhysicalLevelWhenReleaseCallbackReassertsReset()
+        {
+            target.OnGPIO(2, false);
+            target.OnRelease = () => target.OnGPIO(2, false);
+            target.OnGPIO(2, true);
+            Assert.IsTrue(target.PhysicalResetAsserted);
+            Assert.AreEqual(2, target.TargetResetCount);
+            Assert.AreEqual(1, target.TargetReleaseCount);
+            Assert.IsFalse(IsDriving);
+            target.OnRelease = null;
+            target.OnGPIO(2, true);
+            Wake();
+            Assert.AreEqual(0x4c013477, Read(0xa5));
+        }
+
         private void RawSend(uint value, int count)
         {
             for(var i = 0; i < count; i++) RawCycle(((value >> i) & 1) != 0);
@@ -468,6 +504,9 @@ namespace Antmicro.Renode.PeripheralsTests
             public int RequestCount, WriteCount, ParityErrors, Ack = 1;
             public int BackendOverlap;
             public int TargetResetCount;
+            public int TargetReleaseCount;
+            public bool PhysicalResetAsserted => ResetPinAsserted;
+            public Action OnRelease;
             public Action OnBegin;
             public uint LastWrite;
             protected override Acknowledgement BeginTransfer(bool ap, bool read, byte address, out uint value)
@@ -499,6 +538,11 @@ namespace Antmicro.Renode.PeripheralsTests
             }
             protected override void WriteParityError() { ParityErrors++; }
             protected override void ResetTarget() { Interlocked.Increment(ref TargetResetCount); }
+            protected override void ReleaseTarget()
+            {
+                Interlocked.Increment(ref TargetReleaseCount);
+                OnRelease?.Invoke();
+            }
             protected override bool SelectTarget(uint value) { return value == 0x01002927; }
             private int activeBackend;
         }

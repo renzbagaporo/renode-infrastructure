@@ -53,6 +53,7 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         public void OnGPIO(int number, bool value)
         {
+            var releaseTarget = false;
             lock(sync)
             {
                 switch(number)
@@ -68,6 +69,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                     else if(value && resetAsserted)
                     {
                         resetAsserted = false;
+                        releaseTarget = true;
                         clock = sampledClock;
                         data = sampledData;
                     }
@@ -76,6 +78,9 @@ namespace Antmicro.Renode.Peripherals.CPU
                 }
                 if(number != 2 && !resetAsserted) pending.Enqueue(new Input(generation, number, value));
             }
+            // Physical release is independent of accepted protocol work and
+            // must never invoke a target callback while owning the monitor.
+            if(releaseTarget) ReleaseTarget();
             ProcessPending();
         }
 
@@ -191,6 +196,11 @@ namespace Antmicro.Renode.Peripherals.CPU
         protected virtual void ResetBackend() { }
         protected virtual void LineReset() { }
         protected virtual void ResetTarget() { }
+        protected virtual void ReleaseTarget() { }
+        protected bool ResetPinAsserted
+        {
+            get { lock(sync) return resetAsserted; }
+        }
         protected virtual bool SelectTarget(uint value) { return true; }
 
         private Action RisingEdge(ulong requestGeneration)

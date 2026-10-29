@@ -15,6 +15,10 @@ namespace Antmicro.Renode.Peripherals.CPU
         public RP2350_DebugPort(IMachine machine, CortexM cpu0, CortexM cpu1)
         {
             this.machine = machine;
+            cores = new[] { cpu0, cpu1 };
+            // MachineReset runs after peripheral reset while PEs are paused.
+            // Reapply the physical level before the machine can resume them.
+            machine.MachineReset += _ => ApplyRunHold();
             aps = new[] { new MemoryAccessPort(machine.SystemBus, cpu0), new MemoryAccessPort(machine.SystemBus, cpu1) };
             if(cpu0 != null) cpu0.EnableMemoryMappedDebug = true;
             if(cpu1 != null) cpu1.EnableMemoryMappedDebug = true;
@@ -36,6 +40,19 @@ namespace Antmicro.Renode.Peripherals.CPU
         protected override void ResetTarget()
         {
             machine.RequestReset();
+        }
+
+        protected override void ReleaseTarget()
+        {
+            // A release can overtake a queued reset, or be followed by another
+            // assertion. Reconcile the current physical level at the boundary.
+            machine.LocalTimeSource.ExecuteInNearestSyncedState(_ => ApplyRunHold());
+        }
+
+        private void ApplyRunHold()
+        {
+            var asserted = ResetPinAsserted;
+            foreach(var core in cores) core?.SetExternalResetHold(asserted);
         }
 
         protected override Acknowledgement BeginTransfer(bool accessPort, bool read, byte address, out uint value)
@@ -295,6 +312,7 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         private sealed class AccessFault : Exception { }
         private readonly IMachine machine;
+        private readonly CortexM[] cores;
         private readonly MemoryAccessPort[] aps;
         private uint select, select1, control, readBuffer, rpControl;
     }

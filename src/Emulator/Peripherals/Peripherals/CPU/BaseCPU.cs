@@ -292,7 +292,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
         }
 
-        public override bool HasAnyHaltingCondition => base.HasAnyHaltingCondition || !Clocked || HaltedByDebugger;
+        public override bool HasAnyHaltingCondition => base.HasAnyHaltingCondition || !Clocked || HaltedByDebugger || IsHeldInReset;
 
         public bool OnPossessedThread
         {
@@ -445,12 +445,16 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
         }
 
+        // Separate reset inputs must remain effective when other halt sources
+        // change and when Resume is called as part of a machine reset.
+        protected virtual bool IsHeldInReset => false;
+
         protected virtual void UpdateRequestedHaltedState()
         {
             lock(pauseLock)
             {
                 this.Trace();
-                var value = isHalted || !clocked || haltedByDebugger;
+                var value = isHalted || !clocked || haltedByDebugger || IsHeldInReset;
                 if(isHaltedRequested == value)
                 {
                     return;
