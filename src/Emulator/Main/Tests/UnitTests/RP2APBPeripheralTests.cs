@@ -87,6 +87,19 @@ namespace Antmicro.Renode.UnitTests
         }
 
         [Test]
+        public void ShouldNotifyResetHoldTransitionsAfterUpdatingState()
+        {
+            var peripheral = new TestPeripheral();
+            peripheral.ResetHeld = true;
+            peripheral.ResetHeld = true;
+            Assert.AreEqual(1, peripheral.ResetChanges);
+            Assert.IsTrue(peripheral.LastResetState);
+            peripheral.ResetHeld = false;
+            Assert.AreEqual(2, peripheral.ResetChanges);
+            Assert.IsFalse(peripheral.LastResetState);
+        }
+
+        [Test]
         public void ShouldHoldRegistersInResetUntilReleased()
         {
             var peripheral = new TestPeripheral();
@@ -128,6 +141,16 @@ namespace Antmicro.Renode.UnitTests
             public uint Value { get; private set; }
 
             public int ReadCount { get; private set; }
+
+            public int ResetChanges { get; private set; }
+
+            public bool LastResetState { get; private set; }
+
+            protected override void OnResetHeldChanged()
+            {
+                ResetChanges++;
+                LastResetState = ResetHeld;
+            }
 
             protected override uint ReadRegister(long offset)
             {

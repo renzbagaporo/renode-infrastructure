@@ -54,11 +54,16 @@ namespace Antmicro.Renode.Peripherals
             get => resetHeld;
             set
             {
-                if(value && !resetHeld)
+                if(value == resetHeld)
+                {
+                    return;
+                }
+                if(value)
                 {
                     Reset();
                 }
                 resetHeld = value;
+                OnResetHeldChanged();
             }
         }
 
@@ -80,6 +85,10 @@ namespace Antmicro.Renode.Peripherals
             default:
                 return (previous & ~writableMask) | (value & writableMask);
             }
+        }
+
+        protected virtual void OnResetHeldChanged()
+        {
         }
 
         protected abstract uint ReadRegister(long offset);
