@@ -95,9 +95,15 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
                 }
                 var preemptNeeded = activeIRQs.Count != 0;
                 int? result = null;
+                var maskDebugInterrupts = ExternalDebugMaskInterrupts;
 
                 foreach(int i in pendingIRQs)
                 {
+                    var exceptionNumber = i & ~BankedExcpSecureBit;
+                    if(maskDebugInterrupts && (exceptionNumber >= 16 || exceptionNumber == (int)SystemException.PendSV || exceptionNumber == (int)SystemException.SysTick))
+                    {
+                        continue;
+                    }
                     if(isLockedUp && i != (int)SystemException.NMI)
                     {
                         continue;

@@ -19,6 +19,7 @@ namespace Antmicro.Renode.PeripheralsTests
         [SetUp]
         public void SetUp()
         {
+            EmulationManager.Instance.Clear();
             machine = new Machine(createLocalTimeSource: true);
             EmulationManager.Instance.CurrentEmulation.AddMachine(machine, "debug_test");
             nvic = new NVIC(machine);
@@ -47,6 +48,19 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.IsFalse(cpu.HaltedByDebugger);
             Assert.AreNotEqual(0, nvic.ReadDoubleWord(0xdf0) & 0x4000000);
             Assert.AreEqual(0, nvic.ReadDoubleWord(0xdf0) & 0x4000000);
+        }
+
+        [Test]
+        public void ShouldKeepMemoryMappedDebugExecutionControlOptIn()
+        {
+            cpu.EnableMemoryMappedDebug = false;
+            cpu.SetRegister(0, 0x12345678);
+            nvic.WriteDoubleWord(0xdf0, 0xa05f0003);
+            nvic.WriteDoubleWord(0xdf8, 0xabcdef00);
+            nvic.WriteDoubleWord(0xdf4, 0x10000);
+            Assert.IsFalse(cpu.HaltedByDebugger);
+            Assert.IsFalse(cpu.ExternalDebugEnabled);
+            Assert.AreEqual(0x12345678, (uint)cpu.GetRegister(0));
         }
 
         [TestCase(0)]
@@ -145,6 +159,72 @@ namespace Antmicro.Renode.PeripheralsTests
         }
 
         [Test]
+        public void ShouldRejectCompletionOfAStepSupersededByANewerDebugRequest()
+        {
+            nvic.WriteDoubleWord(0xdf0, 0xa05f000d);
+            Assert.IsTrue(nvic.TryGetExternalDebugStepRequest(out var oldGeneration));
+            Assert.IsTrue(nvic.ExternalDebugMaskInterrupts);
+            nvic.WriteDoubleWord(0xdf0, 0xa05f0001);
+            Assert.IsFalse(nvic.ReportExternalDebugStep(oldGeneration));
+            Assert.IsFalse(nvic.ExternalDebugHaltRequested);
+            nvic.WriteDoubleWord(0xdf0, 0xa05f000d);
+            Assert.IsTrue(nvic.TryGetExternalDebugStepRequest(out var generation));
+            Assert.AreNotEqual(oldGeneration, generation);
+            Assert.IsFalse(nvic.ReportExternalDebugStep(oldGeneration));
+            Assert.IsTrue(nvic.ExternalDebugStepRequested);
+            Assert.IsTrue(nvic.ReportExternalDebugStep(generation));
+            Assert.IsTrue(nvic.ExternalDebugHaltRequested);
+            Assert.IsFalse(nvic.ExternalDebugStepRequested);
+            Assert.AreEqual(1, nvic.ReadDoubleWord(0xd30));
+        }
+
+        [Test]
+        public void ShouldLetABreakpointSupersedeAPendingStepCompletion()
+        {
+            nvic.WriteDoubleWord(0xdf0, 0xa05f000d);
+            Assert.IsTrue(nvic.TryGetExternalDebugStepRequest(out var generation));
+            nvic.ReportExternalDebugBreakpoint();
+            Assert.IsFalse(nvic.ReportExternalDebugStep(generation));
+            Assert.AreEqual(2, nvic.ReadDoubleWord(0xd30));
+        }
+
+        [TestCase(26, true)]
+        [TestCase(26, false)]
+        [TestCase(28, true)]
+        [TestCase(28, false)]
+        public void ShouldMaskBothSecurityBanksOfSysTickAndPendSVWhileDebugMaskIsSet(int pendingBit, bool secure)
+        {
+            nvic.WriteDoubleWord(0xd04, 1u << pendingBit, secure);
+            Assert.IsNotNull(nvic.FindPendingInterrupt());
+            nvic.WriteDoubleWord(0xdf0, 0xa05f000b);
+            Assert.IsNull(nvic.FindPendingInterrupt());
+            nvic.WriteDoubleWord(0xdf0, 0xa05f0003);
+            Assert.IsNotNull(nvic.FindPendingInterrupt());
+        }
+
+        [Test]
+        public void ShouldMaskExternalIRQsWithoutClearingTheirPendingState()
+        {
+            nvic.WriteDoubleWord(0x100, 1, true);
+            nvic.OnGPIO(0, true);
+            Assert.AreEqual(16, nvic.FindPendingInterrupt());
+            nvic.WriteDoubleWord(0xdf0, 0xa05f000b);
+            Assert.IsNull(nvic.FindPendingInterrupt());
+            Assert.AreEqual(1, nvic.ReadDoubleWord(0x200, true) & 1);
+            nvic.WriteDoubleWord(0xdf0, 0xa05f0003);
+            Assert.AreEqual(16, nvic.FindPendingInterrupt());
+        }
+
+        [TestCase(2)]
+        [TestCase(3)]
+        public void ShouldRetainNMIAndHardFaultWhileDebugMaskIsSet(int exception)
+        {
+            nvic.WriteDoubleWord(0xdf0, 0xa05f000b);
+            nvic.SetPendingIRQ(exception);
+            Assert.AreEqual(exception, nvic.FindPendingInterrupt());
+        }
+
+        [Test]
         public void ShouldSelectTheRequestedCoreThroughItsActualMEMAP()
         {
             var nvic1 = new NVIC(machine);
@@ -188,10 +268,26 @@ namespace Antmicro.Renode.PeripheralsTests
         public void ShouldHaltAndResumeFromAnotherMachinesClockCallback()
         {
             var emulation = EmulationManager.Instance.CurrentEmulation;
+            var previousQuantum = emulation.MasterTimeSource.Quantum;
+            emulation.MasterTimeSource.Quantum = TimeInterval.FromMicroseconds(1);
+            machine.LocalTimeSource.Quantum = TimeInterval.FromMicroseconds(1);
             var probe = new Machine(createLocalTimeSource: true);
+            probe.LocalTimeSource.Quantum = TimeInterval.FromMicroseconds(1);
             emulation.AddMachine(probe, "probe_test");
             try
             {
+                var probeNvic = new NVIC(probe);
+                var probeCpu = new CortexM("cortex-m0+", probe, probeNvic);
+                probe.SystemBus.Register(probeCpu, new CPURegistrationPoint(0));
+                probe.SetLocalName(probeCpu, "probe_cpu");
+                probe.SystemBus.Register(probeNvic, new BusPointRegistration(0xe000e000, cpu: probeCpu));
+                var probeRam = new MappedMemory(probe, 0x2000);
+                probe.SystemBus.Register(probeRam, new BusPointRegistration(0x20000000));
+                probeRam.WriteDoubleWord(0, 0x20001000);
+                probeRam.WriteDoubleWord(4, 0x20000101);
+                probeRam.WriteWord(0x100, 0xe7fe); // b .
+                probeCpu.InitVectorTableOffset = 0x20000000;
+                probeCpu.Reset();
                 var ram = new MappedMemory(machine, 0x2000);
                 machine.SystemBus.Register(ram, new BusPointRegistration(0x20000000));
                 ram.WriteDoubleWord(0, 0x20001000);
@@ -203,21 +299,36 @@ namespace Antmicro.Renode.PeripheralsTests
                 nvic.WriteDoubleWord(0xdf0, 0xa05f0001);
                 emulation.RunFor(TimeInterval.FromMicroseconds(100));
                 Assert.Greater((uint)cpu.GetRegister(0), 0, "CPU must execute the RAM loop before the foreign halt callback");
-                probe.ScheduleAction(TimeInterval.FromMicroseconds(5), _ => nvic.WriteDoubleWord(0xdf0, 0xa05f0003), "halt_target");
+                var sawHalt = false;
+                var sawResume = false;
+                uint haltedCount = 0;
+                probe.ScheduleAction(TimeInterval.FromMicroseconds(5), _ =>
+                {
+                    nvic.WriteDoubleWord(0xdf0, 0xa05f0003);
+                    TestContext.WriteLine($"HALT master={emulation.MasterTimeSource.ElapsedVirtualTime}, target={machine.ElapsedVirtualTime}, probe={probe.ElapsedVirtualTime}, handle={cpu.TimeHandle.Enabled}/{cpu.TimeHandle.DeferredEnabled}, instructions={cpu.ExecutedInstructions}");
+                    sawHalt = cpu.HaltedByDebugger && (nvic.ReadDoubleWord(0xdf0) & 0x20000) != 0;
+                    haltedCount = (uint)cpu.GetRegister(0);
+                    probe.ScheduleAction(TimeInterval.FromMicroseconds(5), __ =>
+                    {
+                        nvic.WriteDoubleWord(0xdf0, 0xa05f0001);
+                        TestContext.WriteLine($"RESUME master={emulation.MasterTimeSource.ElapsedVirtualTime}, target={machine.ElapsedVirtualTime}, probe={probe.ElapsedVirtualTime}, handle={cpu.TimeHandle.Enabled}/{cpu.TimeHandle.DeferredEnabled}, instructions={cpu.ExecutedInstructions}");
+                        sawResume = !cpu.HaltedByDebugger;
+                    }, "resume_target");
+                }, "halt_target");
                 emulation.RunFor(TimeInterval.FromMicroseconds(100));
-                Assert.IsTrue(cpu.HaltedByDebugger);
-                var haltedCount = (uint)cpu.GetRegister(0);
-                Assert.Greater(haltedCount, 0);
-                Assert.AreNotEqual(0, nvic.ReadDoubleWord(0xdf0) & 0x20000);
-                probe.ScheduleAction(TimeInterval.FromMicroseconds(5), _ => nvic.WriteDoubleWord(0xdf0, 0xa05f0001), "resume_target");
-                emulation.RunFor(TimeInterval.FromMicroseconds(100));
+                Assert.IsTrue(sawHalt);
+                Assert.IsTrue(sawResume);
                 Assert.IsFalse(cpu.HaltedByDebugger);
-                // The foreign timer can fire after the target has consumed its
-                // current grant. Advance another grant to observe resumed code.
-                emulation.RunFor(TimeInterval.FromMicroseconds(100));
-                Assert.Greater((uint)cpu.GetRegister(0), haltedCount);
+                Assert.Greater(probeCpu.ExecutedInstructions, 0);
+                Assert.Greater(haltedCount, 0);
+                Assert.Greater((uint)cpu.GetRegister(0), haltedCount,
+                    $"PC={cpu.PC}, executed={cpu.ExecutedInstructions}, state={cpu.EmulationState}, halted={cpu.IsHalted}, debugger={cpu.HaltedByDebugger}, clocked={cpu.Clocked}, handle={cpu.TimeHandle.Enabled}");
             }
-            finally { emulation.RemoveMachine(probe); }
+            finally
+            {
+                emulation.RemoveMachine(probe);
+                emulation.MasterTimeSource.Quantum = previousQuantum;
+            }
         }
 
         private Machine machine;
