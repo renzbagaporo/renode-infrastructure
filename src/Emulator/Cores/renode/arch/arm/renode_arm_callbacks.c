@@ -19,6 +19,7 @@ EXTERNAL_AS(int32_t, SetPendingVectorFault, tlib_nvic_set_pending_vector_fault, 
 EXTERNAL_AS(uint32_t, GetFpccrReadyBits, tlib_nvic_get_fpccr_ready_bits, int32_t, int32_t)
 EXTERNAL_AS(int32_t, SetPendingLazyFpFault, tlib_nvic_set_pending_lazy_fp_fault, int32_t, uint32_t)
 EXTERNAL_AS(void, OnLockupStateChange, tlib_on_lockup_state_change, int32_t)
+EXTERNAL_AS(uint32_t, TryHaltOnDebugBreakpoint, tlib_try_halt_on_debug_breakpoint)
 EXTERNAL_AS(int32_t, FindPendingIRQ, tlib_nvic_find_pending_irq)
 EXTERNAL_AS(void, OnBASEPRIWrite, tlib_nvic_write_basepri, int32_t, uint32_t)
 EXTERNAL_AS(int32_t, PendingMaskedIRQ, tlib_nvic_get_pending_masked_irq)
