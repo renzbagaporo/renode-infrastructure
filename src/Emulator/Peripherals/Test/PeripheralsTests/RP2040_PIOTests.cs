@@ -149,6 +149,7 @@ namespace Antmicro.Renode.PeripheralsTests
             }
             pio.WriteDoubleWord(0xd0, 0xc0000 | (8u << 20) | (1u << 16));
             gpio.OnGPIO(0, true);
+            pio.WriteDoubleWord(0x38, 1); // explicitly bypass the input synchronizer
             Force(0, 0x4008); // in pins, 8
             Assert.AreNotEqual(0u, pio.ReadDoubleWord(0xcc) & 0x80000000);
             gpio.OnGPIO(0, false);
@@ -253,6 +254,7 @@ namespace Antmicro.Renode.PeripheralsTests
             pio.WriteDoubleWord(0x10, 42);
             Force(0, 0x2007); // wait 0 gpio7 succeeds
             gpio.OnGPIO(7, true);
+            pio.WriteDoubleWord(0x38, 1u << 7);
             Force(0, 0x2007); // now stalls
             Assert.AreNotEqual(0u, pio.ReadDoubleWord(0xcc) & 0x80000000);
             pio.WriteDoubleWord(0x2000, 1u << 4); // SM_RESTART strobe
@@ -283,6 +285,276 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.AreEqual(0, changes);
             Assert.AreEqual(0u, pio.ReadDoubleWord(0));
             Assert.AreEqual(0u, pio.ReadDoubleWord(0x40));
+        }
+
+        [TestCase(false)]
+        [TestCase(true)]
+        public void ShouldExecuteMetalclawSPIStreamAndCSMonitor(bool lead)
+        {
+            const int mosi = 8, miso = 9, sck = 10, cs = 11;
+            // The generated words match encode_program in spi_target.c.
+            LoadMetalclawSPI(sck, lead);
+            gpio.WriteDoubleWord(miso * 8 + 4, 6);
+            gpio.OnGPIO(cs, true);
+            gpio.OnGPIO(sck, false);
+            Advance(2); // let the CS input synchronizer settle before enabling
+            pio.WriteDoubleWord(0xdc, (1u << 26) | (1u << 20) | (mosi << 15) | (miso << 5) | miso);
+            pio.WriteDoubleWord(0xcc, (cs << 24) | (11u << 12) | (6u << 7));
+            pio.WriteDoubleWord(0xd0, (8u << 25) | (8u << 20) | (1u << 19) | (1u << 17) | (1u << 16));
+            // Firmware reverses an MSB-first byte, then feeds the LSB-first OSR.
+            pio.WriteByte(0x13, 0x65); // wire byte for 0xa6, APB replication
+            pio.WriteByte(0x13, 0x5a);
+            pio.WriteDoubleWord(0xf4, cs << 15); // SM1 monitor input base
+            pio.WriteDoubleWord(0xe4, (31u << 12) | (29u << 7));
+            Force(1, 29);
+            pio.WriteDoubleWord(0x138, 1u << 9); // IRQ1 from relative monitor flag1
+            pio.WriteDoubleWord(0, 3);
+            Advance(20);
+            Assert.AreEqual(3u, pio.ReadDoubleWord(0xd4));
+            Advance(1000000); // no clock callbacks are needed in the CS-high JMP
+            Assert.AreEqual(3u, pio.ReadDoubleWord(0xd4));
+            GetOutputState(miso, out _, out var enabled);
+            Assert.IsFalse(enabled);
+            gpio.OnGPIO(cs, false);
+            Advance(8);
+            uint response = 0;
+            const uint request = 0x3c;
+            for(var bit = 7; bit >= 0; bit--)
+            {
+                gpio.OnGPIO(mosi, ((request >> bit) & 1) != 0);
+                gpio.OnGPIO(sck, lead);
+                Advance(6);
+                gpio.OnGPIO(sck, !lead);
+                response = (response << 1) | (gpio.GetInput(miso) ? 1u : 0u);
+                Advance(6);
+            }
+            Assert.AreEqual(0xa6u, response);
+            Assert.AreEqual(request, pio.ReadDoubleWord(0x20));
+            Assert.IsFalse(pio.IRQ1.IsSet);
+            gpio.OnGPIO(cs, true);
+            Advance(4);
+            Assert.IsTrue(pio.IRQ1.IsSet);
+            Assert.AreEqual(2u, pio.ReadDoubleWord(0x30));
+        }
+
+        [Test]
+        public void ShouldKeepForcedInstructionStalledUntilItExecutes()
+        {
+            Force(0, 0x80a0);
+            pio.WriteDoubleWord(0x10, 0x29);
+            Assert.AreNotEqual(0u, pio.ReadDoubleWord(0xcc) & 0x80000000);
+            Advance(1);
+            Assert.AreEqual(0u, pio.ReadDoubleWord(0xcc) & 0x80000000);
+            Force(0, 0xa0c7);
+            Force(0, 0x8020);
+            Assert.AreEqual(0x29u, pio.ReadDoubleWord(0x20));
+        }
+
+        [Test]
+        public void ShouldRetryInitialAutopullAndFlagOnlyEmptyFIFOStalls()
+        {
+            pio.WriteDoubleWord(0xd0, 0xc0000 | (1u << 17));
+            pio.WriteDoubleWord(0x10, 0xb1234567);
+            Force(0, 0x6020); // out x,32: first cycle refills OSR
+            Assert.AreEqual(0u, pio.ReadDoubleWord(8));
+            Advance(1);
+            Assert.AreEqual(0u, pio.ReadDoubleWord(0xcc) & 0x80000000);
+            Force(0, 0xa0c1);
+            Force(0, 0x8020);
+            Assert.AreEqual(0xb1234567u, pio.ReadDoubleWord(0x20));
+            Force(0, 0x6020);
+            Assert.AreNotEqual(0u, pio.ReadDoubleWord(8) & (1u << 24));
+        }
+
+        [Test]
+        public void ShouldResolveSimultaneousPinWritesWithHigherSMWinning()
+        {
+            gpio.WriteDoubleWord(4, 6);
+            pio.WriteDoubleWord(0xdc, 1u << 26);
+            pio.WriteDoubleWord(0xf4, 1u << 26);
+            Force(0, 0xe081);
+            Load(0xe001, 0xe000, 0x80a0); // SM0 writes one, SM1 writes zero
+            Force(1, 1);
+            var changes = 0;
+            gpio.DriveChanged += (_, __, ___) => changes++;
+            pio.WriteDoubleWord(0, 3);
+            Advance(1);
+            Assert.AreEqual(0u, pio.ReadDoubleWord(0x3c));
+            Assert.AreEqual(0, changes, "A losing SM must not create a pin glitch");
+        }
+
+        [Test]
+        public void ShouldRetainStickyPinPriorityUntilInlineEnableDeasserts()
+        {
+            gpio.WriteDoubleWord(4, 6);
+            pio.WriteDoubleWord(0xdc, 1u << 26);
+            pio.WriteDoubleWord(0xf4, 1u << 26);
+            Force(0, 0xe081);
+            pio.WriteDoubleWord(0xe4, 0x1f000 | (1u << 17) | (1u << 18));
+            Force(1, 0xe001);
+            Assert.IsTrue(gpio.GetInput(0));
+            Force(0, 0xe000);
+            Assert.IsTrue(gpio.GetInput(0));
+            Force(1, 0xe000); // inline enable zero removes SM1's sticky strobe
+            Force(0, 0xe000);
+            Assert.IsFalse(gpio.GetInput(0));
+            pio.WriteDoubleWord(0xdc, (1u << 29) | (1u << 26));
+            Force(0, 0xf000); // set pins,0 side1: side-set wins
+            Assert.IsTrue(gpio.GetInput(0));
+        }
+
+        [Test]
+        public void ShouldDelaySynchronizedInputsByTwoSystemClocksAndHonorBypass()
+        {
+            gpio.OnGPIO(0, true);
+            Force(0, 0x4001);
+            Force(0, 0x8020);
+            Assert.AreEqual(0u, pio.ReadDoubleWord(0x20));
+            Advance(1);
+            Force(0, 0x4001);
+            Force(0, 0x8020);
+            Assert.AreEqual(0u, pio.ReadDoubleWord(0x20));
+            Advance(1);
+            Force(0, 0x4001);
+            Force(0, 0x8020);
+            Assert.AreEqual(0x80000000u, pio.ReadDoubleWord(0x20));
+            gpio.OnGPIO(0, false);
+            pio.WriteDoubleWord(0x38, 1);
+            Force(0, 0x4001);
+            Force(0, 0x8020);
+            Assert.AreEqual(0u, pio.ReadDoubleWord(0x20));
+            pio.WriteDoubleWord(0x38, 0);
+            Force(0, 0x4001);
+            Force(0, 0x8020);
+            Assert.AreEqual(0x80000000u, pio.ReadDoubleWord(0x20));
+        }
+
+        [Test]
+        public void ShouldPauseInstructionDelayAndRetainDividerPhaseWhileDisabled()
+        {
+            Load(0xe721, 0xe022, 0x80a0); // set x,1 [7]; set x,2; pull
+            pio.WriteDoubleWord(0xc8, 3u << 16);
+            pio.WriteDoubleWord(0, 1);
+            Advance(7); // first instruction at3; one delay cycle at6
+            Assert.AreEqual(1u, pio.ReadDoubleWord(0xd4));
+            pio.WriteDoubleWord(0, 0);
+            Advance(100); // divider keeps its phase, delay counter is paused
+            pio.WriteDoubleWord(0, 1);
+            Advance(18); // enables108..123 consume remaining6 delay cycles
+            Assert.AreEqual(1u, pio.ReadDoubleWord(0xd4));
+            Advance(1); // next instruction at126
+            Assert.AreEqual(2u, pio.ReadDoubleWord(0xd4));
+        }
+
+        [Test]
+        public void ShouldRestartDelayImmediatelyAndKeepClockPhase()
+        {
+            Load(0xff21, 0xe022, 0x80a0); // set x,1 [31]; set x,2
+            pio.WriteDoubleWord(0xc8, 3u << 16);
+            pio.WriteDoubleWord(0, 1);
+            Advance(7);
+            pio.WriteDoubleWord(0x2000, 1u << 4);
+            Advance(1);
+            Assert.AreEqual(1u, pio.ReadDoubleWord(0xd4));
+            Advance(1); // phase-aligned enable at9, with delay cleared
+            Assert.AreEqual(2u, pio.ReadDoubleWord(0xd4));
+        }
+
+        [TestCase(false)]
+        [TestCase(true)]
+        public void ShouldExecuteMetalclawSPIRegmapAddressAndPayload(bool lead)
+        {
+            const int mosi = 8, miso = 9, sck = 10, cs = 11;
+            const uint table = 0x20004000;
+            LoadMetalclawSPI(sck, lead);
+            gpio.WriteDoubleWord(miso * 8 + 4, 6);
+            gpio.OnGPIO(cs, true);
+            gpio.OnGPIO(sck, false);
+            Advance(2);
+            pio.WriteDoubleWord(0xdc, (1u << 26) | (1u << 20) | (mosi << 15) | (miso << 5) | miso);
+            pio.WriteDoubleWord(0xcc, (cs << 24) | (10u << 12) | (12u << 7));
+            pio.WriteDoubleWord(0xd0, 0);
+            pio.WriteDoubleWord(0x10, table >> 11);
+            Force(0, 0x80a0);
+            Force(0, 0x6040); // out y,32
+            Force(0, 0xa0c3); // mov isr,null
+            pio.WriteDoubleWord(0xd0, (8u << 25) | (1u << 17));
+            pio.WriteByte(0x13, 0); // command-phase filler; payload arrives after RX pointer
+            Force(0, 14);
+            pio.WriteDoubleWord(0, 1);
+            Advance(20);
+            gpio.OnGPIO(cs, false);
+            Advance(8);
+            Assert.AreEqual(0u, SPIByte(0x83, lead, mosi, miso, sck));
+            Advance(4); // IN NULL, PUSH, and the following payload OUT
+            Assert.AreEqual(table + 0x83u * 8, pio.ReadDoubleWord(0x20));
+            Assert.AreNotEqual(0u, pio.ReadDoubleWord(8) & (1u << 24));
+            pio.WriteByte(0x13, 0xa6);
+            pio.WriteByte(0x13, 0x5a);
+            Advance(8);
+            Assert.AreEqual(0xa6u, SPIByte(0x17, lead, mosi, miso, sck));
+            Assert.AreEqual(0x17u, pio.ReadDoubleWord(0x20));
+        }
+
+        [Test]
+        public void ShouldAutopullDuringAnInstructionDelayWithoutEndingTheDelay()
+        {
+            Load(0xef21, 0x80a0, 0xa0c7, 0x8020, 0x80a0); // set x,1 [15]; pull; mov isr,osr; push
+            pio.WriteDoubleWord(0xd0, 0xc0000 | (1u << 17));
+            pio.WriteDoubleWord(0, 1);
+            Advance(2);
+            pio.WriteDoubleWord(0x10, 0x12345678);
+            Assert.AreEqual(1u, pio.ReadDoubleWord(12) & 15);
+            Advance(1);
+            Assert.AreEqual(0u, pio.ReadDoubleWord(12) & 15);
+            Advance(13);
+            Assert.AreEqual(1u, pio.ReadDoubleWord(0xd4));
+            Advance(3);
+            Assert.AreEqual(0x12345678u, pio.ReadDoubleWord(0x20));
+        }
+
+        [Test]
+        public void ShouldResumeForcedInstructionWithoutWaitingForDividerOrDelay()
+        {
+            Load(0xff21, 0x0001); // long delay then a self-JMP
+            pio.WriteDoubleWord(0xc8, 10u << 16);
+            pio.WriteDoubleWord(0, 1);
+            Advance(11);
+            Force(0, 0x80a0);
+            pio.WriteDoubleWord(0x10, 0x713);
+            Advance(1);
+            Assert.AreEqual(0u, pio.ReadDoubleWord(0xcc) & 0x80000000);
+            Force(0, 0xa0c7);
+            Force(0, 0x8020);
+            Assert.AreEqual(0x713u, pio.ReadDoubleWord(0x20));
+            Assert.AreEqual(1u, pio.ReadDoubleWord(0xd4));
+        }
+
+        private uint SPIByte(uint value, bool lead, int mosi, int miso, int sck)
+        {
+            uint result = 0;
+            for(var bit = 7; bit >= 0; bit--)
+            {
+                gpio.OnGPIO(mosi, ((value >> bit) & 1) != 0);
+                gpio.OnGPIO(sck, lead);
+                Advance(6);
+                gpio.OnGPIO(sck, !lead);
+                result = (result << 1) | (gpio.GetInput(miso) ? 1u : 0u);
+                Advance(6);
+            }
+            return result;
+        }
+
+        private void LoadMetalclawSPI(int sck, bool lead)
+        {
+            var firstWait = (ushort)(0x2000 | (lead ? 0x80 : 0) | sck);
+            var secondWait = (ushort)(0x2000 | (lead ? 0 : 0x80) | sck);
+            Load(0x6001, 0x00c3, 0x0001, 0x00c3, 0xe081, 0xe027,
+                firstWait, secondWait, 0x4001, 0x6001, 0x0046, 0xe027,
+                0x8000, 0x0005, 0x8080, 0x00cf, 0x4055, 0xe081,
+                firstWait, secondWait, 0x4001, 0x6001, 0x00f2, 0x4063,
+                0x8020, 0xa042, 0x6001, 0x0005, 0xa042, 0x2020,
+                0x20a0, 0xc010);
         }
 
         private void ConfigureMetalclawSWD()

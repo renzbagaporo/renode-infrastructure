@@ -42,6 +42,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 sm.Timer.LimitReached += () => Tick(sm);
                 stateMachines[index] = sm;
             }
+            for(var pin = 0; pin < 32; pin++)
+            {
+                inputHistory[pin] = new Queue<InputTransition>();
+                synchronizedInput[pin] = gpio.GetInput(pin);
+            }
             gpio.InputChanged += OnInputChanged;
             if(clocks != null) clocks.ClockChanged += OnClockChanged;
             Reset();
@@ -68,6 +73,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 foreach(var sm in stateMachines)
                 {
                     sm.Timer.Enabled = false;
+                    sm.Scheduled = false;
+                    sm.ResumeCycles = 0;
+                    sm.StickyMask = sm.StickyValue = sm.WriteMask = sm.WriteValue = sm.DirectionMask = sm.DirectionValue = 0;
                     sm.ClockDivider = 0x10000;
                     sm.ExecControl = 0x1f000;
                     sm.ShiftControl = 0xc0000;
@@ -90,6 +98,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         protected override void OnResetHeldChanged()
         {
             foreach(var sm in stateMachines) Schedule(sm);
+            UpdateSignals();
         }
 
         protected override void OnAccessCompleted() => PublishPending();
@@ -180,7 +189,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             if(offset >= 0x48 && offset < 0xc8)
             {
                 // Atomic aliases read a write-only instruction RAM port as zero.
-                instructions[(offset - 0x48) / 4] = (ushort)ApplyOperation(0, value, operation, 0xffff);
+                var address = (int)((offset - 0x48) / 4);
+                instructions[address] = (ushort)ApplyOperation(0, value, operation, 0xffff);
+                foreach(var sm in stateMachines)
+                {
+                    if(sm.JumpLoop && sm.PC == address) { ClearExecution(sm); Schedule(sm); }
+                }
                 return;
             }
             if(offset >= 0xc8 && offset < 0x128)
@@ -192,7 +206,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     sm.ClockDivider = ApplyOperation(sm.ClockDivider, value, operation, 0xffffff00);
                     Schedule(sm);
                     break;
-                case 4: sm.ExecControl = ApplyOperation(sm.ExecControl, value, operation, 0x7fffffff); break;
+                case 4:
+                    sm.ExecControl = ApplyOperation(sm.ExecControl, value, operation, 0x7fffff9f);
+                    if(sm.JumpLoop) { ClearExecution(sm); Schedule(sm); }
+                    break;
                 case 8:
                     var previous = sm.ShiftControl;
                     sm.ShiftControl = ApplyOperation(previous, value, operation, 0xffff0000);
@@ -207,10 +224,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     ClearExecution(sm);
                     sm.Pending = sm.Forced = true;
                     sm.Instruction = (ushort)ApplyOperation(0, value, operation, 0xffff);
+                    BeginPinCycle();
                     Execute(sm);
-                    Schedule(sm);
+                    ResolvePinWrites();
+                    var retry = sm.RetryNextCycle;
+                    sm.RetryNextCycle = false;
+                    Schedule(sm, wake: retry);
                     break;
-                case 20: sm.PinControl = ApplyOperation(sm.PinControl, value, operation, 0xffffffe0 | 0x1fu); break;
+                case 20: sm.PinControl = ApplyOperation(sm.PinControl, value, operation); break;
                 }
                 UpdateSignals();
                 return;
@@ -229,19 +250,31 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             switch(offset)
             {
             case 0:
+                var previousControl = control;
                 control = ApplyOperation(control, value, operation, 0xf);
                 var strobes = ApplyOperation(0, value, operation);
                 foreach(var sm in stateMachines)
                 {
+                    var wasEnabled = (previousControl & (1u << sm.Index)) != 0;
+                    if(wasEnabled && !Enabled(sm) && sm.Scheduled && !sm.Stalled && !sm.Forced) sm.ResumeCycles = CyclesUntilExecution(sm);
+                    if(!wasEnabled && Enabled(sm) && sm.ResumeCycles != 0)
+                    {
+                        sm.Edge256 = NextClockEdge(sm) + Divider256(sm) * (sm.ResumeCycles - 1);
+                        sm.ResumeCycles = 0;
+                    }
                     if((strobes & (1u << (4 + sm.Index))) != 0) Restart(sm);
-                    if((strobes & (1u << (8 + sm.Index))) != 0) sm.Edge256 = (BigInteger)cycleCounter.Value * 256;
-                    Schedule(sm);
+                    if((strobes & (1u << (8 + sm.Index))) != 0)
+                    {
+                        var remaining = sm.Scheduled ? CyclesUntilExecution(sm) : 1ul;
+                        sm.Edge256 = (BigInteger)cycleCounter.Value * 256 + Divider256(sm) * remaining;
+                    }
+                    Schedule(sm, wake: sm.Stalled && CanResume(sm));
                 }
                 break;
             case 8: debug &= ~value; break;
             case 0x30: irqFlags &= ~(value & 0xff); WakeAll(); break;
             case 0x34: irqFlags |= value & 0xff; WakeAll(); break;
-            case 0x38: inputSyncBypass = ApplyOperation(inputSyncBypass, value, operation); break;
+            case 0x38: inputSyncBypass = ApplyOperation(inputSyncBypass, value, operation); WakeAll(); break;
             case 4:
             case 12:
             case 0x3c:
@@ -253,28 +286,61 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             UpdateSignals();
         }
 
-        private void Tick(StateMachine sm)
+        private void Tick(StateMachine triggeringMachine)
         {
             lock(SyncRoot)
             {
-                if(ResetHeld || frequency == 0 || (!Enabled(sm) && !sm.Forced)) return;
-                if(!sm.Pending)
+                var now = cycleCounter.Value;
+                BeginPinCycle();
+                // Clock enables on the same system edge are simultaneous. Run
+                // all of them before resolving pin strobes in SM priority order.
+                foreach(var sm in stateMachines)
                 {
-                    sm.Pending = true;
-                    sm.Instruction = instructions[sm.PC];
+                    if(!sm.Scheduled || sm.DueTick > now) continue;
+                    sm.Scheduled = false;
+                    sm.Timer.Enabled = false;
+                    if(ResetHeld || frequency == 0 || (!Enabled(sm) && !sm.Forced)) continue;
+                    if(sm.PrefetchOnly)
+                    {
+                        sm.PrefetchOnly = false;
+                        if(AutoPull(sm) && sm.OutputCount >= PullThreshold(sm)) TryPull(sm);
+                        Schedule(sm, advance: false);
+                        continue;
+                    }
+                    if(!sm.Pending)
+                    {
+                        sm.Pending = true;
+                        sm.Instruction = instructions[sm.PC];
+                    }
+                    var pc = sm.PC;
+                    var fetched = !sm.Forced && !sm.Injected;
+                    var forced = sm.Forced;
+                    var instruction = sm.Instruction;
+                    var completed = Execute(sm);
+                    if(completed)
+                    {
+                        if(!forced) sm.Edge256 += Divider256(sm) * (ulong)(1 + sm.Delay);
+                        // A JMP which returns to itself has no changing machine
+                        // state. Its next useful execution is a pin/config change.
+                        // Keep the loop period to retain delay and divider phase.
+                        var condition = (instruction >> 5) & 7;
+                        if(fetched && SideCount(sm) == 0 && sm.PC == pc && (instruction & 31) == pc
+                            && (instruction >> 13) == 0 && (condition == 0 || (condition == 6 && ReadInput((int)((sm.ExecControl >> 24) & 31)))))
+                        {
+                            sm.Pending = sm.Stalled = sm.JumpLoop = true;
+                            sm.Instruction = instruction;
+                            sm.LoopCycles = 1 + sm.Delay;
+                        }
+                        Schedule(sm, advance: false);
+                    }
+                    else if(sm.RetryNextCycle)
+                    {
+                        sm.RetryNextCycle = false;
+                        if(!forced) sm.Edge256 += Divider256(sm);
+                        Schedule(sm, advance: false, wake: true);
+                    }
                 }
-                var completed = Execute(sm);
-                if(completed)
-                {
-                    sm.Edge256 += Divider256(sm) * (ulong)(1 + sm.Delay);
-                    Schedule(sm, advance: false);
-                }
-                else if(sm.RetryNextCycle)
-                {
-                    sm.RetryNextCycle = false;
-                    sm.Edge256 += Divider256(sm);
-                    Schedule(sm, advance: false);
-                }
+                ResolvePinWrites();
                 UpdateSignals();
             }
             PublishPending();
@@ -306,7 +372,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 case 3: taken = sm.Y == 0; break;
                 case 4: taken = sm.Y-- != 0; break;
                 case 5: taken = sm.X != sm.Y; break;
-                case 6: taken = gpio.GetInput((int)((sm.ExecControl >> 24) & 31)); break;
+                case 6: taken = ReadInput((int)((sm.ExecControl >> 24) & 31)); break;
                 default: taken = sm.OutputCount < PullThreshold(sm); break;
                 }
                 if(taken) { nextPC = argument & 31; jump = true; }
@@ -316,8 +382,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 var source = (argument >> 5) & 3;
                 var index = argument & 31;
                 bool input;
-                if(source == 0) input = gpio.GetInput(index);
-                else if(source == 1) input = gpio.GetInput((InBase(sm) + index) & 31);
+                if(source == 0) input = ReadInput(index);
+                else if(source == 1) input = ReadInput((InBase(sm) + index) & 31);
                 else if(source == 2)
                 {
                     var mask = 1u << IrqIndex(sm, index);
@@ -342,7 +408,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 if(AutoPull(sm) && sm.OutputCount >= PullThreshold(sm))
                 {
                     if(TryPull(sm)) sm.RetryNextCycle = true;
-                    debug |= 1u << (24 + sm.Index);
+                    else debug |= 1u << (24 + sm.Index);
                     complete = false;
                     break;
                 }
@@ -447,7 +513,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
             case 0:
                 uint pins = 0;
-                for(var bit = 0; bit < 32; bit++) if(gpio.GetInput((InBase(sm) + bit) & 31)) pins |= 1u << bit;
+                for(var bit = 0; bit < 32; bit++) if(ReadInput((InBase(sm) + bit) & 31)) pins |= 1u << bit;
                 return pins;
             case 1: return sm.X;
             case 2: return sm.Y;
@@ -515,10 +581,51 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                         mask &= ~(1u << (((int)(sm.PinControl >> 10) + bit) & 31));
                 }
             }
-            if(!directions && (sm.ExecControl & (1u << 18)) != 0 && (bits & (1u << (int)((sm.ExecControl >> 19) & 31))) == 0) return;
-            if(directions) outputEnable = (outputEnable & ~mask) | (value & mask);
-            else output = (output & ~mask) | (value & mask);
-            for(var pin = 0; pin < 32; pin++) if((mask & (1u << pin)) != 0) QueuePin(pin);
+            if(directions)
+            {
+                sm.DirectionMask |= mask;
+                sm.DirectionValue = (sm.DirectionValue & ~mask) | (value & mask);
+            }
+            else
+            {
+                if(sm.Started)
+                {
+                    if((sm.ExecControl & (1u << 18)) != 0 && (bits & (1u << (int)((sm.ExecControl >> 19) & 31))) == 0)
+                    {
+                        if((sm.ExecControl & (1u << 17)) != 0) sm.StickyMask = 0;
+                        return;
+                    }
+                    sm.StickyMask = mask;
+                    sm.StickyValue = value;
+                }
+                sm.WriteMask |= mask;
+                sm.WriteValue = (sm.WriteValue & ~mask) | (value & mask);
+            }
+        }
+
+        private void BeginPinCycle()
+        {
+            foreach(var sm in stateMachines)
+            {
+                sm.WriteMask = sm.DirectionMask = 0;
+                sm.WriteValue = sm.DirectionValue = 0;
+            }
+        }
+
+        private void ResolvePinWrites()
+        {
+            var previousOutput = output;
+            var previousEnable = outputEnable;
+            foreach(var sm in stateMachines)
+            {
+                var stickyMask = (sm.ExecControl & (1u << 17)) != 0 ? sm.StickyMask : 0;
+                var mask = stickyMask | sm.WriteMask;
+                var value = (sm.StickyValue & stickyMask & ~sm.WriteMask) | (sm.WriteValue & sm.WriteMask);
+                output = (output & ~mask) | value;
+                outputEnable = (outputEnable & ~sm.DirectionMask) | (sm.DirectionValue & sm.DirectionMask);
+            }
+            var changed = (previousOutput ^ output) | (previousEnable ^ outputEnable);
+            for(var pin = 0; pin < 32; pin++) if((changed & (1u << pin)) != 0) QueuePin(pin);
         }
 
         private void QueuePin(int pin)
@@ -531,8 +638,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         {
             foreach(var sm in stateMachines)
             {
-                QueueSignal(sm.Index, sm.Tx.Count < TxCapacity(sm));
-                QueueSignal(sm.Index + 4, sm.Rx.Count != 0);
+                QueueSignal(sm.Index, !ResetHeld && sm.Tx.Count < TxCapacity(sm));
+                QueueSignal(sm.Index + 4, !ResetHeld && sm.Rx.Count != 0);
             }
             var status = InterruptStatus;
             for(var index = 0; index < 2; index++) QueueSignal(8 + index, ((status & irqEnable[index]) | irqForce[index]) != 0);
@@ -587,13 +694,32 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
         }
 
+        private bool ReadInput(int pin)
+        {
+            var history = inputHistory[pin];
+            var now = cycleCounter.Value;
+            while(history.Count != 0 && history.Peek().Tick <= now) synchronizedInput[pin] = history.Dequeue().Value;
+            return (inputSyncBypass & (1u << pin)) != 0 ? gpio.GetInput(pin) : synchronizedInput[pin];
+        }
+
         private void OnInputChanged(int pin, bool level)
         {
+            if(pin >= 32) return;
             lock(SyncRoot)
             {
+                ReadInput(pin);
+                var now = cycleCounter.Value;
+                inputHistory[pin].Enqueue(new InputTransition { Tick = now + 2, Value = level });
+                var visibleTick = now + ((inputSyncBypass & (1u << pin)) != 0 ? 1ul : 2ul);
                 foreach(var sm in stateMachines)
                 {
-                    if(sm.Stalled && (sm.Instruction >> 13) == 1) Wake(sm);
+                    if(!sm.Stalled) continue;
+                    var source = (sm.Instruction >> 5) & 3;
+                    var dependsOnPin = sm.JumpLoop ? ((sm.Instruction >> 5) & 7) == 6 ? (int)((sm.ExecControl >> 24) & 31) : -1
+                        : (sm.Instruction >> 13) != 1 || source > 1 ? -1
+                        : source == 0 ? sm.Instruction & 31 : (InBase(sm) + (sm.Instruction & 31)) & 31;
+                    if(dependsOnPin == pin && (!sm.Timer.Enabled || sm.DueTick > visibleTick))
+                        Schedule(sm, wake: true, earliestTick: visibleTick);
                 }
             }
         }
@@ -621,45 +747,107 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private void Wake(StateMachine sm)
         {
-            if(sm.Stalled)
+            if(sm.Stalled && !sm.Timer.Enabled && CanResume(sm)) Schedule(sm, wake: true);
+            else if(!sm.Stalled && sm.Scheduled && AutoPull(sm) && sm.OutputCount >= PullThreshold(sm) && sm.Tx.Count != 0)
+                Schedule(sm, advance: false);
+        }
+
+        private bool CanResume(StateMachine sm)
+        {
+            if(AutoPull(sm) && sm.OutputCount >= PullThreshold(sm) && sm.Tx.Count != 0) return true;
+            var argument = sm.Instruction & 0xff;
+            switch(sm.Instruction >> 13)
             {
-                sm.Stalled = false;
-                Schedule(sm);
+            case 0:
+                return sm.JumpLoop && ((argument >> 5) & 7) == 6
+                    && !ReadInput((int)((sm.ExecControl >> 24) & 31));
+            case 1:
+                var index = argument & 31;
+                var source = (argument >> 5) & 3;
+                var value = source == 0 ? ReadInput(index) : source == 1 ? ReadInput((InBase(sm) + index) & 31)
+                    : source == 2 && (irqFlags & (1u << IrqIndex(sm, index))) != 0;
+                return value == ((argument & 0x80) != 0);
+            case 2: return sm.Rx.Count < RxCapacity(sm);
+            case 3: return sm.Tx.Count != 0 || sm.OutputCount < PullThreshold(sm);
+            case 4: return (argument & 0x80) != 0 ? sm.Tx.Count != 0 : sm.Rx.Count < RxCapacity(sm);
+            case 6: return (irqFlags & (1u << IrqIndex(sm, argument & 31))) == 0;
+            default: return true;
             }
         }
 
-        private void Schedule(StateMachine sm, bool advance = true)
+        private void Schedule(StateMachine sm, bool advance = true, bool wake = false, ulong earliestTick = 0)
         {
             sm.Timer.Enabled = false;
-            if(ResetHeld || frequency == 0 || (!Enabled(sm) && !sm.Forced) || sm.Stalled) return;
+            sm.Scheduled = false;
+            sm.PrefetchOnly = false;
+            if(ResetHeld || frequency == 0 || (!Enabled(sm) && !sm.Forced) || (sm.Stalled && !wake)) return;
             var now = (BigInteger)cycleCounter.Value;
-            if(advance || sm.Edge256 / 256 <= now)
+            var earliest = BigInteger.Max(now + 1, earliestTick);
+            if(sm.Forced)
             {
-                var divider = sm.Forced ? 256ul : Divider256(sm);
-                var elapsed = now * 256 - sm.Edge256;
-                if(elapsed >= 0) sm.Edge256 += (elapsed / divider + 1) * divider;
-                // Fractional divider rounds intervals down, carrying the fraction
-                // to the following interval. A clock enable is always in the future.
-                if(sm.Edge256 / 256 <= now) sm.Edge256 += divider;
+                sm.DueTick = (ulong)earliest;
+                sm.Scheduled = true;
+                sm.Timer.Limit = (ulong)(earliest - now);
+                sm.Timer.ResetValue();
+                sm.Timer.Enabled = true;
+                return;
             }
-            var ticks = sm.Edge256 / 256 - now;
+            if(advance || sm.Edge256 / 256 < earliest)
+            {
+                var divider = Divider256(sm) * (ulong)(sm.JumpLoop ? sm.LoopCycles : 1);
+                var elapsed = earliest * 256 - sm.Edge256;
+                if(elapsed > 0) sm.Edge256 += ((elapsed + divider - 1) / divider) * divider;
+            }
+            var due = sm.Edge256 / 256;
+            if(Enabled(sm) && !sm.Stalled && AutoPull(sm) && sm.OutputCount >= PullThreshold(sm) && sm.Tx.Count != 0)
+            {
+                var prefetch = NextClockEdge(sm) / 256;
+                if(prefetch < due)
+                {
+                    due = prefetch;
+                    sm.PrefetchOnly = true;
+                }
+            }
+            var ticks = due - now;
+            sm.DueTick = (ulong)due;
+            sm.Scheduled = true;
             sm.Timer.Limit = (ulong)BigInteger.Min(ulong.MaxValue, BigInteger.Max(1, ticks));
             sm.Timer.ResetValue();
             sm.Timer.Enabled = true;
         }
 
+        private ulong CyclesUntilExecution(StateMachine sm)
+        {
+            var remaining = sm.Edge256 - ((BigInteger)cycleCounter.Value + 1) * 256;
+            return remaining < 0 ? 1 : (ulong)(remaining / Divider256(sm) + 1);
+        }
+
+        private BigInteger NextClockEdge(StateMachine sm)
+        {
+            var earliest = ((BigInteger)cycleCounter.Value + 1) * 256;
+            var divider = Divider256(sm);
+            var remaining = sm.Edge256 - earliest;
+            return remaining >= 0 ? sm.Edge256 - (remaining / divider) * divider
+                : sm.Edge256 + ((-remaining + divider - 1) / divider) * divider;
+        }
+
         private void Restart(StateMachine sm)
         {
+            sm.Timer.Enabled = false;
+            sm.Scheduled = false;
+            sm.ResumeCycles = 0;
+            sm.Edge256 = NextClockEdge(sm);
             ClearExecution(sm);
             sm.InputCount = 0;
             sm.OutputCount = 32;
             sm.ISR = 0;
             sm.Delay = 0;
+            sm.StickyMask = 0;
         }
 
         private static void ClearExecution(StateMachine sm)
         {
-            sm.Pending = sm.Forced = sm.Injected = sm.Started = sm.Shifted = sm.IrqSet = sm.Stalled = sm.RetryNextCycle = false;
+            sm.Pending = sm.Forced = sm.Injected = sm.Started = sm.Shifted = sm.IrqSet = sm.Stalled = sm.RetryNextCycle = sm.JumpLoop = false;
             sm.Exec = null;
         }
 
@@ -706,11 +894,20 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             public LimitTimer Timer;
             public uint ClockDivider, ExecControl, ShiftControl, PinControl;
             public uint X, Y, OSR, ISR, LastRx;
-            public int PC, InputCount, OutputCount, Delay;
+            public uint StickyMask, StickyValue, WriteMask, WriteValue, DirectionMask, DirectionValue;
+            public ulong DueTick, ResumeCycles;
+            public bool Scheduled, PrefetchOnly;
+            public int PC, InputCount, OutputCount, Delay, LoopCycles;
             public ushort Instruction;
             public ushort? Exec;
-            public bool Pending, Forced, Injected, Started, Shifted, IrqSet, Stalled, RetryNextCycle;
+            public bool Pending, Forced, Injected, Started, Shifted, IrqSet, Stalled, RetryNextCycle, JumpLoop;
             public BigInteger Edge256;
+        }
+
+        private struct InputTransition
+        {
+            public ulong Tick;
+            public bool Value;
         }
 
         private struct Notification
@@ -724,6 +921,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private readonly uint[] irqEnable = new uint[2];
         private readonly uint[] irqForce = new uint[2];
         private readonly bool[] signalState = new bool[10];
+        private readonly bool[] synchronizedInput = new bool[32];
+        private readonly Queue<InputTransition>[] inputHistory = new Queue<InputTransition>[32];
         private readonly Queue<Notification> notifications = new Queue<Notification>();
         private readonly RP2_GPIOBank0 gpio;
         private readonly IRP2ClockSource clocks;
