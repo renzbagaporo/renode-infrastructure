@@ -23,6 +23,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         public uint GPIONonSecureMask0 => gpioMasks[0];
         public uint GPIONonSecureMask1 => gpioMasks[1];
+        public bool PeripheralIsNonSecure(long registerOffset)
+        {
+            // NSP gates both Non-secure privileged and unprivileged access;
+            // NSU alone cannot grant access when NSP is clear.
+            return registerOffset >= 0x14 && registerOffset <= 0xe8 && registerOffset % 4 == 0
+                && (permissions[(registerOffset - 0x14) / 4] & 2) != 0;
+        }
         public bool GPIOIsNonSecure(int pin) => pin >= 0 && pin < 64 && (gpioMasks[pin / 32] & (1u << (pin % 32))) != 0;
         public bool CoreIsForcedNonSecure(int coreIndex) => coreIndex == 1 && (forceCoreNonSecure & 2) != 0;
         public event Action GPIOAccessChanged;
@@ -57,7 +64,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     var index = (offset - 0x14) / 4;
                     if((permissions[index] & 2) != 0 && (value >> 16) == 0xacce)
                     {
-                        if((locked & (1u << master)) == 0) permissions[index] = ApplyOperation(permissions[index], value, operation, 1);
+                        if((locked & (1u << master)) == 0)
+                        {
+                            permissions[index] = ApplyOperation(permissions[index], value, operation, 1);
+                            GPIOAccessChanged?.Invoke();
+                        }
                         return;
                     }
                 }
@@ -80,6 +91,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 {
                     var permissionIndex = (offset - 0x14) / 4;
                     permissions[permissionIndex] = ApplyOperation(permissions[permissionIndex], value, operation, 0xff);
+                    GPIOAccessChanged?.Invoke();
                 }
                 else this.LogUnhandledWrite(offset, value);
                 return;
