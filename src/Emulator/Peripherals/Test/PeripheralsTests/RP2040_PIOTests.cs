@@ -7,6 +7,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
+using System.Threading.Tasks;
 
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Peripherals;
@@ -763,6 +764,94 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.IsTrue(gpio.GetInput(0));
             Advance(1000000); // the correction returns to an event-driven stall
             Assert.IsTrue(gpio.GetInput(0));
+        }
+
+        [Test]
+        public void ShouldSerializeConcurrentDREQNotificationsAcrossPublisherHandoffs()
+        {
+            const int workers = 4;
+            const int iterations = 5000;
+            const int readers = 4;
+            var stop = 0;
+            var activeCallbacks = 0;
+            var overlappingCallbacks = 0;
+            var callbacksUnderMonitor = 0;
+            var counts = new int[workers];
+            var lastValues = Enumerable.Repeat(true, workers).ToArray();
+            var repeatedValues = 0;
+            for(var index = 0; index < workers; index++)
+            {
+                var sm = index;
+                ((GPIO)pio.Connections[sm]).AddStateChangedHook(value =>
+                {
+                    if(Monitor.IsEntered(pio)) Interlocked.Exchange(ref callbacksUnderMonitor, 1);
+                    if(Interlocked.Increment(ref activeCallbacks) != 1) Interlocked.Exchange(ref overlappingCallbacks, 1);
+                    try
+                    {
+                        if(lastValues[sm] == value) Interlocked.Exchange(ref repeatedValues, 1);
+                        lastValues[sm] = value;
+                        Interlocked.Increment(ref counts[sm]);
+                        // Different GPIO objects have independent callback locks.
+                        // Yielding exposes concurrent drainers without relying
+                        // on the GPIO implementation to serialize this block.
+                        Thread.Yield();
+                    }
+                    finally
+                    {
+                        Interlocked.Decrement(ref activeCallbacks);
+                    }
+                });
+            }
+            using(var start = new Barrier(workers + readers + 1))
+            {
+                // Empty publications are just as important as FIFO changes:
+                // a register reader can hand ownership to a new publisher.
+                var polling = Enumerable.Range(0, readers).Select(_ => Task.Factory.StartNew(() =>
+                {
+                    Assert.IsTrue(start.SignalAndWait(TimeSpan.FromSeconds(10)));
+                    while(Volatile.Read(ref stop) == 0) pio.ReadDoubleWord(0);
+                }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default)).ToArray();
+                var writers = Enumerable.Range(0, workers).Select(sm => Task.Factory.StartNew(() =>
+                {
+                    Assert.IsTrue(start.SignalAndWait(TimeSpan.FromSeconds(10)));
+                    for(var iteration = 0; iteration < iterations && Volatile.Read(ref stop) == 0; iteration++)
+                    {
+                        // RX join removes TX ownership, then restoring the
+                        // normal FIFO raises this SM's TX DREQ again.
+                        pio.WriteDoubleWord(0xd0 + sm * 0x18, 0x800c0000);
+                        pio.WriteDoubleWord(0xd0 + sm * 0x18, 0x000c0000);
+                    }
+                }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default)).ToArray();
+                try
+                {
+                    Assert.IsTrue(start.SignalAndWait(TimeSpan.FromSeconds(10)));
+                    Assert.IsTrue(Task.WaitAll(writers, TimeSpan.FromSeconds(30)), "Concurrent publishers did not finish");
+                }
+                finally
+                {
+                    Volatile.Write(ref stop, 1);
+                    Assert.IsTrue(Task.WaitAll(writers.Concat(polling).ToArray(), TimeSpan.FromSeconds(10)));
+                }
+            }
+            Assert.AreEqual(0, overlappingCallbacks, "One publisher must own all pin/IRQ/DREQ notification delivery");
+            Assert.AreEqual(0, callbacksUnderMonitor);
+            Assert.AreEqual(0, repeatedValues);
+            CollectionAssert.AreEqual(Enumerable.Repeat(iterations * 2, workers), counts);
+            for(var index = 0; index < workers; index++) Assert.IsTrue(pio.Connections[index].IsSet);
+        }
+
+        [Test]
+        public void ShouldReleasePublisherOwnershipWhenAReceiverThrows()
+        {
+            var calls = 0;
+            ((GPIO)pio.Connections[0]).AddStateChangedHook(value =>
+            {
+                if(Interlocked.Increment(ref calls) == 1) throw new InvalidOperationException("receiver failure");
+            });
+            Assert.Throws<InvalidOperationException>(() => pio.WriteDoubleWord(0xd0, 0x800c0000));
+            pio.WriteDoubleWord(0xd0, 0x000c0000);
+            Assert.AreEqual(2, calls);
+            Assert.IsTrue(pio.Connections[0].IsSet);
         }
 
         private uint SPIByte(uint value, bool lead, int mosi, int miso, int sck)

@@ -785,9 +785,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     else Connections[notification.Pin].Set(notification.Value);
                 }
             }
-            finally
+            catch
             {
                 lock(SyncRoot) publishing = false;
+                throw;
             }
         }
 
