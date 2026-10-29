@@ -11,26 +11,37 @@ using System.Threading;
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
+using Antmicro.Renode.Peripherals.Miscellaneous;
 
 namespace Antmicro.Renode.Peripherals.GPIOPort
 {
     [GPIO(NumberOfInputs = 48)]
     public sealed class RP2_GPIOBank0 : RP2APBPeripheral, IThreeStateGPIO, INumberedGPIOOutput
     {
-        public RP2_GPIOBank0(IMachine machine, IRP2GPIO sio = null, bool rp2350 = false, int numberOfPins = 0) : base(machine)
+        public RP2_GPIOBank0(IMachine machine, IRP2GPIO sio = null, bool rp2350 = false, int numberOfPins = 0,
+            RP2350_AccessControl accessControl = null, int securityPinOffset = 0) : base(machine)
         {
             this.sio = sio;
             this.rp2350 = rp2350;
+            this.accessControl = accessControl;
+            this.securityPinOffset = securityPinOffset;
             registerCount = rp2350 ? 48 : 30;
             this.numberOfPins = numberOfPins == 0 ? registerCount : numberOfPins;
             if(this.numberOfPins < 1 || this.numberOfPins > registerCount)
             {
                 throw new ConstructionException("GPIO pin count is outside the selected RP2 variant");
             }
+            if(securityPinOffset < 0 || securityPinOffset + this.numberOfPins > 64)
+            {
+                throw new ConstructionException("GPIO security pin range must fit the 64 SIO bit positions");
+            }
             interruptGroupCount = rp2350 ? 6 : 4;
             rawInterruptOffset = rp2350 ? 0x230 : 0xf0;
             control = new uint[registerCount];
             pads = new uint[registerCount];
+            isolated = new bool[registerCount];
+            isolatedOutput = new bool[registerCount];
+            isolatedEnable = new bool[registerCount];
             external = new bool?[registerCount];
             sampled = new bool[registerCount];
             interruptInput = new bool[registerCount];
@@ -46,12 +57,24 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             for(var pin = 0; pin < registerCount; pin++)
             {
                 connections.Add(pin, new GPIO());
-                pads[pin] = rp2350 ? 0x116u : 0x56u;
+                pads[pin] = rp2350 ? 0x16u : 0x56u;
+                isolated[pin] = rp2350;
             }
             Connections = new ReadOnlyDictionary<int, IGPIO>(connections);
             Core0IRQ = new GPIO();
             Core1IRQ = new GPIO();
             DormantWakeIRQ = new GPIO();
+            Core0NonSecureIRQ = new GPIO();
+            Core1NonSecureIRQ = new GPIO();
+            DormantWakeNonSecureIRQ = new GPIO();
+            interruptOutputs = rp2350
+                ? new[] { Core0IRQ, Core1IRQ, DormantWakeIRQ, Core0NonSecureIRQ, Core1NonSecureIRQ, DormantWakeNonSecureIRQ }
+                : new[] { Core0IRQ, Core1IRQ, DormantWakeIRQ };
+            interruptState = new bool[interruptOutputs.Length];
+            if(accessControl != null)
+            {
+                accessControl.GPIOAccessChanged += UpdatePins;
+            }
             if(sio != null)
             {
                 sio.GPIOChanged += UpdatePins;
@@ -102,11 +125,46 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             if(pin < 0 || pin >= registerCount) return;
             lock(SyncRoot)
             {
-                pads[pin] = value;
+                var isolate = rp2350 && (value & 0x100) != 0;
+                if(isolate && !isolated[pin])
+                {
+                    isolatedOutput[pin] = drivenValue[pin];
+                    isolatedEnable[pin] = drivenEnable[pin];
+                }
+                if(!isolate)
+                {
+                    pads[pin] = value & 0xff;
+                }
+                isolated[pin] = isolate;
                 UpdatePin(pin);
                 UpdateInterrupts();
             }
             PublishPending();
+        }
+
+        // Cold reset initializes always-on isolation latches from the pad's
+        // reset signals. APB resets use SetPadConfiguration and retain them.
+        public void ResetPadConfiguration(int pin, uint value)
+        {
+            if(pin < 0 || pin >= registerCount) return;
+            lock(SyncRoot)
+            {
+                pads[pin] = value & 0xff;
+                isolated[pin] = rp2350 && (value & 0x100) != 0;
+                isolatedOutput[pin] = false;
+                isolatedEnable[pin] = false;
+                UpdatePin(pin);
+                UpdateInterrupts();
+            }
+            PublishPending();
+        }
+
+        internal bool IsSecureAccess => !rp2350 || RP2350_GPIOAccess.IsSecure(machine, accessControl);
+
+        internal bool CanAccessPin(int pin)
+        {
+            return IsSecureAccess
+                || (accessControl?.GPIOIsNonSecure(pin + securityPinOffset) ?? false);
         }
 
         public bool GetInput(int pin)
@@ -190,8 +248,7 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
                         DriveChanged?.Invoke(notification.Pin, notification.Value, notification.Enabled);
                         break;
                     case NotificationKind.Interrupt:
-                        var irq = notification.Pin == 0 ? Core0IRQ : notification.Pin == 1 ? Core1IRQ : DormantWakeIRQ;
-                        irq.Set(notification.Value);
+                        interruptOutputs[notification.Pin].Set(notification.Value);
                         break;
                     }
                 }
@@ -213,6 +270,12 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
 
         public GPIO DormantWakeIRQ { get; }
 
+        public GPIO Core0NonSecureIRQ { get; }
+
+        public GPIO Core1NonSecureIRQ { get; }
+
+        public GPIO DormantWakeNonSecureIRQ { get; }
+
         public event Action<int, bool> InputChanged;
 
         // Consumers resolving a shared wire need both the driven level and OE.
@@ -223,6 +286,7 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             if(offset >= 0 && offset < registerCount * 8)
             {
                 var pin = (int)(offset / 8);
+                if(!CanAccessPin(pin)) return 0;
                 if((offset & 4) != 0)
                 {
                     return control[pin];
@@ -242,16 +306,16 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             if(rp2350 && offset >= 0x200 && offset < 0x230)
             {
                 var target = (int)((offset - 0x200) / 16);
-                if(((offset - 0x200) & 8) != 0)
-                {
-                    return 0;
-                }
+                var nonSecure = ((offset - 0x200) & 8) != 0;
+                if(!nonSecure && !RP2350_GPIOAccess.IsSecure(machine, accessControl)) return 0;
                 var firstPin = ((offset & 4) != 0) ? 32 : 0;
                 uint summary = 0;
                 for(var bit = 0; bit < 32 && firstPin + bit < numberOfPins; bit++)
                 {
                     var pin = firstPin + bit;
-                    if((MaskedInterrupts(target, pin / 8) & (0xfu << ((pin % 8) * 4))) != 0)
+                    var mask = NonSecureInterruptMask(pin / 8);
+                    if(!nonSecure) mask = ~mask;
+                    if((MaskedInterrupts(target, pin / 8) & mask & (0xfu << ((pin % 8) * 4))) != 0)
                     {
                         summary |= 1u << bit;
                     }
@@ -260,12 +324,13 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             }
             if(TryDecodeInterrupt(offset, out var targetIndex, out var kind, out var group))
             {
+                var visible = AccessibleInterruptMask(group);
                 switch(kind)
                 {
-                case 0: return RawInterrupts(group);
-                case 1: return interruptEnable[targetIndex, group];
-                case 2: return interruptForce[targetIndex, group];
-                case 3: return MaskedInterrupts(targetIndex, group);
+                case 0: return RawInterrupts(group) & visible;
+                case 1: return interruptEnable[targetIndex, group] & visible;
+                case 2: return interruptForce[targetIndex, group] & visible;
+                case 3: return MaskedInterrupts(targetIndex, group) & visible;
                 }
             }
             this.LogUnhandledRead(offset);
@@ -279,8 +344,9 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
                 if((offset & 4) != 0)
                 {
                     var pin = (int)(offset / 8);
+                    if(!CanAccessPin(pin)) return;
                     control[pin] = ApplyOperation(control[pin], value, operation, rp2350 ? 0x3003f01fu : 0x3003331fu);
-                    UpdatePin(pin);
+                    if(IsBondedPin(pin)) UpdatePin(pin);
                     UpdateInterrupts();
                 }
                 return;
@@ -290,13 +356,13 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
                 switch(kind)
                 {
                 case 0:
-                    edgeInterrupts[group] &= ~(value & 0xcccccccc);
+                    edgeInterrupts[group] &= ~(value & 0xcccccccc & AccessibleInterruptMask(group));
                     break;
                 case 1:
-                    interruptEnable[target, group] = ApplyOperation(interruptEnable[target, group], value, operation, InterruptMask(group));
+                    interruptEnable[target, group] = ApplyOperation(interruptEnable[target, group], value, operation, AccessibleInterruptMask(group));
                     break;
                 case 2:
-                    interruptForce[target, group] = ApplyOperation(interruptForce[target, group], value, operation, InterruptMask(group));
+                    interruptForce[target, group] = ApplyOperation(interruptForce[target, group], value, operation, AccessibleInterruptMask(group));
                     break;
                 }
                 UpdateInterrupts();
@@ -351,6 +417,25 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             return pins == 8 ? uint.MaxValue : (1u << (pins * 4)) - 1;
         }
 
+        private uint NonSecureInterruptMask(int group)
+        {
+            uint result = 0;
+            for(var i = 0; i < 8 && group * 8 + i < numberOfPins; i++)
+            {
+                if(accessControl?.GPIOIsNonSecure(group * 8 + i + securityPinOffset) ?? false)
+                {
+                    result |= 0xfu << (4 * i);
+                }
+            }
+            return result;
+        }
+
+        private uint AccessibleInterruptMask(int group)
+        {
+            return InterruptMask(group) & (!rp2350 || RP2350_GPIOAccess.IsSecure(machine, accessControl)
+                ? uint.MaxValue : NonSecureInterruptMask(group));
+        }
+
         private void UpdatePins()
         {
             lock(SyncRoot) UpdatePinsLocked();
@@ -371,7 +456,12 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             var function = control[pin] & 0x1f;
             var value = Override(PeripheralValue(pin, function), (control[pin] >> (rp2350 ? 12 : 8)) & 3);
             var enabled = Override(PeripheralEnabled(pin, function), (control[pin] >> (rp2350 ? 14 : 12)) & 3);
-            enabled &= (pads[pin] & 0x80) == 0 && (!rp2350 || (pads[pin] & 0x100) == 0);
+            enabled &= (pads[pin] & 0x80) == 0;
+            if(isolated[pin])
+            {
+                value = isolatedOutput[pin];
+                enabled = isolatedEnable[pin];
+            }
             var driveChanged = value != drivenValue[pin] || enabled != drivenEnable[pin];
             drivenValue[pin] = value;
             drivenEnable[pin] = enabled;
@@ -405,7 +495,7 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
 
         private bool ReadPadInput(int pin)
         {
-            return (pads[pin] & 0x40) != 0 && (!rp2350 || (pads[pin] & 0x100) == 0) && ReadWireLevel(pin);
+            return (pads[pin] & 0x40) != 0 && ReadWireLevel(pin);
         }
 
         private bool ReadWireLevel(int pin)
@@ -439,7 +529,12 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             for(var target = 0; target < interruptState.Length; target++)
             {
                 var state = false;
-                for(var group = 0; group < interruptGroupCount; group++) state |= MaskedInterrupts(target, group) != 0;
+                for(var group = 0; group < interruptGroupCount; group++)
+                {
+                    var mask = !rp2350 ? uint.MaxValue
+                        : target < 3 ? ~NonSecureInterruptMask(group) : NonSecureInterruptMask(group);
+                    state |= (MaskedInterrupts(target % 3, group) & mask) != 0;
+                }
                 if(state != interruptState[target])
                 {
                     interruptState[target] = state;
@@ -488,7 +583,13 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
         private bool resetting;
         private bool publishing;
         private readonly Queue<Notification> notifications = new Queue<Notification>();
-        private readonly bool[] interruptState = new bool[3];
+        private readonly bool[] interruptState;
+        private readonly GPIO[] interruptOutputs;
+        private readonly RP2350_AccessControl accessControl;
+        private readonly int securityPinOffset;
+        private readonly bool[] isolated;
+        private readonly bool[] isolatedOutput;
+        private readonly bool[] isolatedEnable;
 
         private readonly IRP2GPIO sio;
         private readonly bool rp2350;

@@ -9,7 +9,11 @@ using System.Threading;
 using System.Threading.Tasks;
 
 using Antmicro.Renode.Core;
+using Antmicro.Renode.Peripherals;
+using Antmicro.Renode.Peripherals.Bus;
+using Antmicro.Renode.Peripherals.CPU;
 using Antmicro.Renode.Peripherals.GPIOPort;
+using Antmicro.Renode.Peripherals.Miscellaneous;
 
 using NUnit.Framework;
 
@@ -82,7 +86,7 @@ namespace Antmicro.Renode.PeripheralsTests
         }
 
         [Test]
-        public void ShouldRequireInputEnableAndReleasedIsolationOnRP2350()
+        public void ShouldLatchInputEnableWithoutIsolatingTheInputOnRP2350()
         {
             var gpio = new RP2_GPIOBank0(machine, rp2350: true);
             gpio.OnGPIO(4, true);
@@ -90,6 +94,8 @@ namespace Antmicro.Renode.PeripheralsTests
             gpio.SetPadConfiguration(4, 0x56);
             Assert.IsTrue(gpio.GetInput(4));
             gpio.SetPadConfiguration(4, 0x156);
+            Assert.IsTrue(gpio.GetInput(4));
+            gpio.OnGPIO(4, false);
             Assert.IsFalse(gpio.GetInput(4));
         }
 
@@ -350,6 +356,196 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.IsFalse(gpio.GetInput(0));
             Assert.IsFalse(gpio.GetInput(1));
             Assert.IsFalse(gpio.Core0IRQ.IsSet);
+        }
+
+        [Test]
+        public void ShouldLatchOutputAndPadControlsWhileIsolated()
+        {
+            var gpio = new RP2_GPIOBank0(machine, rp2350: true);
+            gpio.SetPadConfiguration(47, 0x56);
+            gpio.WriteDoubleWord(47 * 8 + 4, 5);
+            gpio.SetPeripheralOutput(5, 47, true, true);
+            gpio.SetPadConfiguration(47, 0x156);
+            gpio.SetPeripheralOutput(5, 47, false, false);
+            gpio.SetPadConfiguration(47, 0x180);
+            gpio.GetOutputState(47, out var level, out var enabled);
+            Assert.IsTrue(level);
+            Assert.IsTrue(enabled);
+            Assert.IsTrue(gpio.GetInput(47));
+            gpio.OnGPIO(47, false);
+            Assert.IsFalse(gpio.GetInput(47));
+            gpio.ReleaseInput(47);
+            Assert.IsTrue(gpio.GetInput(47));
+            gpio.SetPadConfiguration(47, 0x80);
+            gpio.GetOutputState(47, out level, out enabled);
+            Assert.IsFalse(level);
+            Assert.IsFalse(enabled);
+            Assert.IsFalse(gpio.GetInput(47));
+        }
+
+        [Test]
+        public void ShouldReadColdResetPullUpThroughAnIsolatedInput()
+        {
+            var gpio = new RP2_GPIOBank0(machine, rp2350: true, numberOfPins: 8);
+            gpio.ResetPadConfiguration(2, 0x15a);
+            Assert.IsTrue(gpio.GetInput(2));
+            gpio.SetPadConfiguration(2, 0x156);
+            Assert.IsTrue(gpio.GetInput(2));
+            gpio.OnGPIO(2, false);
+            Assert.IsFalse(gpio.GetInput(2));
+            gpio.ReleaseInput(2);
+            Assert.IsTrue(gpio.GetInput(2));
+            gpio.SetPadConfiguration(2, 0x56);
+            Assert.IsFalse(gpio.GetInput(2));
+        }
+
+        [Test]
+        public void ShouldPreserveIsolationAndLatchedDriveAcrossPadBlockReset()
+        {
+            var gpio = new RP2_GPIOBank0(machine, rp2350: true);
+            var pads = new RP2_PadsBank0(machine, gpio, rp2350: true);
+            pads.WriteDoubleWord(4, 0x56);
+            gpio.WriteDoubleWord(4, 0xf01f);
+            pads.WriteDoubleWord(4, 0x156);
+            gpio.WriteDoubleWord(4, 0x1f);
+            pads.ResetHeld = true;
+            Assert.AreEqual(0x116u, pads.ReadDoubleWord(4));
+            gpio.GetOutputState(0, out var level, out var enabled);
+            Assert.IsTrue(level);
+            Assert.IsTrue(enabled);
+            Assert.IsTrue(gpio.GetInput(0));
+            pads.ResetHeld = false;
+            pads.WriteDoubleWord(4, 0x56);
+            gpio.GetOutputState(0, out level, out enabled);
+            Assert.IsFalse(enabled);
+            Assert.IsFalse(gpio.GetInput(0));
+        }
+
+        [Test]
+        public void ShouldRetainReleasedIsolationAcrossPadBlockReset()
+        {
+            var gpio = new RP2_GPIOBank0(machine, rp2350: true);
+            var pads = new RP2_PadsBank0(machine, gpio, rp2350: true);
+            pads.WriteDoubleWord(4, 0x56);
+            pads.ResetHeld = true;
+            Assert.AreEqual(0x16u, pads.ReadDoubleWord(4));
+            pads.ResetHeld = false;
+            pads.Reset();
+            Assert.AreEqual(0x116u, pads.ReadDoubleWord(4));
+        }
+
+        [Test]
+        public void ShouldExposeRP2350DebugPadRegisters()
+        {
+            var gpio = new RP2_GPIOBank0(machine, rp2350: true);
+            var pads = new RP2_PadsBank0(machine, gpio, rp2350: true);
+            Assert.AreEqual(0x5au, pads.ReadDoubleWord(0xc4));
+            Assert.AreEqual(0x5au, pads.ReadDoubleWord(0xc8));
+            pads.WriteDoubleWord(0xc4, uint.MaxValue);
+            pads.WriteDoubleWord(0xc8, uint.MaxValue);
+            Assert.AreEqual(0x1ffu, pads.ReadDoubleWord(0xc4));
+            Assert.AreEqual(0x1ffu, pads.ReadDoubleWord(0xc8));
+            pads.WriteDoubleWord(0x30c8, 0x100);
+            Assert.AreEqual(0xffu, pads.ReadDoubleWord(0xc8));
+        }
+
+        [Test]
+        public void ShouldRerouteUpperPinInterruptWhenItsSecurityMaskChanges()
+        {
+            var access = new RP2350_AccessControl(machine);
+            var gpio = new RP2_GPIOBank0(machine, rp2350: true, accessControl: access);
+            gpio.SetPadConfiguration(47, 0x56);
+            gpio.WriteDoubleWord(0x25c, 0x80000000);
+            gpio.OnGPIO(47, true);
+            Assert.IsTrue(gpio.Core0IRQ.IsSet);
+            Assert.IsFalse(gpio.Core0NonSecureIRQ.IsSet);
+            access.WriteDoubleWord(0x10, 1u << 15);
+            Assert.IsFalse(gpio.Core0IRQ.IsSet);
+            Assert.IsTrue(gpio.Core0NonSecureIRQ.IsSet);
+            Assert.AreEqual(0u, gpio.ReadDoubleWord(0x204));
+            Assert.AreEqual(1u << 15, gpio.ReadDoubleWord(0x20c));
+        }
+
+        [Test]
+        public void ShouldMapQSPIInterruptSecurityToItsSioBitPosition()
+        {
+            var access = new RP2350_AccessControl(machine);
+            var gpio = new RP2_GPIOBank0(machine, rp2350: true, numberOfPins: 8, accessControl: access, securityPinOffset: 56);
+            gpio.ResetPadConfiguration(2, 0x156);
+            gpio.WriteDoubleWord(0x248, 8u << 8);
+            gpio.OnGPIO(2, true);
+            access.WriteDoubleWord(0x10, 1u << 2);
+            Assert.IsTrue(gpio.Core0IRQ.IsSet);
+            Assert.IsFalse(gpio.Core0NonSecureIRQ.IsSet);
+            access.WriteDoubleWord(0x10, 1u << 26);
+            Assert.IsFalse(gpio.Core0IRQ.IsSet);
+            Assert.IsTrue(gpio.Core0NonSecureIRQ.IsSet);
+        }
+
+        [Test]
+        public void ShouldFilterNonSecurePinPadAndInterruptAccessesByTransactionAttributes()
+        {
+            var access = new RP2350_AccessControl(machine);
+            var gpio = new RP2_GPIOBank0(machine, rp2350: true, accessControl: access);
+            var pads = new RP2_PadsBank0(machine, gpio, rp2350: true);
+            var master = new TestBusMaster();
+            var state = new CortexM.ContextState { CpuSecure = true, AttributionSecure = false, Privileged = true };
+            machine.SystemBus.Register(gpio, new BusRangeRegistration(0x40028000, 0x4000));
+            machine.SystemBus.Register(pads, new BusRangeRegistration(0x40038000, 0x4000));
+            access.WriteDoubleWord(0xc, 1u << 3);
+            pads.WriteDoubleWord(4, 0x56);
+            pads.WriteDoubleWord(16, 0x56);
+            Assert.AreEqual(0u, machine.SystemBus.ReadDoubleWordWithState(0x40028004, master, state));
+            Assert.AreEqual(0x1fu, machine.SystemBus.ReadDoubleWordWithState(0x4002801c, master, state));
+            machine.SystemBus.WriteDoubleWordWithState(0x40028004, 5, master, state);
+            machine.SystemBus.WriteDoubleWordWithState(0x4002801c, 5, master, state);
+            Assert.AreEqual(0x1fu, gpio.ReadDoubleWord(4));
+            Assert.AreEqual(5u, gpio.ReadDoubleWord(28));
+            Assert.AreEqual(0u, machine.SystemBus.ReadDoubleWordWithState(0x40038004, master, state));
+            Assert.AreEqual(0x56u, machine.SystemBus.ReadDoubleWordWithState(0x40038010, master, state));
+            machine.SystemBus.WriteDoubleWordWithState(0x40038004, 0x5a, master, state);
+            machine.SystemBus.WriteDoubleWordWithState(0x40038010, 0x5a, master, state);
+            Assert.AreEqual(0x56u, pads.ReadDoubleWord(4));
+            Assert.AreEqual(0x5au, pads.ReadDoubleWord(16));
+            machine.SystemBus.WriteDoubleWordWithState(0x40028248, uint.MaxValue, master, state);
+            Assert.AreEqual(0xf000u, gpio.ReadDoubleWord(0x248));
+            gpio.OnGPIO(0, true);
+            gpio.OnGPIO(3, true);
+            Assert.AreEqual(0xa000u, machine.SystemBus.ReadDoubleWordWithState(0x40028230, master, state));
+            machine.SystemBus.WriteDoubleWordWithState(0x40028230, uint.MaxValue, master, state);
+            Assert.AreEqual(0x200au, gpio.ReadDoubleWord(0x230) & 0xf00f);
+            Assert.AreEqual(0u, machine.SystemBus.ReadDoubleWordWithState(0x40028200, master, state));
+            Assert.AreEqual(8u, machine.SystemBus.ReadDoubleWordWithState(0x40028208, master, state));
+        }
+
+        [TestCase(false, 0u)]
+        [TestCase(true, 0x116u)]
+        public void ShouldApplyOptionalQfn60A2PadSecurityRemapping(bool a2Remap, uint expected)
+        {
+            var access = new RP2350_AccessControl(machine);
+            var gpio = new RP2_GPIOBank0(machine, rp2350: true, numberOfPins: 30, accessControl: access);
+            var pads = new RP2_PadsBank0(machine, gpio, rp2350: true, rp2350A2PadRemap: a2Remap);
+            var master = new TestBusMaster();
+            var state = new CortexM.ContextState { AttributionSecure = false, Privileged = true };
+            machine.SystemBus.Register(pads, new BusRangeRegistration(0x40038000, 0x4000));
+            access.WriteDoubleWord(0xc, 1u << 8);
+            Assert.AreEqual(expected, machine.SystemBus.ReadDoubleWordWithState(0x40038004, master, state));
+        }
+
+        private sealed class TestBusMaster : IPeripheralWithTransactionState, IBusPeripheral
+        {
+            public void Reset() { }
+            public IReadOnlyDictionary<string, int> StateBits { get; } = new Dictionary<string, int>();
+            public bool TryConvertStateObjToUlong(IContextState stateObj, out ulong? state)
+            {
+                state = stateObj is CortexM.ContextState value ? (ulong?)value : null;
+                return state.HasValue;
+            }
+            public bool TryConvertUlongToStateObj(ulong? state, out IContextState stateObj)
+            {
+                stateObj = state.HasValue ? (CortexM.ContextState)state.Value : null;
+                return state.HasValue;
+            }
         }
 
         private sealed class TestReceiver : IGPIOReceiver
