@@ -17,7 +17,7 @@ using Antmicro.Renode.Time;
 
 namespace Antmicro.Renode.Peripherals.Miscellaneous
 {
-    public class RP2040_SIO : BaseGPIOPort, IDoubleWordPeripheral, IKnownSize, IHasFrequency
+    public class RP2040_SIO : BaseGPIOPort, IDoubleWordPeripheral, IKnownSize, IHasFrequency, IRP2GPIO
     {
         public RP2040_SIO(IMachine machine) : base(machine, GPIOCount + QSPICount)
         {
