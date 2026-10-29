@@ -70,7 +70,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 cores[number].Reset();
                 // Reset pauses the execution thread. Resume preserves native
                 // debugger halt/vector-catch state while restarting time progress.
-                if(resume) cores[number].Resume();
+                if(resume || cores[number].HasAnyHaltingCondition) cores[number].Resume();
                 WarmReset?.Invoke(number);
             });
         }
@@ -200,15 +200,20 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             rescueHeld = asserted;
             if(!asserted)
             {
-                foreach(var core in cores)
+                var generation = Volatile.Read(ref resetGeneration);
+                machine.LocalTimeSource.ExecuteInNearestSyncedState(_ =>
                 {
-                    core.CpuWaitSignal.Unset();
-                    // Machine-wide reset can already have left InReset while
-                    // this external rescue hold kept the execution source off.
-                    // Debugger vector catch is independent of the rescue hold.
-                    core.IsHalted = false;
-                    core.Resume();
-                }
+                    if(generation != Volatile.Read(ref resetGeneration) || rescueHeld) return;
+                    foreach(var core in cores)
+                    {
+                        // A protocol/MMIO callback can own the machine clock.
+                        // Apply lifecycle changes only after that transaction
+                        // and preserve independent PSM/RUN/debug hold sources.
+                        core.CpuWaitSignal.Unset();
+                        core.IsHalted = false;
+                        core.Resume();
+                    }
+                });
                 return;
             }
             // A rescue request resets POWMAN and the switched domain but retains

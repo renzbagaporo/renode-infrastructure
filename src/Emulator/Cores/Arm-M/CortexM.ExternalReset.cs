@@ -13,7 +13,18 @@ namespace Antmicro.Renode.Peripherals.CPU
             UpdateRequestedHaltedState();
         }
 
-        protected override bool IsHeldInReset => externalResetHeld;
+        internal void SetPowerSequencerResetHold(bool asserted)
+        {
+            if(powerSequencerResetHeld == asserted) return;
+            powerSequencerResetHeld = asserted;
+            // PSM transitions are dispatched at a synchronization boundary. Keep
+            // this source independent of external RUN, CpuWaitSignal and debug.
+            UpdateRequestedHaltedState();
+        }
+
+        protected override bool IsHeldInReset => externalResetHeld || powerSequencerResetHeld;
+
+        private volatile bool powerSequencerResetHeld;
 
         private volatile bool externalResetHeld;
     }
