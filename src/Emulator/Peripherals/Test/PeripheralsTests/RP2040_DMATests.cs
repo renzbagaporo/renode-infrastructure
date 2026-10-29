@@ -363,6 +363,28 @@ namespace Antmicro.Renode.PeripheralsTests
         }
 
         [Test]
+        public void ShouldAcceptAsynchronousDREQOnNextSystemClockEdge()
+        {
+            memory.WriteDoubleWord(0, 0x12345678);
+            Configure(0, Ram, Ram + 0x100, 2, Control(0, 2, 5, true, true));
+            ((BaseClockSource)machine.ClockSource).Advance(TimeInterval.FromNanoseconds(250));
+            dma.OnGPIO(5, true);
+            Assert.AreEqual(Ram, dma.ReadDoubleWord(0));
+            ((BaseClockSource)machine.ClockSource).Advance(TimeInterval.FromNanoseconds(750));
+            Assert.AreEqual(Ram + 4, dma.ReadDoubleWord(0));
+            dma.OnGPIO(5, false);
+            Advance(1);
+            Assert.AreEqual(0x12345678u, memory.ReadDoubleWord(0x100));
+            Assert.AreEqual(1u, dma.ReadDoubleWord(8));
+            ((BaseClockSource)machine.ClockSource).Advance(TimeInterval.FromNanoseconds(250));
+            dma.OnGPIO(5, true);
+            ((BaseClockSource)machine.ClockSource).Advance(TimeInterval.FromNanoseconds(750));
+            Assert.AreEqual(Ram + 8, dma.ReadDoubleWord(0));
+            Advance(1);
+            Assert.AreEqual(0u, dma.ReadDoubleWord(8));
+        }
+
+        [Test]
         public void ShouldWaitForSystemClockAndResumePendingTransferAtNewFrequency()
         {
             var clocks = new MutableClock { SystemFrequency = 1000000 };

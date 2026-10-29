@@ -10,6 +10,7 @@ using System.Numerics;
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Peripherals.Timers;
 using Antmicro.Renode.Time;
+using Antmicro.Renode.Utilities;
 
 namespace Antmicro.Renode.Peripherals.DMA
 {
@@ -23,9 +24,9 @@ namespace Antmicro.Renode.Peripherals.DMA
             this.frequency = clocks == null ? frequency : clocks.SystemFrequency;
             IRQ0 = new GPIO();
             IRQ1 = new GPIO();
-            cycleCounter = new LimitTimer(machine.ClockSource, Math.Max(1ul, this.frequency), this, "cycles",
+            cycleCounter = new PhasedTimer(machine.ClockSource, Math.Max(1ul, this.frequency), this, "cycles",
                 direction: Direction.Ascending, enabled: this.frequency != 0);
-            timer = new LimitTimer(machine.ClockSource, Math.Max(1ul, this.frequency), this, "bus",
+            timer = new PhasedTimer(machine.ClockSource, Math.Max(1ul, this.frequency), this, "bus",
                 limit: 1, workMode: WorkMode.OneShot, eventEnabled: true);
             timer.LimitReached += Tick;
             for(var i = 0; i < ChannelCount; i++) channels[i] = new Channel(i);
@@ -364,6 +365,9 @@ namespace Antmicro.Renode.Peripherals.DMA
             timer.Enabled = false;
             timer.Limit = delay;
             timer.ResetValue();
+            // A peripheral may assert DREQ between system clock edges. The
+            // dormant bus timer must resume the running clock's exact phase.
+            timer.Phase = cycleCounter.Phase;
             dueCycle = due;
             scheduled = true;
             timer.Enabled = true;
@@ -508,6 +512,29 @@ namespace Antmicro.Renode.Peripherals.DMA
             }
         }
 
+        private sealed class PhasedTimer : LimitTimer
+        {
+            public PhasedTimer(IClockSource clockSource, ulong frequency, IPeripheral owner, string name,
+                ulong limit = ulong.MaxValue, Direction direction = Direction.Descending, bool enabled = false,
+                WorkMode workMode = WorkMode.Periodic, bool eventEnabled = false)
+                : base(clockSource, frequency, owner, name, limit, direction, enabled, workMode, eventEnabled)
+            {
+                this.clockSource = clockSource;
+            }
+
+            public Fraction Phase
+            {
+                get => clockSource.GetClockEntry(OnLimitReached).ValueResiduum;
+                set => clockSource.ExchangeClockEntryWith(OnLimitReached, entry =>
+                {
+                    entry.ValueResiduum = value;
+                    return entry;
+                });
+            }
+
+            private readonly IClockSource clockSource;
+        }
+
         private sealed class Channel
         {
             public Channel(int index) { Index = index; }
@@ -535,7 +562,7 @@ namespace Antmicro.Renode.Peripherals.DMA
         private readonly ulong[] pacingPhase = new ulong[4];
         private readonly bool[] irqState = new bool[2];
         private readonly Queue<Notification> notifications = new Queue<Notification>();
-        private readonly LimitTimer timer, cycleCounter;
+        private readonly PhasedTimer timer, cycleCounter;
         private readonly IRP2ClockSource clocks;
         private Transfer pending;
         private ulong frequency, dueCycle, lastTimerCycle;
