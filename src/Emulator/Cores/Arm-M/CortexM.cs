@@ -916,7 +916,12 @@ namespace Antmicro.Renode.Peripherals.CPU
         public override string[] AllLLVMTriples => new[] { "thumb" };
 
         // LLVM considers M4F to be the "base" M4, see https://reviews.llvm.org/D12692
-        public override string LLVMModel => Model == "cortex-m4f" ? "cortex-m4" : Model;
+        public override string LLVMModel => Model switch
+        {
+            "cortex-m4f" => "cortex-m4",
+            "cortex-m33-rp2350" => "cortex-m33",
+            _ => Model,
+        };
 
         public const uint IDAU_SAURegionMinSize = 32u;
 
