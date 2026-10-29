@@ -370,11 +370,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             var instruction = sm.Instruction;
             var opcode = instruction >> 13;
             var argument = instruction & 0xff;
-            if(!sm.Started)
-            {
-                ApplySideSet(sm, instruction);
-                sm.Started = true;
-            }
+            // A stalled instruction asserts side-set on every execution clock.
+            // Treat the side strobe separately from OUT/SET and inline enable.
+            sm.Started = false;
+            ApplySideSet(sm, instruction);
+            sm.Started = true;
             var nextPC = sm.PC;
             var jump = false;
             var complete = true;
@@ -651,6 +651,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private void ResolvePinWrites()
         {
+            var now = cycleCounter.Value;
+            foreach(var sm in stateMachines)
+            {
+                if(!HasStalledSideSet(sm) || !ClockEnableAt(sm, now)) continue;
+                sm.Started = false;
+                ApplySideSet(sm, sm.Instruction);
+                sm.Started = true;
+            }
             var previousOutput = output;
             var previousEnable = outputEnable;
             foreach(var sm in stateMachines)
@@ -663,6 +671,58 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
             var changed = (previousOutput ^ output) | (previousEnable ^ outputEnable);
             for(var pin = 0; pin < 32; pin++) if((changed & (1u << pin)) != 0) QueuePin(pin);
+            foreach(var sm in stateMachines)
+            {
+                if(!HasStalledSideSet(sm)) continue;
+                SideSetState(sm, out var mask, out var value, out var directions);
+                var nextTick = (ulong)(NextClockEdge(sm, sm.Forced ? 256ul : Divider256(sm)) / 256);
+                // Higher-priority persistent writes can mask this strobe. They
+                // need no correction event when the lower write cannot win.
+                for(var higher = sm.Index + 1; higher < stateMachines.Length; higher++)
+                {
+                    var other = stateMachines[higher];
+                    if(!directions && (other.ExecControl & (1u << 17)) != 0) mask &= ~other.StickyMask;
+                    if(HasStalledSideSet(other) && ClockEnableAt(other, nextTick))
+                    {
+                        SideSetState(other, out var otherMask, out _, out var otherDirections);
+                        if(directions == otherDirections) mask &= ~otherMask;
+                    }
+                }
+                var current = directions ? outputEnable : output;
+                if(((current ^ value) & mask) != 0 && (!sm.Timer.Enabled || sm.DueTick > nextTick))
+                    Schedule(sm, wake: true, earliestTick: nextTick);
+            }
+        }
+
+        private bool HasStalledSideSet(StateMachine sm)
+        {
+            return !ResetHeld && frequency != 0 && (Enabled(sm) || sm.Forced) && sm.Stalled && sm.Started && SideCount(sm) != 0
+                && ((sm.ExecControl & (1u << 30)) == 0 || (sm.Instruction & 0x1000) != 0);
+        }
+
+        private static void SideSetState(StateMachine sm, out uint mask, out uint value, out bool directions)
+        {
+            var count = SideCount(sm);
+            var optional = (sm.ExecControl & (1u << 30)) != 0;
+            var data = (uint)(sm.Instruction >> (13 - count));
+            var pinBase = (int)((sm.PinControl >> 10) & 31);
+            directions = (sm.ExecControl & (1u << 29)) != 0;
+            mask = value = 0;
+            for(var bit = 0; bit < count - (optional ? 1 : 0); bit++)
+            {
+                var pin = (pinBase + bit) & 31;
+                mask |= 1u << pin;
+                if((data & (1u << bit)) != 0) value |= 1u << pin;
+            }
+        }
+
+        private static bool ClockEnableAt(StateMachine sm, ulong tick)
+        {
+            var divider = sm.Forced ? 256ul : Divider256(sm);
+            var delta = ((BigInteger)tick + 1) * 256 - 1 - sm.Edge256;
+            var steps = delta >= 0 ? delta / divider : -((-delta + divider - 1) / divider);
+            var edge = sm.Edge256 + steps * divider;
+            return edge >= 0 && edge / 256 == tick;
         }
 
         private void QueuePin(int pin)
@@ -883,10 +943,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             return remaining < 0 ? 1 : (ulong)(remaining / Divider256(sm) + 1);
         }
 
-        private BigInteger NextClockEdge(StateMachine sm)
+        private BigInteger NextClockEdge(StateMachine sm, ulong divider = 0)
         {
             var earliest = ((BigInteger)cycleCounter.Value + 1) * 256;
-            var divider = Divider256(sm);
+            if(divider == 0) divider = Divider256(sm);
             var remaining = sm.Edge256 - earliest;
             return remaining >= 0 ? sm.Edge256 - (remaining / divider) * divider
                 : sm.Edge256 + ((-remaining + divider - 1) / divider) * divider;

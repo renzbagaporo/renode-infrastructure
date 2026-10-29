@@ -709,6 +709,53 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.AreEqual(1u, pio.ReadDoubleWord(0xd4));
         }
 
+        [TestCase(false)]
+        [TestCase(true)]
+        public void ShouldKeepStalledSideSetPriorityAgainstOtherStateMachines(bool directions)
+        {
+            gpio.WriteDoubleWord(4, 6);
+            pio.WriteDoubleWord(0xdc, 1u << 26);
+            Force(0, 0xe081);
+            pio.WriteDoubleWord(0xf4, 1u << 29);
+            pio.WriteDoubleWord(0xe4, 0x1f000 | (directions ? 1u << 29 : 0));
+            Load(directions ? (ushort)0xe080 : (ushort)0xe000, 0x0000, 0x3084);
+            Force(1, 2);
+            pio.WriteDoubleWord(0, 3);
+            Advance(1);
+            GetOutputState(0, out var value, out var enabled);
+            Assert.IsTrue(directions ? enabled : value);
+            var changes = 0;
+            gpio.DriveChanged += (_, __, ___) => changes++;
+            Advance(8);
+            GetOutputState(0, out value, out enabled);
+            Assert.IsTrue(directions ? enabled : value);
+            Assert.AreEqual(0, changes, "A stalled higher SM still asserts side-set on every clock enable");
+        }
+
+        [Test]
+        public void ShouldRestoreStalledSideSetAtItsNextDividerEnable()
+        {
+            gpio.WriteDoubleWord(4, 6);
+            pio.WriteDoubleWord(0xdc, 1u << 26);
+            Force(0, 0xe081);
+            pio.WriteDoubleWord(0xf4, 1u << 29);
+            pio.WriteDoubleWord(0xe0, 3u << 16);
+            Load(0xe000, 0x0001, 0x3084);
+            Force(1, 2);
+            pio.WriteDoubleWord(0, 3);
+            Advance(3);
+            Assert.IsTrue(gpio.GetInput(0));
+            Advance(1);
+            Force(0, 0xe000); // between SM1's enables at3 and6
+            Assert.IsFalse(gpio.GetInput(0));
+            Advance(1);
+            Assert.IsFalse(gpio.GetInput(0));
+            Advance(1);
+            Assert.IsTrue(gpio.GetInput(0));
+            Advance(1000000); // the correction returns to an event-driven stall
+            Assert.IsTrue(gpio.GetInput(0));
+        }
+
         private uint SPIByte(uint value, bool lead, int mosi, int miso, int sck)
         {
             uint result = 0;
