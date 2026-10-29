@@ -5,12 +5,15 @@
 
 using System;
 using System.Collections.Generic;
+using System.Threading;
 using System.Linq;
 
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.CPU;
 using Antmicro.Renode.Peripherals.IRQControllers;
+using Antmicro.Renode.Peripherals.Memory;
+using Antmicro.Renode.Peripherals.MemoryControllers;
 using Antmicro.Renode.Peripherals.SPI;
 
 namespace Antmicro.Renode.Peripherals.Miscellaneous
@@ -18,17 +21,23 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
     public sealed class RP2350_POWMAN : RP2APBPeripheral, IGPIOReceiver
     {
         public RP2350_POWMAN(IMachine machine, CortexM core0, CortexM core1, NVIC nvic0, NVIC nvic1,
-            RP2350_DebugPort debugPort) : base(machine)
+            RP2350_DebugPort debugPort, RP2350_BootRAM bootRAM = null, RP2350_XIP xip = null,
+            MappedMemory sramLow = null, MappedMemory sramHigh = null) : base(machine)
         {
             cores = new[] { core0, core1 };
             nvics = new[] { nvic0, nvic1 };
             this.debugPort = debugPort;
+            this.bootRAM = bootRAM;
+            this.xip = xip;
+            this.sramLow = sramLow;
+            this.sramHigh = sramHigh;
             debugPort.RescueResetChanged += OnRescueReset;
             Reset();
         }
 
         public override void Reset()
         {
+            Interlocked.Increment(ref resetGeneration);
             badPassword = false;
             chipReset = 1u << 16;
             bootDisable = 0;
@@ -39,6 +48,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             powerState = timerControl = 0;
             Array.Clear(powerUp, 0, powerUp.Length);
             Array.Clear(scratch, 0, scratch.Length);
+            bootRAM?.SetPowerPresent(true);
+            xip?.SetPowerPresent(true);
+            machine.SystemBus.SetAddressRangeLocked(new Antmicro.Renode.Core.Range(0x20000000, 0x40000), false);
+            machine.SystemBus.SetAddressRangeLocked(new Antmicro.Renode.Core.Range(0x20040000, 0x42000), false);
         }
 
         public void OnGPIO(int number, bool value)
@@ -46,10 +59,18 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             if(!value || number < 0 || number >= cores.Length) return;
             // AIRCR SYSRESETREQ is an individual warm core reset on RP2350
             // (datasheet AIRCR bit 2). SW-DP and the sibling core keep running.
+            var generation = Volatile.Read(ref resetGeneration);
+            var core = cores[number];
+            var resume = !core.IsHalted && !core.CpuWaitSignal.IsSet && !core.HaltedByDebugger
+                && (!core.IsPaused || machine.IsPaused);
             machine.LocalTimeSource.ExecuteInNearestSyncedState(_ =>
             {
+                if(generation != Volatile.Read(ref resetGeneration) || rescueHeld) return;
                 nvics[number].Reset();
                 cores[number].Reset();
+                // Reset pauses the execution thread. Resume preserves native
+                // debugger halt/vector-catch state while restarting time progress.
+                if(resume) cores[number].Resume();
                 WarmReset?.Invoke(number);
             });
         }
@@ -136,10 +157,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     powerState |= 0x2000;
                     machine.LocalTimeSource.ExecuteInNearestSyncedState(_ =>
                     {
+                        var previous = powerState & 0xf;
                         powerState = (request << 4) | request;
+                        if((request & ~previous & 2) != 0) sramLow?.ZeroAll();
+                        if((request & ~previous & 1) != 0) sramHigh?.ZeroAll();
+                        bootRAM?.SetPowerPresent((request & 4) == 0);
+                        xip?.SetPowerPresent((request & 4) == 0);
                         machine.SystemBus.SetAddressRangeLocked(new Antmicro.Renode.Core.Range(0x20000000, 0x40000), (request & 2) != 0);
                         machine.SystemBus.SetAddressRangeLocked(new Antmicro.Renode.Core.Range(0x20040000, 0x42000), (request & 1) != 0);
-                        machine.SystemBus.SetAddressRangeLocked(new Antmicro.Renode.Core.Range(0x400e0000, 0x4000), (request & 4) != 0);
                         foreach(var core in cores) core.CpuWaitSignal.Set((request & 8) != 0);
                     });
                 }
@@ -175,7 +200,15 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             rescueHeld = asserted;
             if(!asserted)
             {
-                foreach(var core in cores) core.CpuWaitSignal.Unset();
+                foreach(var core in cores)
+                {
+                    core.CpuWaitSignal.Unset();
+                    // Machine-wide reset can already have left InReset while
+                    // this external rescue hold kept the execution source off.
+                    // Debugger vector catch is independent of the rescue hold.
+                    core.IsHalted = false;
+                    core.Resume();
+                }
                 return;
             }
             // A rescue request resets POWMAN and the switched domain but retains
@@ -195,6 +228,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }, retained);
         }
 
+        private readonly RP2350_BootRAM bootRAM;
+        private readonly RP2350_XIP xip;
+        private readonly MappedMemory sramLow;
+        private readonly MappedMemory sramHigh;
+        private int resetGeneration;
         private readonly CortexM[] cores;
         private readonly NVIC[] nvics;
         private readonly RP2350_DebugPort debugPort;

@@ -29,6 +29,23 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
             }
             PublishNotifications();
         }
+        public void SetPowerPresent(bool value)
+        {
+            lock(SyncRoot)
+            {
+                if(powerPresent == value) return;
+                powerPresent = value;
+                if(!value)
+                {
+                    Array.Clear(data, 0, data.Length);
+                    Array.Clear(tags, 0, tags.Length);
+                    Array.Clear(pinned, 0, pinned.Length);
+                }
+                configurationPending = true;
+            }
+            PublishNotifications();
+        }
+
         public event Action ConfigurationChanged;
         public event Action<long, int> ContentsChanged;
 
@@ -76,6 +93,7 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
             {
                 lock(SyncRoot)
                 {
+                    if(!powerPresent) throw new BusAccessException(BusAccessError.GenericError);
                     if(!Secure && (control & 0x100) == 0) throw new BusAccessException(BusAccessError.CommandError);
                     var operation = offset & 7;
                     var line = (int)((offset >> 3) & 0x7ff);
@@ -196,6 +214,7 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
 
         private void CheckAccess(bool useCache, bool untranslated)
         {
+            if(!powerPresent) throw new BusAccessException(BusAccessError.GenericError);
             if(useCache) return;
             var bit = untranslated ? (Secure ? 6 : 7) : (Secure ? 4 : 5);
             if((control & (1u << bit)) != 0) throw new BusAccessException(BusAccessError.CommandError);
@@ -211,6 +230,7 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
             }
         }
         private readonly Queue<KeyValuePair<long, int>> pendingRanges = new Queue<KeyValuePair<long, int>>();
+        private bool powerPresent = true;
         private bool configurationPending;
         private bool publishing;
         private readonly byte[] data = new byte[0x4000];

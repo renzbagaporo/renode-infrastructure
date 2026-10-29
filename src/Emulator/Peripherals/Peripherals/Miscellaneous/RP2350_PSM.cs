@@ -6,6 +6,7 @@
 //
 
 using System.Collections.Generic;
+using System.Threading;
 using System.Linq;
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Logging;
@@ -26,6 +27,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         public override void Reset()
         {
+            Interlocked.Increment(ref resetGeneration);
             forceOn = 0;
             forceOff = 0;
             watchdogSelect = 0;
@@ -47,15 +49,21 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 machine.RequestResetInSafeState(unresetable: retained);
                 return;
             }
+            var generation = Volatile.Read(ref resetGeneration);
+            var selected = watchdogSelect;
+            var resume = cores.Select(core => !core.IsHalted && !core.CpuWaitSignal.IsSet && !core.HaltedByDebugger
+                && (!core.IsPaused || machine.IsPaused)).ToArray();
             machine.LocalTimeSource.ExecuteInNearestSyncedState(_ =>
             {
+                if(generation != Volatile.Read(ref resetGeneration)) return;
                 for(var core = 0; core < cores.Length; core++)
                 {
-                    if((watchdogSelect & (1u << (Processor0Bit + core))) == 0) continue;
+                    if((selected & (1u << (Processor0Bit + core))) == 0) continue;
                     nvics[core].Reset();
                     cores[core].Reset();
+                    if(resume[core]) cores[core].Resume();
                 }
-                var unsupported = watchdogSelect & ~ProcessorMask;
+                var unsupported = selected & ~ProcessorMask;
                 if(unsupported != 0) this.Log(LogLevel.Warning, "Selective watchdog reset for PSM domains 0x{0:x} is not implemented", unsupported);
             });
         }
@@ -125,6 +133,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
         }
 
+        private int resetGeneration;
         private readonly CortexM[] cores;
         private readonly NVIC[] nvics;
         private uint forceOn;

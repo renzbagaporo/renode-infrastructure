@@ -30,6 +30,20 @@ namespace Antmicro.Renode.Peripherals.Memory
             }
         }
 
+        public void SetPowerPresent(bool value)
+        {
+            lock(SyncRoot)
+            {
+                if(powerPresent == value) return;
+                powerPresent = value;
+                if(!value)
+                {
+                    System.Array.Clear(words, 0, words.Length);
+                    Reset();
+                }
+            }
+        }
+
         // The RAM array samples byte enables, including on atomic aliases.
         // The control registers use the peripheral bridge's replicated data.
         public new void WriteByte(long offset, byte value)
@@ -97,6 +111,7 @@ namespace Antmicro.Renode.Peripherals.Memory
 
         private void RequireSecureAccess()
         {
+            if(!powerPresent) throw new BusAccessException(BusAccessError.GenericError);
             var bus = machine.SystemBus;
             if(bus.TryGetCurrentContextState<CortexM.ContextState>(out var _, out var state))
             {
@@ -110,6 +125,7 @@ namespace Antmicro.Renode.Peripherals.Memory
                 throw new BusAccessException(BusAccessError.CommandError);
         }
 
+        private bool powerPresent = true;
         private readonly RP2350_AccessControl accessControl;
         private readonly uint[] writeOnce = new uint[2];
         private uint unclaimedLocks;
