@@ -10,11 +10,14 @@ namespace Antmicro.Renode.Peripherals
 {
     // RP-series APB bridges replicate narrow writes across the data bus. The
     // upper address bits select an atomic operation on the destination register.
-    public abstract class RP2APBPeripheral : IDoubleWordPeripheral, IWordPeripheral, IBytePeripheral, IKnownSize
+    public abstract class RP2APBPeripheral : IDoubleWordPeripheral, IWordPeripheral, IBytePeripheral, IKnownSize, IRP2ResettablePeripheral
     {
         public uint ReadDoubleWord(long offset)
         {
-            return ReadRegister(offset & RegisterOffsetMask);
+            lock(SyncRoot)
+            {
+                return ReadRegister(offset & RegisterOffsetMask);
+            }
         }
 
         public ushort ReadWord(long offset)
@@ -29,9 +32,12 @@ namespace Antmicro.Renode.Peripherals
 
         public void WriteDoubleWord(long offset, uint value)
         {
-            if(!ResetHeld)
+            lock(SyncRoot)
             {
-                WriteRegister(offset & RegisterOffsetMask, value, (AtomicOperation)((offset >> 12) & 3));
+                if(!resetHeld)
+                {
+                    WriteRegister(offset & RegisterOffsetMask, value, (AtomicOperation)((offset >> 12) & 3));
+                }
             }
         }
 
@@ -51,19 +57,28 @@ namespace Antmicro.Renode.Peripherals
 
         public bool ResetHeld
         {
-            get => resetHeld;
+            get
+            {
+                lock(SyncRoot)
+                {
+                    return resetHeld;
+                }
+            }
             set
             {
-                if(value == resetHeld)
+                lock(SyncRoot)
                 {
-                    return;
+                    if(value == resetHeld)
+                    {
+                        return;
+                    }
+                    resetHeld = value;
+                    if(value)
+                    {
+                        Reset();
+                    }
+                    OnResetHeldChanged();
                 }
-                if(value)
-                {
-                    Reset();
-                }
-                resetHeld = value;
-                OnResetHeldChanged();
             }
         }
 
@@ -71,6 +86,10 @@ namespace Antmicro.Renode.Peripherals
         {
             this.machine = machine;
         }
+
+        // External protocol callbacks use the same monitor as register accesses
+        // and reset transitions. Shared-memory peripherals can supply its lock.
+        protected virtual object SyncRoot => this;
 
         protected static uint ApplyOperation(uint previous, uint value, AtomicOperation operation, uint writableMask = uint.MaxValue)
         {

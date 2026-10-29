@@ -5,6 +5,8 @@
 
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure;
+using Antmicro.Renode.Exceptions;
+using Antmicro.Renode.Peripherals.Memory;
 using Antmicro.Renode.Peripherals.Bus;
 using Antmicro.Renode.Peripherals.Miscellaneous;
 using Antmicro.Renode.Time;
@@ -188,6 +190,19 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.AreEqual(3u, ticks.ReadDoubleWord(0x0));
             ticks.WriteDoubleWord(0x3000, 1);
             Assert.AreEqual(0ul, ticks.GetFrequency(0));
+        }
+
+        [Test]
+        public void ShouldRejectPeripheralWithoutPersistentResetHold()
+        {
+            var resets = new RP2_Resets(machine);
+            machine.SystemBus.Register(resets, new BusRangeRegistration(0x4000c000, 0x4000));
+            var registration = new NumberRegistrationPoint<int>(12);
+            var unsupported = new MappedMemory(machine, 0x1000);
+            Assert.Throws<RegistrationException>(() => resets.Register(unsupported, registration));
+            Assert.That(resets.Children, Is.Empty);
+            resets.Register(pllSys, registration);
+            Assert.IsTrue(pllSys.ResetHeld);
         }
 
         [Test]

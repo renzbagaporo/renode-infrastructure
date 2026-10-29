@@ -28,7 +28,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             var index = registrationPoint.Address;
             if(index < 0 || index >= numberOfResetLines || peripherals.ContainsKey(index))
             {
-                throw new RegistrationException("Invalid or occupied RP2350 reset line");
+                throw new RegistrationException("Invalid or occupied RP2 reset line");
+            }
+            if(!(peripheral is IRP2ResettablePeripheral))
+            {
+                throw new RegistrationException("RP2 reset lines require a peripheral implementing persistent reset hold");
             }
             peripherals.Add(index, peripheral);
             machine.RegisterAsAChildOf(this, peripheral, registrationPoint);
@@ -40,7 +44,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             var indices = peripherals.Where(x => x.Value == peripheral).Select(x => x.Key).ToArray();
             if(indices.Length == 0)
             {
-                throw new RegistrationException("Peripheral is not attached to an RP2350 reset line");
+                throw new RegistrationException("Peripheral is not attached to an RP2 reset line");
             }
             foreach(var index in indices)
             {
@@ -112,15 +116,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private void SetResetState(int index, bool asserted)
         {
-            var peripheral = peripherals[index];
-            if(peripheral is RP2APBPeripheral apbPeripheral)
-            {
-                apbPeripheral.ResetHeld = asserted;
-            }
-            else if(asserted)
-            {
-                peripheral.Reset();
-            }
+            ((IRP2ResettablePeripheral)peripherals[index]).ResetHeld = asserted;
         }
 
         private uint reset;

@@ -94,6 +94,7 @@ namespace Antmicro.Renode.UnitTests
             peripheral.ResetHeld = true;
             Assert.AreEqual(1, peripheral.ResetChanges);
             Assert.IsTrue(peripheral.LastResetState);
+            Assert.IsTrue(peripheral.ResetHeldDuringReset);
             peripheral.ResetHeld = false;
             Assert.AreEqual(2, peripheral.ResetChanges);
             Assert.IsFalse(peripheral.LastResetState);
@@ -134,6 +135,7 @@ namespace Antmicro.Renode.UnitTests
 
             public override void Reset()
             {
+                ResetHeldDuringReset = ResetHeld;
                 Value = 0;
                 ReadCount = 0;
             }
@@ -145,6 +147,8 @@ namespace Antmicro.Renode.UnitTests
             public int ResetChanges { get; private set; }
 
             public bool LastResetState { get; private set; }
+
+            public bool ResetHeldDuringReset { get; private set; }
 
             protected override void OnResetHeldChanged()
             {
