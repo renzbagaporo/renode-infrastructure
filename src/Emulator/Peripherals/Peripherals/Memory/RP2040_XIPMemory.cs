@@ -4,9 +4,9 @@
 //
 
 using System;
-using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Threading;
 
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Peripherals.Bus;
@@ -16,10 +16,11 @@ using Antmicro.Renode.Peripherals.SPI;
 
 namespace Antmicro.Renode.Peripherals.Memory
 {
-    // The cache is not retained: all reads fetch the NOR backing data. XIP
-    // writes invalidate cache tags and must never program the serial flash.
+    // Reads and instruction fetches use the bus so SSI/NOR availability is
+    // observed without changing mapped memory while a clock callback runs.
+    // Programming remains available only through the flash serial interface.
     public sealed class RP2040_XIPMemory : IBytePeripheral, IWordPeripheral, IDoubleWordPeripheral,
-        IQuadWordPeripheral, IMultibyteWritePeripheral, IMapped, IKnownSize, IMemory, IDisposable
+        IQuadWordPeripheral, IMultibyteWritePeripheral, IExecutableIO, IKnownSize, IDisposable
     {
         public RP2040_XIPMemory(IMachine machine, WinbondW25QFlash flash, RP2040_XIP xip)
         {
@@ -27,17 +28,45 @@ namespace Antmicro.Renode.Peripherals.Memory
             this.flash = flash;
             this.xip = xip;
             flash.StateChanged += InvalidateInstructions;
-            xip.AvailabilityChanged += RouteDataAccessesThroughBus;
+            xip.AvailabilityChanged += InvalidateInstructions;
             machine.PeripheralsChanged += OnPeripheralsChanged;
         }
 
-        public byte ReadByte(long offset) => xip.Available ? flash.UnderlyingMemory.ReadByte(offset) : (byte)0;
+        public byte ReadByte(long offset) => (byte)ReadTransaction(offset, 1);
+        public ushort ReadWord(long offset) => (ushort)ReadTransaction(offset, 2);
+        public uint ReadDoubleWord(long offset) => (uint)ReadTransaction(offset, 4);
+        public ulong ReadQuadWord(long offset) => ReadTransaction(offset, 8);
 
-        public ushort ReadWord(long offset) => xip.Available ? flash.UnderlyingMemory.ReadWord(offset) : (ushort)0;
+        private ulong ReadTransaction(long offset, int count)
+        {
+            if(offset < 0 || offset > Size - count) throw new BusAccessException(BusAccessError.AddressError);
+            SynchronizeDataAccess();
+            if(machine.GetSystemBus(this).TryGetCurrentContextState<CortexM.ContextState>(out var _, out var state)
+                && state.InstructionFetch) Volatile.Write(ref hasFetchedInstructions, 1);
+            ulong value = 0;
+            machine.ClockSource.ExecuteInLock(() =>
+            {
+                if(!CanRead()) return;
+                for(var i = 0; i < count; i++) value |= (ulong)flash.UnderlyingMemory.ReadByte(offset + i) << (8 * i);
+            });
+            return value;
+        }
 
-        public uint ReadDoubleWord(long offset) => xip.Available ? flash.UnderlyingMemory.ReadDoubleWord(offset) : 0;
+        private void SynchronizeDataAccess()
+        {
+            var bus = machine.GetSystemBus(this);
+            if(bus.TryGetCurrentContextState<CortexM.ContextState>(out var _, out var state)
+                && (state.InstructionFetch || state.DebugAccess)) return;
+            if(bus.TryGetTransactionInitiator(out var initiator) && initiator is ICPU cpu) cpu.SyncTime();
+        }
 
-        public ulong ReadQuadWord(long offset) => xip.Available ? flash.UnderlyingMemory.ReadQuadWord(offset) : 0;
+        private bool CanRead()
+        {
+            if(xip.Available) return true;
+            if(machine.GetSystemBus(this).TryGetCurrentContextState<CortexM.ContextState>(out var _, out var state)
+                && state.InstructionFetch) throw new BusAccessException(BusAccessError.GenericError);
+            return false;
+        }
 
         public void WriteByte(long offset, byte value)
         {
@@ -57,7 +86,13 @@ namespace Antmicro.Renode.Peripherals.Memory
 
         public byte[] ReadBytes(long offset, int count, IPeripheral context = null)
         {
-            return xip.Available ? flash.UnderlyingMemory.ReadBytes(offset, count) : new byte[count];
+            SynchronizeDataAccess();
+            var result = new byte[count];
+            machine.ClockSource.ExecuteInLock(() =>
+            {
+                if(CanRead()) result = flash.UnderlyingMemory.ReadBytes(offset, count);
+            });
+            return result;
         }
 
         public void WriteBytes(long offset, byte[] array, int startingIndex, int count, IPeripheral context = null)
@@ -67,15 +102,18 @@ namespace Antmicro.Renode.Peripherals.Memory
         public void LoadBinary(string fileName, long offset = 0)
         {
             var data = File.ReadAllBytes(fileName);
-            flash.UnderlyingMemory.WriteBytes(offset, data, 0, data.Length);
-            InvalidateInstructions();
+            machine.ClockSource.ExecuteInLock(() =>
+            {
+                flash.UnderlyingMemory.WriteBytes(offset, data, 0, data.Length);
+                InvalidateInstructions();
+            });
         }
 
         public void Dispose()
         {
             machine.PeripheralsChanged -= OnPeripheralsChanged;
             flash.StateChanged -= InvalidateInstructions;
-            xip.AvailabilityChanged -= RouteDataAccessesThroughBus;
+            xip.AvailabilityChanged -= InvalidateInstructions;
             flash.UnderlyingMemory.Dispose();
         }
 
@@ -85,8 +123,6 @@ namespace Antmicro.Renode.Peripherals.Memory
         }
 
         public long Size => flash.UnderlyingMemory.Size;
-
-        public IEnumerable<IMappedSegment> MappedSegments => flash.UnderlyingMemory.MappedSegments;
 
         private void OnPeripheralsChanged(IMachine _, PeripheralsChangedEventArgs change)
         {
@@ -98,10 +134,6 @@ namespace Antmicro.Renode.Peripherals.Memory
 
         private void RouteDataAccessesThroughBus()
         {
-            if(!xip.Available)
-            {
-                return;
-            }
             var bus = machine.GetSystemBus(this);
             foreach(var registration in bus.GetRegistrationPoints(this))
             {
@@ -114,13 +146,16 @@ namespace Antmicro.Renode.Peripherals.Memory
 
         private void InvalidateInstructions()
         {
+            if(Volatile.Read(ref hasFetchedInstructions) == 0) return;
             foreach(var cpu in machine.GetSystemBus(this).GetCPUs().OfType<TranslationCPU>())
             {
-                cpu.InvalidateTranslationBlocks();
+                // Request clearing on the CPU thread after a concurrent code
+                // translation returns, including any newly published block.
+                cpu.RequestTranslationCacheClearing();
             }
-            RouteDataAccessesThroughBus();
         }
 
+        private int hasFetchedInstructions;
         private readonly IMachine machine;
         private readonly WinbondW25QFlash flash;
         private readonly RP2040_XIP xip;

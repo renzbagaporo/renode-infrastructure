@@ -9,12 +9,11 @@ using Antmicro.Renode.Core;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.SPI;
 
-using Range = Antmicro.Renode.Core.Range;
 
 namespace Antmicro.Renode.Peripherals.MemoryControllers
 {
-    // XIP aliases share the NOR backing memory. Removing their CPU mappings
-    // when the serial interface cannot issue a flash read also blocks fetches.
+    // XIP aliases consult the serial controller and NOR state for each bus
+    // transaction, including instruction fetches.
     public sealed class RP2040_XIP : RP2APBPeripheral
     {
         public RP2040_XIP(IMachine machine, RP2040_SSI ssi, WinbondW25QFlash flash) : base(machine)
@@ -33,7 +32,17 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
             UpdateAvailability();
         }
 
-        public bool Available => ssi.IsXIPReady && FlashAcceptsRead;
+        public bool Available
+        {
+            get
+            {
+                var available = false;
+                machine.ClockSource.ExecuteInLock(() => available =
+                    ssi.TryGetXIPConfiguration(out var serialControl, out var frameFormat)
+                    && FlashAcceptsRead(serialControl, frameFormat));
+                return available;
+            }
+        }
 
         public event Action AvailabilityChanged;
 
@@ -74,37 +83,22 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
             }
         }
 
-        private bool FlashAcceptsRead
+        private bool FlashAcceptsRead(uint serialControl, uint frameFormat)
         {
-            get
+            if(!flash.ReadAvailable) return false;
+            var instructionLength = (serialControl >> 8) & 3;
+            var command = (serialControl >> 24) & 0xff;
+            if(frameFormat == 0)
             {
-                if(!flash.ReadAvailable)
-                {
-                    return false;
-                }
-                var serialControl = ssi.ReadDoubleWord(0xf4);
-                var instructionLength = (serialControl >> 8) & 3;
-                var command = (serialControl >> 24) & 0xff;
-                var frameFormat = (ssi.ReadDoubleWord(0) >> 21) & 3;
-                if(frameFormat == 0)
-                {
-                    return !flash.ContinuousReadEnabled && instructionLength == 2 && (command == 3 || command == 0xb);
-                }
-                if(frameFormat != 2 || !flash.QuadEnabled)
-                {
-                    return false;
-                }
-                if(instructionLength == 0)
-                {
-                    return flash.ContinuousReadEnabled;
-                }
-                return !flash.ContinuousReadEnabled && instructionLength == 2 && (command == 0x6b || command == 0xeb);
+                return !flash.ContinuousReadEnabled && instructionLength == 2 && (command == 3 || command == 0xb);
             }
+            if(frameFormat != 2 || !flash.QuadEnabled) return false;
+            if(instructionLength == 0) return flash.ContinuousReadEnabled;
+            return !flash.ContinuousReadEnabled && instructionLength == 2 && (command == 0x6b || command == 0xeb);
         }
 
         private void UpdateAvailability()
         {
-            machine.GetSystemBus(this).SetAddressRangeLocked(new Range(0x10000000, 0x04000000), !Available);
             AvailabilityChanged?.Invoke();
         }
 

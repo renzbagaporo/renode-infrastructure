@@ -36,6 +36,11 @@ namespace Antmicro.Renode.Peripherals.SPI
 
         public override void Reset()
         {
+            machine.ClockSource.ExecuteInLock(ResetState);
+        }
+
+        private void ResetState()
+        {
             EndTransaction();
             frameInProgress = false;
             transferTimer.Reset();
@@ -64,7 +69,17 @@ namespace Antmicro.Renode.Peripherals.SPI
 
         public uint ReadDoubleWord(long offset)
         {
+            // Both cores can report time progress. Serialize all bus state
+            // with timer callbacks using the clock's canonical lock, after
+            // reporting the initiating CPU's progress outside that lock.
             SynchronizeTime();
+            uint result = 0;
+            machine.ClockSource.ExecuteInLock(() => result = ReadRegister(offset));
+            return result;
+        }
+
+        private uint ReadRegister(long offset)
+        {
             offset &= 0xfff;
             if(IsDataRegister(offset))
             {
@@ -106,11 +121,16 @@ namespace Antmicro.Renode.Peripherals.SPI
         public void WriteDoubleWord(long offset, uint value)
         {
             SynchronizeTime();
+            machine.ClockSource.ExecuteInLock(() => WriteRegister(offset, value));
+        }
+
+        private void WriteRegister(long offset, uint value)
+        {
             var operation = (offset >> 12) & 3;
             offset &= 0xfff;
             if(operation != 0)
             {
-                var previous = ReadDoubleWord(offset);
+                var previous = ReadRegister(offset);
                 value = operation == 1 ? previous ^ value : operation == 2 ? previous | value : previous & ~value;
             }
             if(IsDataRegister(offset))
@@ -171,26 +191,44 @@ namespace Antmicro.Renode.Peripherals.SPI
         // Forced low preserves the slave transaction while SSI's FIFO is idle.
         public uint ChipSelectOverride
         {
-            get => chipSelectOverride;
+            get
+            {
+                uint result = 0;
+                machine.ClockSource.ExecuteInLock(() => result = chipSelectOverride);
+                return result;
+            }
             set
             {
                 SynchronizeTime();
-                var next = value & 3;
-                if(next == 3 || (next == 0 && chipSelectOverride == 2 && !transferTimer.Enabled && !frameInProgress)) EndTransaction();
-                chipSelectOverride = next;
-                ConfigurationChanged?.Invoke();
+                machine.ClockSource.ExecuteInLock(() => SetChipSelectOverride(value));
             }
+        }
+
+        private void SetChipSelectOverride(uint value)
+        {
+            var next = value & 3;
+            if(next == 3 || (next == 0 && chipSelectOverride == 2 && !transferTimer.Enabled && !frameInProgress)) EndTransaction();
+            chipSelectOverride = next;
+            ConfigurationChanged?.Invoke();
         }
 
         public ulong Frequency
         {
-            get => transferTimer.Frequency;
+            get
+            {
+                ulong result = 0;
+                machine.ClockSource.ExecuteInLock(() => result = transferTimer.Frequency);
+                return result;
+            }
             set
             {
                 SynchronizeTime();
-                var updateDeadline = frameInProgress && machine.ClockSource.CurrentValue < frameDeadline;
-                transferTimer.Frequency = value;
-                if(updateDeadline) frameDeadline = transferTimer.Deadline;
+                machine.ClockSource.ExecuteInLock(() =>
+                {
+                    var updateDeadline = frameInProgress && machine.ClockSource.CurrentValue < frameDeadline;
+                    transferTimer.Frequency = value;
+                    if(updateDeadline) frameDeadline = transferTimer.Deadline;
+                });
             }
         }
 
@@ -203,7 +241,34 @@ namespace Antmicro.Renode.Peripherals.SPI
 
         // This model exposes 32-bit XIP bus words in EEPROM-read mode.
         // The external flash must also accept the configured instruction/mode.
-        public bool IsXIPReady => Enabled && registers[4] == 1 && chipSelectOverride == 0
+        public bool IsXIPReady
+        {
+            get
+            {
+                var result = false;
+                machine.ClockSource.ExecuteInLock(() => result = XIPReady);
+                return result;
+            }
+        }
+
+        // A notification may query XIP state while the clock lock is held.
+        // This snapshot must not enter the public bus access/CPU.SyncTime path.
+        internal bool TryGetXIPConfiguration(out uint serialControl, out uint frameFormat)
+        {
+            uint serial = 0, format = 0;
+            var ready = false;
+            machine.ClockSource.ExecuteInLock(() =>
+            {
+                ready = XIPReady;
+                serial = registers[0xf4 / 4];
+                format = (registers[0] >> 21) & 3;
+            });
+            serialControl = serial;
+            frameFormat = format;
+            return ready;
+        }
+
+        private bool XIPReady => Enabled && registers[4] == 1 && chipSelectOverride == 0
             && registers[0x14 / 4] != 0 && Mode == 3 && FrameBits == 32
             && (LaneWidth == 1 || LaneWidth == 2 || LaneWidth == 4)
             && ((registers[0xf4 / 4] >> 2) & 15) >= 6
