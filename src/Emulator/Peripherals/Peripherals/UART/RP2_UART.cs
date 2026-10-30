@@ -5,6 +5,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Threading;
 
 using Antmicro.Migrant;
 using Antmicro.Renode.Core;
@@ -370,6 +371,9 @@ namespace Antmicro.Renode.Peripherals.UART
         // device. Publish after releasing the UART state lock.
         private void PublishPending()
         {
+            // ResetHeld invokes Reset while the APB base owns this monitor.
+            // Its completion hook publishes after that outer lock is released.
+            if(Monitor.IsEntered(SyncRoot)) return;
             lock(SyncRoot)
             {
                 if(publishing) return;

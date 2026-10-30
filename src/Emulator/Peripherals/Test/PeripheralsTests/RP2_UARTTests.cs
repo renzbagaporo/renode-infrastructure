@@ -562,6 +562,60 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.IsTrue(uart.RxDMA.IsSet);
         }
 
+        [TestCase("irq", false)]
+        [TestCase("rts", false)]
+        [TestCase("rx_dma", false)]
+        [TestCase("tx_dma", false)]
+        [TestCase("irq", true)]
+        [TestCase("rts", true)]
+        [TestCase("rx_dma", true)]
+        [TestCase("tx_dma", true)]
+        public void ShouldPublishResetSignalsAfterReleasingState(string signal, bool heldReset)
+        {
+            Configure(false);
+            uart.WriteDoubleWord(0x2030, 0x800); // Assert active-low RTS.
+            uart.WriteDoubleWord(0x38, 0x10);
+            uart.WriteDoubleWord(0x48, 3);
+            uart.WriteChar(0x41);
+            GPIO outputSignal;
+            switch(signal)
+            {
+            case "irq": outputSignal = uart.IRQ; break;
+            case "rts": outputSignal = uart.RTS; break;
+            case "rx_dma": outputSignal = uart.RxDMA; break;
+            default: outputSignal = uart.TxDMA; break;
+            }
+            Assert.AreEqual(signal != "rts", outputSignal.IsSet);
+            var observedValues = new List<bool>();
+            var observedLocks = new List<bool>();
+            var receiver = new SignalReceiver(null);
+            // GPIO.Connect initially publishes the existing value, so only
+            // subscribe after that synchronization callback has completed.
+            outputSignal.Connect(receiver, 0);
+            observedValues.Clear();
+            observedLocks.Clear();
+            receiver.Callback = value =>
+            {
+                observedValues.Add(value);
+                observedLocks.Add(Monitor.IsEntered(uart));
+                Assert.AreEqual(0x300u, uart.ReadDoubleWord(0x30));
+            };
+            if(heldReset) uart.ResetHeld = true;
+            else uart.Reset();
+            CollectionAssert.AreEqual(new[] { signal == "rts" }, observedValues);
+            CollectionAssert.AreEqual(new[] { false }, observedLocks,
+                "Synchronous receivers must run after the outer reset state lock is released");
+            Assert.AreEqual(signal == "rts", outputSignal.IsSet);
+        }
+
+        private sealed class SignalReceiver : IGPIOReceiver
+        {
+            public SignalReceiver(Action<bool> callback) => Callback = callback;
+            public void OnGPIO(int number, bool value) => Callback?.Invoke(value);
+            public void Reset() { }
+            public Action<bool> Callback;
+        }
+
         private void Configure(bool fifo, bool enable = true)
         {
             uart.WriteDoubleWord(0x24, 1);
