@@ -8,7 +8,6 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -190,19 +189,14 @@ namespace Antmicro.Renode.Utilities
         {
             try
             {
-                // This thread will poll for bytes constantly for `MaxReadThreadPoolingTimeMs` to assert we have the lowest possible latency while transmiting packet.
-                var watch = new Stopwatch();
                 while(!cancellationToken.IsCancellationRequested)
                 {
-                    watch.Start();
-                    while(watch.ElapsedMilliseconds < MaxReadThreadPoolingTimeMs)
+                    while(queue.TryDequeue(out var dequeued))
                     {
-                        while(queue.TryDequeue(out var dequeued))
-                        {
-                            ProcessWrite(stream, dequeued);
-                        }
+                        ProcessWrite(stream, dequeued);
                     }
-                    watch.Reset();
+                    // Send signals after enqueueing. A notification received
+                    // while draining remains set until this wait consumes it.
                     enqueuedEvent.WaitOne();
                 }
             }
@@ -514,7 +508,6 @@ namespace Antmicro.Renode.Utilities
         private readonly string serverName;
 
         private const int IACEscape = 255;
-        private const int MaxReadThreadPoolingTimeMs = 60;
 
         private enum TelnetReadState
         {
