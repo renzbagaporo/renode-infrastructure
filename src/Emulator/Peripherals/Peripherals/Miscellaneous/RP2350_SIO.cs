@@ -65,6 +65,45 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public GPIO Core1NonSecureDoorbellIRQ { get; } = new GPIO();
         public event Action GPIOChanged;
 
+        // Control bits: operation [1:0] (write/xor/set/clear), register group
+        // [3:2] (output/OE/input), read [4]. The CPU decoder supplies a single
+        // 64-bit mask so paired transfers publish one coherent GPIO change.
+        public ulong AccessGPIOCoprocessor(uint control, ulong value, ulong mask, bool secure, int core)
+        {
+            if(core < 0 || core > 1 || (control & ~0x1fu) != 0 || ((control >> 2) & 3) > 2
+                || ((control & 16) == 0 && ((control >> 2) & 3) == 2))
+            {
+                throw new ArgumentOutOfRangeException(nameof(control));
+            }
+            try
+            {
+                lock(sync)
+                {
+                    // FORCE_CORE_NS extends the system security policy to SIO
+                    // (datasheet 10.2.1). Apply that shared peripheral policy to
+                    // this direct port as well as the memory-mapped interface.
+                    if(accessControl != null && accessControl.CoreIsForcedNonSecure(core)) secure = false;
+                    var allowed = GPIOMask(secure ? 0 : 1);
+                    var group = (control >> 2) & 3;
+                    var previous = group == 0 ? gpioOutput : group == 1 ? gpioEnable : Inputs;
+                    if((control & 16) != 0) return previous & allowed;
+                    mask &= allowed;
+                    value &= mask;
+                    switch(control & 3)
+                    {
+                    case 0: previous = (previous & ~mask) | value; break;
+                    case 1: previous ^= value; break;
+                    case 2: previous |= value; break;
+                    case 3: previous &= ~value; break;
+                    }
+                    if(group == 0) gpioOutput = previous; else gpioEnable = previous;
+                    gpioChanged = pending = true;
+                    return previous & allowed;
+                }
+            }
+            finally { Publish(); }
+        }
+
         private uint Read(long offset, bool mirror)
         {
             var bank = Bank(mirror, out var core);
