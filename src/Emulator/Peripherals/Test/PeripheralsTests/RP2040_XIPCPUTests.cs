@@ -159,14 +159,16 @@ namespace Antmicro.Renode.PeripheralsTests
         [TestCase(true)] [TestCase(false)]
         public void ShouldPublishAvailabilityWhileAnotherNativeCorePollsSsi(bool flashNotification)
         {
+            EmulationManager.Instance.Clear();
             var emulation = EmulationManager.Instance.CurrentEmulation;
             var machine = new Machine(createLocalTimeSource: true);
             emulation.AddMachine(machine, "xip_peer_poll");
             using(var transitionEntered = new ManualResetEventSlim())
             using(var allowNotification = new ManualResetEventSlim())
             using(var peerAboutToRead = new ManualResetEventSlim())
+            using(var publisherCompleted = new ManualResetEventSlim())
+            using(var peerCompleted = new ManualResetEventSlim())
             {
-                Task execution = null;
                 try
                 {
                     var memory = new MappedMemory(machine, 0x1000);
@@ -233,23 +235,32 @@ namespace Antmicro.Renode.PeripheralsTests
                         Console.WriteLine("Native peer about to read SSI");
                         peerAboutToRead.Set();
                     });
+                    // These events are reached by native execution only after
+                    // the real publisher write and peer read/store have returned.
+                    cpu0.AddHook(Ram + 0x106, (_, __) => publisherCompleted.Set());
+                    var firstCompletedRead = 1;
+                    cpu1.AddHook(Ram + 0x186, (_, __) =>
+                    {
+                        if(Interlocked.Exchange(ref firstCompletedRead, 0) != 0) peerCompleted.Set();
+                    });
                     if(flashNotification) cpu0.SetRegister(1, 0x40000000);
                     Volatile.Write(ref armed, 1);
-                    execution = Task.Run(() => emulation.RunFor(TimeInterval.FromMicroseconds(100)));
+                    emulation.StartAll();
                     Assert.IsTrue(transitionEntered.Wait(TimeSpan.FromSeconds(5)), "Native publisher did not reach availability transition");
                     Assert.IsTrue(peerAboutToRead.Wait(TimeSpan.FromSeconds(5)), "Native peer did not reach its actual SSI read");
                     Thread.Sleep(50); // Let the peer enter the shared bus/clock path.
                     allowNotification.Set();
-                    Assert.IsTrue(execution.Wait(TimeSpan.FromSeconds(5)), "Availability publication deadlocked against native SSI polling");
+                    Assert.IsTrue(publisherCompleted.Wait(TimeSpan.FromSeconds(5)), "Native availability publisher did not return from its actual bus write");
+                    Assert.IsTrue(peerCompleted.Wait(TimeSpan.FromSeconds(5)), "Native peer did not return from its actual SSI read and publish its result");
                     Assert.AreEqual(1u, memory.ReadDoubleWord(0x300));
                     Assert.Greater(memory.ReadDoubleWord(0x304), 0u);
                 }
                 finally
                 {
                     allowNotification.Set();
-                    // The external isolated runner also bounds a model deadlock;
-                    // ordinary assertion paths still release the fixture gate.
-                    if(execution != null && !execution.IsCompleted) execution.Wait(TimeSpan.FromSeconds(1));
+                    // The isolated runner bounds a real model deadlock as well.
+                    // No background RunFor task can survive this owned scenario.
+                    emulation.PauseAll();
                     emulation.RemoveMachine(machine);
                 }
             }
