@@ -284,7 +284,10 @@ namespace Antmicro.Renode.Peripherals.SPI
         }
 
         private int Address => transaction.Count >= 4 ? ((transaction[1] << 16) | (transaction[2] << 8) | transaction[3]) & AddressMask : 0;
-        private bool Busy => operationTimer.Enabled;
+        // A one-shot timer is disabled before its queued callback runs. The
+        // operation remains busy until that callback has committed the array,
+        // status registers and WEL. Keep the timer read's clock synchronization.
+        private bool Busy => operationTimer.Enabled || pendingData != null;
         private readonly MappedMemory underlyingMemory;
         private readonly ulong uniqueId;
         private readonly byte memoryType;
