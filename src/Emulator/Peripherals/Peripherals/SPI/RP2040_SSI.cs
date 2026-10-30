@@ -23,8 +23,7 @@ namespace Antmicro.Renode.Peripherals.SPI
             transmitFifo = new Queue<uint>();
             receiveFifo = new Queue<uint>();
             registers = new uint[64];
-            transferTimer = new LimitTimer(machine.ClockSource, frequency, this, "serial clock",
-                limit: 1, workMode: WorkMode.OneShot, eventEnabled: true);
+            transferTimer = new FrameTimer(machine.ClockSource, frequency, this);
             transferTimer.LimitReached += CompleteFrame;
             Reset();
         }
@@ -38,6 +37,7 @@ namespace Antmicro.Renode.Peripherals.SPI
         public override void Reset()
         {
             EndTransaction();
+            frameInProgress = false;
             transferTimer.Reset();
             transmitFifo.Clear();
             receiveFifo.Clear();
@@ -84,7 +84,7 @@ namespace Antmicro.Renode.Peripherals.SPI
             case 0x20: return (uint)transmitFifo.Count;
             case 0x24: return (uint)receiveFifo.Count;
             case 0x28:
-                return (transferTimer.Enabled || receiveRemaining != 0 ? 1u : 0)
+                return (transferTimer.Enabled || frameInProgress || receiveRemaining != 0 ? 1u : 0)
                     | (transmitFifo.Count < FifoDepth ? 2u : 0) | (transmitFifo.Count == 0 ? 4u : 0)
                     | (receiveFifo.Count != 0 ? 8u : 0) | (receiveFifo.Count == FifoDepth ? 16u : 0);
             case 0x30: return RawInterrupts & registers[0x2c / 4];
@@ -141,6 +141,8 @@ namespace Antmicro.Renode.Peripherals.SPI
                 registers[2] = value & 1;
                 if(!Enabled)
                 {
+                    frameInProgress = false;
+                    dummyWait = false;
                     transferTimer.Enabled = false;
                     transmitFifo.Clear();
                     receiveFifo.Clear();
@@ -174,7 +176,7 @@ namespace Antmicro.Renode.Peripherals.SPI
             {
                 SynchronizeTime();
                 var next = value & 3;
-                if(next == 3 || (next == 0 && chipSelectOverride == 2 && !transferTimer.Enabled)) EndTransaction();
+                if(next == 3 || (next == 0 && chipSelectOverride == 2 && !transferTimer.Enabled && !frameInProgress)) EndTransaction();
                 chipSelectOverride = next;
                 ConfigurationChanged?.Invoke();
             }
@@ -183,7 +185,13 @@ namespace Antmicro.Renode.Peripherals.SPI
         public ulong Frequency
         {
             get => transferTimer.Frequency;
-            set => transferTimer.Frequency = value;
+            set
+            {
+                SynchronizeTime();
+                var updateDeadline = frameInProgress && machine.ClockSource.CurrentValue < frameDeadline;
+                transferTimer.Frequency = value;
+                if(updateDeadline) frameDeadline = transferTimer.Deadline;
+            }
         }
 
         public void OnGPIO(int number, bool value)
@@ -207,7 +215,7 @@ namespace Antmicro.Renode.Peripherals.SPI
 
         private void TryStartFrame()
         {
-            if(!Enabled || registers[4] == 0 || registers[0x14 / 4] == 0 || transferTimer.Enabled) return;
+            if(!Enabled || registers[4] == 0 || registers[0x14 / 4] == 0 || transferTimer.Enabled || frameInProgress) return;
             if(receiveRemaining != 0)
             {
                 if(receiveFifo.Count == FifoDepth) return;
@@ -257,14 +265,21 @@ namespace Antmicro.Renode.Peripherals.SPI
 
         private void ScheduleFrame(int clocks)
         {
+            frameInProgress = true;
             transferTimer.Limit = (ulong)Math.Max(1, clocks) * registers[0x14 / 4];
             transferTimer.ResetValue();
+            frameDeadline = transferTimer.Deadline;
             transferTimer.Enabled = true;
             UpdateInterrupt();
         }
 
         private void CompleteFrame()
         {
+            // One-shots are disabled before clock callbacks are dispatched.
+            // Retain the current frame through that boundary, and ignore an
+            // old queued callback if reset/disable has canceled it or an earlier
+            // clock callback has armed a replacement with a future deadline.
+            if(!frameInProgress || machine.ClockSource.CurrentValue < frameDeadline) return;
             if(dummyWait)
             {
                 dummyWait = false;
@@ -304,8 +319,8 @@ namespace Antmicro.Renode.Peripherals.SPI
                 {
                     shiftBits = 0;
                     shiftReceive = false;
-                    ScheduleFrame(waitCycles);
                     dummyWait = true;
+                    ScheduleFrame(waitCycles);
                     return;
                 }
             }
@@ -314,6 +329,7 @@ namespace Antmicro.Renode.Peripherals.SPI
 
         private void FinishFrame()
         {
+            frameInProgress = false;
             if(transmitFifo.Count == 0 && receiveRemaining == 0)
             {
                 if(chipSelectOverride != 2) EndTransaction();
@@ -357,15 +373,47 @@ namespace Antmicro.Renode.Peripherals.SPI
         private int InstructionBits => new[] { 0, 4, 8, 16 }[(registers[0xf4 / 4] >> 8) & 3];
         private int HeaderFrames => (InstructionBits != 0 ? 1 : 0) + (((registers[0xf4 / 4] >> 2) & 15) != 0 ? 1 : 0);
 
+        private sealed class FrameTimer : LimitTimer
+        {
+            public FrameTimer(IClockSource clockSource, ulong frequency, IPeripheral owner)
+                : base(clockSource, frequency, owner, "serial clock", limit: 1,
+                    workMode: WorkMode.OneShot, eventEnabled: true)
+            {
+                this.clockSource = clockSource;
+            }
+
+            public TimeInterval Deadline
+            {
+                get
+                {
+                    var deadline = TimeInterval.Empty;
+                    clockSource.GetClockEntryInLockContext(OnLimitReached, entry =>
+                    {
+                        // Match the clock source's fractional progress and round
+                        // up to the first emulator tick that reaches the limit.
+                        var remaining = (entry.Value - entry.ValueResiduum) / entry.Ratio;
+                        var ticks = remaining.Integer;
+                        if(remaining.Fractional.Numerator != 0) ticks++;
+                        deadline = clockSource.CurrentValue + TimeInterval.FromTicks(ticks);
+                    });
+                    return deadline;
+                }
+            }
+
+            private readonly IClockSource clockSource;
+        }
+
         private readonly Queue<uint> transmitFifo;
         private readonly Queue<uint> receiveFifo;
         private readonly uint[] registers;
-        private readonly LimitTimer transferTimer;
+        private readonly FrameTimer transferTimer;
+        private TimeInterval frameDeadline;
         private uint chipSelectOverride;
         private uint errors;
         private uint shiftValue;
         private int shiftBits;
         private bool shiftReceive;
+        private bool frameInProgress;
         private bool transactionActive;
         private bool enhancedInstruction;
         private bool dummyWait;
