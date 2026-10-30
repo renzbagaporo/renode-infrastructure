@@ -44,6 +44,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         public event Action TickChanged;
 
+        // Synchronous notification for external observers. The optional PSM
+        // connection schedules domain resets at a separate synchronization boundary.
         public event Action ResetRequested;
 
         protected override uint ReadRegister(long offset)

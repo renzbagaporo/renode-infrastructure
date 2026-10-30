@@ -63,6 +63,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             machine.LocalTimeSource.ExecuteInNearestSyncedState(_ =>
             {
                 if(generation != Volatile.Read(ref resetGeneration)) return;
+                var paused = cores.Select(core => core.IsPaused && !machine.IsPaused).ToArray();
                 // CPU and peripheral resets run at a synchronization boundary,
                 // outside the watchdog/clock/state callback which requested them.
                 using(machine.ObtainPausedState(true))
@@ -91,6 +92,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                             else peripheral.Reset();
                         }
                     }
+                }
+                // Machine's temporary pause can resume all own-lives. Restore
+                // explicit host pauses before this synchronization phase ends
+                // and any processor receives its next time grant.
+                for(var core = 0; core < cores.Length; core++)
+                {
+                    if(paused[core]) cores[core].Pause();
                 }
             });
         }

@@ -30,7 +30,7 @@ namespace Antmicro.Renode.PeripheralsTests
             EmulationManager.Instance.Clear();
             machine = new Machine();
             EmulationManager.Instance.CurrentEmulation.AddMachine(machine, "watchdog");
-            var nvic0 = new NVIC(machine);
+            nvic0 = new NVIC(machine);
             var nvic1 = new NVIC(machine);
             core0 = new CortexM("cortex-m0+", machine, nvic0);
             core1 = new CortexM("cortex-m0+", machine, nvic1, cpuId: 1);
@@ -194,6 +194,113 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.AreEqual(1, peer.Count);
         }
 
+        [Test]
+        public void ShouldKeepAnIndependentProcessorClockGate()
+        {
+            core0.Clocked = false;
+            psm.WriteDoubleWord(8, 1u << 15);
+            Trigger();
+            Assert.IsFalse(core0.Clocked);
+            Assert.IsTrue(core0.HasAnyHaltingCondition);
+            Assert.AreEqual(0, core0.ExecutedInstructions);
+        }
+
+        [Test]
+        public void ShouldKeepAnIndependentProcessorWaitSignal()
+        {
+            core0.CpuWaitSignal.Set();
+            psm.WriteDoubleWord(8, 1u << 15);
+            Trigger();
+            Assert.IsTrue(core0.CpuWaitSignal.IsSet);
+            Assert.IsTrue(core0.IsHalted);
+            Assert.AreEqual(0, core0.ExecutedInstructions);
+        }
+
+        [TestCase(0)]
+        [TestCase(1)]
+        public void ShouldKeepAHostPausedProcessorDetachedFromTheTimeDomainPaused(int selectedCore)
+        {
+            var emulation = EmulationManager.Instance.CurrentEmulation;
+            core0.IsHalted = false;
+            core1.IsHalted = false;
+            core0.Reset();
+            core1.Reset();
+            core1.SetRegister(0, 0x5678);
+            var blocks = 0;
+            core0.SetHookAtBlockBegin((_, __) => Interlocked.Increment(ref blocks));
+            emulation.StartAll();
+            try
+            {
+                Assert.IsTrue(SpinWait.SpinUntil(() => core0.ExecutedInstructions > 0, TimeSpan.FromSeconds(2)));
+                Assert.IsTrue(SpinWait.SpinUntil(() => core1.ExecutedInstructions > 0, TimeSpan.FromSeconds(2)));
+                core0.Pause();
+                // A paused CPU with an enabled time handle blocks the whole
+                // time domain. Detach it so the peer can reach the reset boundary.
+                core0.TimeHandle.Enabled = false;
+                Assert.IsFalse(machine.IsPaused);
+                Assert.IsTrue(core0.IsPaused);
+                core0.SetRegister(0, 0x1234);
+                var pausedBlocks = Volatile.Read(ref blocks);
+                var cycles = core0.ElapsedCycles;
+                psm.WriteDoubleWord(8, 1u << (15 + selectedCore));
+                var target = selectedCore == 0 ? core0 : core1;
+                using(var completed = new ManualResetEventSlim())
+                {
+                    watchdog.WriteDoubleWord(0, 0x80000000);
+                    machine.LocalTimeSource.ExecuteInNearestSyncedState(_ => completed.Set());
+                    Assert.IsTrue(completed.Wait(TimeSpan.FromSeconds(2)), "The watchdog reset must complete while the machine runs");
+                }
+                Assert.AreEqual(0u, (uint)target.GetRegister(0));
+                Assert.IsTrue(core0.IsPaused);
+                var instructions = core0.ExecutedInstructions;
+                Thread.Sleep(20);
+                Assert.IsTrue(core0.IsPaused);
+                Assert.AreEqual(instructions, core0.ExecutedInstructions);
+                Assert.AreEqual(pausedBlocks, Volatile.Read(ref blocks), "No guest block may begin during temporary resume/restore");
+                Assert.AreEqual(cycles, core0.ElapsedCycles, "The paused processor must execute no guest cycles");
+                Assert.IsFalse(core0.TimeHandle.Enabled, "The caller's detached time handle must remain detached");
+            }
+            finally
+            {
+                emulation.PauseAll();
+            }
+        }
+
+        [Test]
+        public void ShouldKeepAnIndependentProcessorResetHold()
+        {
+            core0.SetPowerSequencerResetHold(true);
+            psm.WriteDoubleWord(8, 1u << 15);
+            Trigger();
+            Assert.IsTrue(core0.HasAnyHaltingCondition);
+            core0.SetPowerSequencerResetHold(false);
+            Assert.IsFalse(core0.HasAnyHaltingCondition);
+        }
+
+        [Test]
+        public void ShouldRespectDebuggerResetCatch()
+        {
+            core0.EnableMemoryMappedDebug = true;
+            nvic0.WriteDoubleWord(0xdf0, 0xa05f0003);
+            Assert.IsTrue(SpinWait.SpinUntil(() => core0.HaltedByDebugger, TimeSpan.FromSeconds(2)));
+            nvic0.WriteDoubleWord(0xdfc, 1); // DEMCR.VC_CORERESET.
+            psm.WriteDoubleWord(8, 1u << 15);
+            Trigger();
+            Assert.IsTrue(core0.HaltedByDebugger);
+            Assert.IsTrue(core0.HasAnyHaltingCondition);
+            Assert.AreEqual(0x100u, (uint)core0.PC);
+        }
+
+        [Test]
+        public void ShouldDiscardAQueuedWatchdogResetAfterThePowerSequencerResets()
+        {
+            psm.WriteDoubleWord(8, 1u << 2);
+            watchdog.WriteDoubleWord(0, 0x80000000);
+            psm.Reset();
+            EmulationManager.Instance.CurrentEmulation.RunFor(TimeInterval.FromMicroseconds(1));
+            foreach(var probe in probes) Assert.AreEqual(0, probe.Count);
+        }
+
         private void Trigger()
         {
             watchdog.WriteDoubleWord(0, 0x80000000);
@@ -220,6 +327,7 @@ namespace Antmicro.Renode.PeripheralsTests
         private Machine machine;
         private CortexM core0;
         private CortexM core1;
+        private NVIC nvic0;
         private RP2040_PSM psm;
         private RP2_Resets resets;
         private RP2040_Clocks clocks;
