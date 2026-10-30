@@ -71,6 +71,19 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public IEnumerable<IRegistered<IPeripheral, NumberRegistrationPoint<int>>> Children =>
             peripherals.Select(x => Registered.Create(x.Value, new NumberRegistrationPoint<int>(x.Key)));
 
+        public void ResetFromWatchdog()
+        {
+            IPeripheral[] selected;
+            lock(SyncRoot)
+            {
+                selected = peripherals.Where(entry => (watchdogSelect & (1u << entry.Key)) != 0)
+                    .Select(entry => entry.Value).ToArray();
+            }
+            // A watchdog pulse resets the selected peripheral's flops; the
+            // software RESET/WDSEL registers and persistent reset holds remain.
+            foreach(var peripheral in selected) peripheral.Reset();
+        }
+
         protected override uint ReadRegister(long offset)
         {
             switch(offset)

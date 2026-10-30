@@ -14,10 +14,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 {
     public sealed class RP2040_Watchdog : RP2APBPeripheral
     {
-        public RP2040_Watchdog(IMachine machine, RP2040_Clocks clocks, RP2_Timer timer = null) : base(machine)
+        public RP2040_Watchdog(IMachine machine, RP2040_Clocks clocks, RP2_Timer timer = null, RP2040_PSM psm = null) : base(machine)
         {
             this.clocks = clocks;
             this.timer = timer;
+            this.psm = psm;
             scratch = new uint[8];
             tickTimer = new LimitTimer(machine.ClockSource, 1000000, this, "tick", limit: 512);
             watchdog = new LimitTimer(machine.ClockSource, 2000000, this, "watchdog", limit: CounterMask,
@@ -142,18 +143,21 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         {
             reason = forced ? 2u : 1;
             watchdog.Enabled = false;
-            if(ResetRequested == null)
+            load = 0;
+            if(psm != null) psm.ResetFromWatchdog();
+            else if(ResetRequested == null)
             {
                 this.Log(LogLevel.Error, "Watchdog reset is not connected to the power/reset controller");
                 return;
             }
-            ResetRequested();
+            ResetRequested?.Invoke();
         }
 
         private uint TickCycles => (tickControl & 0x1ff) == 0 ? 512 : tickControl & 0x1ff;
 
         private readonly RP2040_Clocks clocks;
         private readonly RP2_Timer timer;
+        private readonly RP2040_PSM psm;
         private readonly LimitTimer tickTimer;
         private readonly LimitTimer watchdog;
         private readonly uint[] scratch;

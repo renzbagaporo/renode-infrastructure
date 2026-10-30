@@ -32,12 +32,25 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             Reset();
         }
 
-        public override void Reset()
+        public override void Reset() => ResetClocks(false);
+
+        public void ResetFromWatchdog() => ResetClocks(true);
+
+        private void ResetClocks(bool retainRunDividers)
         {
+            var referenceDivider = divider[ReferenceClock];
+            var systemDivider = divider[SystemClock];
             Array.Clear(control, 0, control.Length);
             for(var i = 0; i < divider.Length; i++)
             {
                 divider[i] = i == PeripheralClock ? 0u : 0x100;
+            }
+            // The clk_ref/clk_sys dividers use rst_n_run, not the PSM CLOCKS
+            // reset, so that their outputs keep running through a soft restart.
+            if(retainRunDividers)
+            {
+                divider[ReferenceClock] = referenceDivider;
+                divider[SystemClock] = systemDivider;
             }
             control[SystemClock] = 0;
             selectedReferenceSource = 0;
