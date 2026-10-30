@@ -389,9 +389,10 @@ namespace Antmicro.Renode.Peripherals.UART
                     }
                 }
             }
-            finally
+            catch
             {
                 lock(SyncRoot) publishing = false;
+                throw;
             }
         }
 

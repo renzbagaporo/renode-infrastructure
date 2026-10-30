@@ -5,6 +5,9 @@
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
+using System.Threading;
+using System.Threading.Tasks;
 
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Peripherals;
@@ -421,6 +424,83 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.AreEqual(0x10u, uart.ReadDoubleWord(0x38));
             uart.WriteWord(0x1038, 0x20);
             Assert.AreEqual(0x30u, uart.ReadDoubleWord(0x38));
+        }
+
+        [Test]
+        public void ShouldAllowSerialPeerToReenterWithoutHoldingUARTState()
+        {
+            Configure(false);
+            uart.CharReceived += value =>
+            {
+                Assert.IsFalse(Monitor.IsEntered(uart));
+                uart.WriteChar(value);
+                if(value == 0x41) uart.WriteDoubleWord(0, 0x42);
+            };
+            uart.WriteDoubleWord(0, 0x41);
+            Advance(100);
+            Assert.AreEqual(0x41u, uart.ReadDoubleWord(0));
+            Advance(100);
+            Assert.AreEqual(0x42u, uart.ReadDoubleWord(0));
+            CollectionAssert.AreEqual(new byte[] { 0x41, 0x42 }, output);
+        }
+
+        [TestCase("receive")]
+        [TestCase("modem")]
+        [TestCase("read")]
+        [TestCase("write")]
+        [TestCase("reset")]
+        [TestCase("reset_hold")]
+        [TestCase("clock")]
+        public void ShouldEnterClockBeforeStateForExternalOperations(string operation)
+        {
+            Configure(false);
+            uart.WriteDoubleWord(0, 0x41);
+            Action access;
+            switch(operation)
+            {
+            case "receive": access = () => uart.WriteChar(0x42); break;
+            case "modem": access = () => uart.OnGPIO(0, false); break;
+            case "read": access = () => uart.ReadDoubleWord(0x18); break;
+            case "write": access = () => uart.WriteDoubleWord(0x38, 0x10); break;
+            case "reset": access = uart.Reset; break;
+            case "reset_hold": access = () => uart.ResetHeld = true; break;
+            default: access = () => clocks.SetFrequency(800000); break;
+            }
+            using(var clockHeld = new ManualResetEventSlim())
+            using(var releaseClock = new ManualResetEventSlim())
+            using(var entering = new ManualResetEventSlim())
+            {
+                var stateOwned = false;
+                var advancing = Task.Factory.StartNew(() => machine.ClockSource.ExecuteInLock(() =>
+                {
+                    clockHeld.Set();
+                    Assert.IsTrue(releaseClock.Wait(TimeSpan.FromSeconds(5)));
+                    if(!stateOwned) Advance(100);
+                }), CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+                Assert.IsTrue(clockHeld.Wait(TimeSpan.FromSeconds(5)));
+                var accessing = Task.Factory.StartNew(() => { entering.Set(); access(); },
+                    CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+                var completedWhileClockHeld = false;
+                try
+                {
+                    Assert.IsTrue(entering.Wait(TimeSpan.FromSeconds(5)));
+                    var deadline = Stopwatch.StartNew();
+                    while(deadline.ElapsedMilliseconds < 100 && !accessing.IsCompleted)
+                    {
+                        if(!Monitor.TryEnter(uart)) { stateOwned = true; break; }
+                        Monitor.Exit(uart);
+                        Thread.Yield();
+                    }
+                    completedWhileClockHeld = accessing.IsCompleted;
+                }
+                finally
+                {
+                    releaseClock.Set();
+                    Assert.IsTrue(Task.WaitAll(new[] { advancing, accessing }, TimeSpan.FromSeconds(5)));
+                }
+                Assert.IsFalse(stateOwned, "An external waiter must not own UART state while waiting for its clock");
+                Assert.IsFalse(completedWhileClockHeld, "The external operation must observe completed clock callbacks");
+            }
         }
 
         private void Configure(bool fifo, bool enable = true)
