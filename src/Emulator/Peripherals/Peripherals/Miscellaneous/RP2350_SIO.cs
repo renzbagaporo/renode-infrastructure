@@ -40,7 +40,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         {
             lock(sync)
             {
-                Array.Clear(State, 0, State.Length);
+                // Pad callbacks maintain live input levels across SIO resets.
                 gpioOutput = gpioEnable = 0;
                 Array.Clear(spinlocks, 0, spinlocks.Length);
                 Array.Clear(errors, 0, errors.Length);
