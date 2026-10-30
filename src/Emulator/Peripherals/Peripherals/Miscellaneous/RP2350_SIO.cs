@@ -13,7 +13,7 @@ using Antmicro.Renode.Peripherals.GPIOPort;
 
 namespace Antmicro.Renode.Peripherals.Miscellaneous
 {
-    public sealed class RP2350_SIO : BaseGPIOPort, IDoubleWordPeripheral, IKnownSize, IRP2GPIO
+    public sealed class RP2350_SIO : BaseGPIOPort, IBytePeripheral, IWordPeripheral, IDoubleWordPeripheral, IKnownSize, IRP2GPIO
     {
         public RP2350_SIO(IMachine machine, RP2350_AccessControl accessControl = null, bool emulateErratumE2 = true) : base(machine, 64)
         {
@@ -24,6 +24,20 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             Reset();
         }
 
+        // Narrow accesses retain the full register's side effects and security
+        // bank selection. Writes broadcast the value without a register read.
+        public byte ReadByte(long offset) => (byte)(Read(offset & ~3L, false) >> ((int)(offset & 3) * 8));
+        public ushort ReadWord(long offset) => (ushort)(Read(offset & ~3L, false) >> ((int)(offset & 2) * 8));
+        public void WriteByte(long offset, byte value) => Write(offset & ~3L, value * 0x01010101u, false);
+        public void WriteWord(long offset, ushort value) => Write(offset & ~3L, (uint)value | ((uint)value << 16), false);
+        [ConnectionRegion("NonSecure")]
+        public byte ReadByteNonSecure(long offset) => (byte)(Read(offset & ~3L, true) >> ((int)(offset & 3) * 8));
+        [ConnectionRegion("NonSecure")]
+        public ushort ReadWordNonSecure(long offset) => (ushort)(Read(offset & ~3L, true) >> ((int)(offset & 2) * 8));
+        [ConnectionRegion("NonSecure")]
+        public void WriteByteNonSecure(long offset, byte value) => Write(offset & ~3L, value * 0x01010101u, true);
+        [ConnectionRegion("NonSecure")]
+        public void WriteWordNonSecure(long offset, ushort value) => Write(offset & ~3L, (uint)value | ((uint)value << 16), true);
         public uint ReadDoubleWord(long offset) => Read(offset, false);
         public void WriteDoubleWord(long offset, uint value) => Write(offset, value, false);
         [ConnectionRegion("NonSecure")]

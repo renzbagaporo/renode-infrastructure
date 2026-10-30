@@ -17,7 +17,7 @@ using Antmicro.Renode.Time;
 
 namespace Antmicro.Renode.Peripherals.Miscellaneous
 {
-    public class RP2040_SIO : BaseGPIOPort, IDoubleWordPeripheral, IKnownSize, IHasFrequency, IRP2GPIO
+    public class RP2040_SIO : BaseGPIOPort, IBytePeripheral, IWordPeripheral, IDoubleWordPeripheral, IKnownSize, IHasFrequency, IRP2GPIO
     {
         public RP2040_SIO(IMachine machine) : base(machine, GPIOCount + QSPICount)
         {
@@ -33,6 +33,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             Core1IRQ = new GPIO();
             Reset();
         }
+
+        // SIO performs one full register transaction for a narrow access.
+        // Reads select a little-endian lane; writes replicate their value and
+        // must not read the register first (FIFO and spinlock reads have effects).
+        public byte ReadByte(long offset) => (byte)(ReadDoubleWord(offset & ~3L) >> ((int)(offset & 3) * 8));
+        public ushort ReadWord(long offset) => (ushort)(ReadDoubleWord(offset & ~3L) >> ((int)(offset & 2) * 8));
+        public void WriteByte(long offset, byte value) => WriteDoubleWord(offset & ~3L, value * 0x01010101u);
+        public void WriteWord(long offset, ushort value) => WriteDoubleWord(offset & ~3L, (uint)value | ((uint)value << 16));
 
         public uint ReadDoubleWord(long offset)
         {
