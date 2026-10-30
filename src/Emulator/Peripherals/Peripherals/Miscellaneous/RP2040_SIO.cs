@@ -169,7 +169,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         {
             lock(sync)
             {
-                base.Reset();
+                // Pad inputs remain live while the SIO registers reset. Their
+                // publishers notify changes, so clearing a stable level here
+                // would lose it until the external signal next changes.
+                foreach(var connection in Connections.Values)
+                {
+                    connection.Unset();
+                }
                 gpioOutput = 0;
                 gpioOutputEnable = 0;
                 qspiOutput = 0;
