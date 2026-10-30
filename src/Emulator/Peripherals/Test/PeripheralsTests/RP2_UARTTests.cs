@@ -391,8 +391,11 @@ namespace Antmicro.Renode.PeripheralsTests
             uart.WriteChar(0x43);
             Assert.IsTrue(uart.RxDMA.IsSet);
             uart.WriteChar(0x44);
-            Assert.IsFalse(uart.RxDMA.IsSet);
+            Assert.IsTrue(uart.RxDMA.IsSet);
+            uart.WriteDoubleWord(0x38, 0x400);
             uart.WriteDoubleWord(0x2048, 4);
+            Assert.IsFalse(uart.RxDMA.IsSet);
+            uart.WriteDoubleWord(0x44, 0x400);
             Assert.IsTrue(uart.RxDMA.IsSet);
             uart.ReadDoubleWord(0);
             Assert.IsFalse(uart.RxDMA.IsSet);
@@ -501,6 +504,62 @@ namespace Antmicro.Renode.PeripheralsTests
                 Assert.IsFalse(stateOwned, "An external waiter must not own UART state while waiting for its clock");
                 Assert.IsFalse(completedWhileClockHeld, "The external operation must observe completed clock callbacks");
             }
+        }
+
+        [TestCase(false)]
+        [TestCase(true)]
+        public void ShouldKeepOverrunStatusUntilECRIndependentOfDataReadsAndInterruptClear(bool fifo)
+        {
+            Configure(fifo);
+            var capacity = fifo ? 32 : 1;
+            for(byte i = 0; i < capacity; i++) uart.WriteChar(i);
+            uart.WriteChar(0xff);
+            Assert.AreEqual(8u, uart.ReadDoubleWord(4));
+            for(uint i = 0; i < capacity; i++)
+            {
+                Assert.AreEqual(i, uart.ReadDoubleWord(0));
+                Assert.AreEqual(8u, uart.ReadDoubleWord(4));
+            }
+            uart.WriteDoubleWord(0x44, 0x400);
+            Assert.AreEqual(8u, uart.ReadDoubleWord(4));
+            uart.WriteDoubleWord(4, 0);
+            Assert.AreEqual(0u, uart.ReadDoubleWord(4));
+            // The per-character DR marker is distinct from sticky RSR status.
+            uart.WriteChar(0x55);
+            Assert.AreEqual(0x855u, uart.ReadDoubleWord(0));
+            Assert.AreEqual(0u, uart.ReadDoubleWord(4));
+        }
+
+        [Test]
+        public void ShouldFlushQueuedTransmitDataWhenDisablingFIFOWithUARTStopped()
+        {
+            Configure(true, enable: false);
+            uart.WriteDoubleWord(0, 0x41);
+            uart.WriteDoubleWord(0, 0x42);
+            uart.WriteDoubleWord(0x2c, 0x60);
+            Assert.AreEqual(0x80u, uart.ReadDoubleWord(0x18) & 0xa8);
+            uart.WriteDoubleWord(0x30, 0x301);
+            uart.WriteDoubleWord(0, 0x5a);
+            Advance(1000);
+            CollectionAssert.AreEqual(new byte[] { 0x5a }, output);
+        }
+
+        [TestCase(false)]
+        [TestCase(true)]
+        public void ShouldMaskReceiveDMAOnErrorOnlyWhenDMAONERRIsSet(bool dmaOnError)
+        {
+            Configure(false);
+            uart.WriteDoubleWord(0x38, 0x400);
+            uart.WriteDoubleWord(0x48, dmaOnError ? 5u : 1u);
+            uart.WriteChar(0x41);
+            Assert.IsTrue(uart.RxDMA.IsSet);
+            uart.WriteChar(0x42);
+            Assert.IsTrue(uart.IRQ.IsSet);
+            Assert.AreEqual(!dmaOnError, uart.RxDMA.IsSet);
+            uart.WriteDoubleWord(4, 0);
+            Assert.AreEqual(!dmaOnError, uart.RxDMA.IsSet);
+            uart.WriteDoubleWord(0x44, 0x400);
+            Assert.IsTrue(uart.RxDMA.IsSet);
         }
 
         private void Configure(bool fifo, bool enable = true)

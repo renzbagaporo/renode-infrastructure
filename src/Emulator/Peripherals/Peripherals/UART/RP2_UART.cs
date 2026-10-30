@@ -140,7 +140,8 @@ namespace Antmicro.Renode.Peripherals.UART
             case 0x00:
                 if(rx.Count == 0) return 0;
                 var value = rx.Dequeue();
-                receiveStatus = (value >> 8) & 0xf;
+                // RSR errors are sticky until ECR; DR carries a separate
+                // status marker alongside each received character.
                 if(rx.Count < ReceiveThreshold) interruptStatus &= ~ReceiveInterrupt;
                 if(rx.Count == 0)
                 {
@@ -200,6 +201,16 @@ namespace Antmicro.Renode.Peripherals.UART
                 fractionalDivisor = value & 0x3f;
                 break;
             case 0x2c:
+                if(((lineControl ^ value) & 0x10) != 0 && rx.Count != 0)
+                {
+                    this.Log(LogLevel.Warning, "Changing FIFO mode with unread receive data is not modeled");
+                }
+                if((lineControl & 0x10) != 0 && (value & 0x10) == 0)
+                {
+                    // Disabling FEN flushes pending TX data (PL011 TRM 3.3.8).
+                    tx.Clear();
+                    interruptStatus &= ~TransmitInterrupt;
+                }
                 lineControl = value & 0xff;
                 // The divisor registers are latched by a UARTLCR_H write.
                 activeDivisor = integerDivisor * 64 + fractionalDivisor;
@@ -344,7 +355,7 @@ namespace Antmicro.Renode.Peripherals.UART
             QueueSignal(1, !RTSAsserted);
             var dmaEnabled = !ResetHeld && (control & 1) != 0 && Frequency != 0;
             QueueSignal(2, dmaEnabled && (dmaControl & 1) != 0 && rx.Count != 0
-                && ((dmaControl & 4) != 0 || (interruptStatus & 0x780) == 0));
+                && ((dmaControl & 4) == 0 || (interruptStatus & 0x780) == 0));
             QueueSignal(3, dmaEnabled && (dmaControl & 2) != 0 && tx.Count < Capacity);
         }
 
