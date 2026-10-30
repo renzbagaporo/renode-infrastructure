@@ -41,8 +41,7 @@ namespace Antmicro.Renode.Peripherals.Memory
         {
             if(offset < 0 || offset > Size - count) throw new BusAccessException(BusAccessError.AddressError);
             SynchronizeDataAccess();
-            if(machine.GetSystemBus(this).TryGetCurrentContextState<CortexM.ContextState>(out var _, out var state)
-                && state.InstructionFetch) Volatile.Write(ref hasFetchedInstructions, 1);
+            MarkInstructionFetch();
             ulong value = 0;
             machine.ClockSource.ExecuteInLock(() =>
             {
@@ -50,6 +49,12 @@ namespace Antmicro.Renode.Peripherals.Memory
                 for(var i = 0; i < count; i++) value |= (ulong)flash.UnderlyingMemory.ReadByte(offset + i) << (8 * i);
             });
             return value;
+        }
+
+        private void MarkInstructionFetch()
+        {
+            if(machine.GetSystemBus(this).TryGetCurrentContextState<CortexM.ContextState>(out var _, out var state)
+                && state.InstructionFetch) Volatile.Write(ref hasFetchedInstructions, 1);
         }
 
         private void SynchronizeDataAccess()
@@ -87,6 +92,7 @@ namespace Antmicro.Renode.Peripherals.Memory
         public byte[] ReadBytes(long offset, int count, IPeripheral context = null)
         {
             SynchronizeDataAccess();
+            MarkInstructionFetch();
             var result = new byte[count];
             machine.ClockSource.ExecuteInLock(() =>
             {
