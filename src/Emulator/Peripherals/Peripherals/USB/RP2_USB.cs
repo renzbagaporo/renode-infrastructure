@@ -30,6 +30,7 @@ namespace Antmicro.Renode.Peripherals.USB
             this.clockSource = clockSource ?? throw new ArgumentNullException(nameof(clockSource));
             endpoints = new Endpoint[EndpointCount];
             bufferIndex = new int[EndpointCount * 2];
+            pendingBufferCompletions = new byte[EndpointCount * 2];
             for(var endpoint = 0; endpoint < EndpointCount; ++endpoint)
             {
                 endpoints[endpoint] = new Endpoint(this, endpoint);
@@ -61,6 +62,7 @@ namespace Antmicro.Renode.Peripherals.USB
             {
                 Array.Clear(registers, 0, registers.Length);
                 Array.Clear(bufferIndex, 0, bufferIndex.Length);
+                Array.Clear(pendingBufferCompletions, 0, pendingBufferCompletions.Length);
                 foreach(var endpoint in endpoints)
                 {
                     endpoint.Reset();
@@ -157,7 +159,7 @@ namespace Antmicro.Renode.Peripherals.USB
                     ClearStatus(ref sieStatus, value, operation);
                     break;
                 case Registers.BufferStatus:
-                    ClearStatus(ref bufferStatus, value, operation);
+                    AcknowledgeBuffers(value, operation);
                     break;
                 case Registers.AbortDone:
                     var abortDone = registers[offset / 4];
@@ -203,6 +205,7 @@ namespace Antmicro.Renode.Peripherals.USB
             bufferStatus = 0;
             bufferCPU = 0;
             Array.Clear(bufferIndex, 0, bufferIndex.Length);
+            Array.Clear(pendingBufferCompletions, 0, pendingBufferCompletions.Length);
             foreach(var endpoint in endpoints)
             {
                 endpoint.Reset();
@@ -323,7 +326,10 @@ namespace Antmicro.Renode.Peripherals.USB
             // firmware or a waiting host callback observe the completion.
             bufferIndex[buffer.Direction] = buffer.DoubleBuffered ? buffer.Index ^ 1 : 0;
             var bit = 1u << buffer.Direction;
-            bufferCPU = buffer.Index != 0 ? bufferCPU | bit : bufferCPU & ~bit;
+            if(pendingBufferCompletions[buffer.Direction] == 0)
+            {
+                bufferCPU = buffer.Index != 0 ? bufferCPU | bit : bufferCPU & ~bit;
+            }
             var endpoint = buffer.Direction / 2;
             var control = endpoint == 0 ? registers[(int)Registers.SIEControl / 4]
                 : dpram.ReadDoubleWord(8 + (endpoint - 1) * 8 + (input ? 0 : 4));
@@ -331,10 +337,41 @@ namespace Antmicro.Renode.Peripherals.USB
             var interruptPerPair = (control & (1u << 28)) != 0;
             if(interruptPerBuffer || (interruptPerPair && buffer.Index == 1))
             {
+                if(interruptPerBuffer)
+                {
+                    // BUFF_CPU presents the oldest unacknowledged buffer. The
+                    // other double buffer can finish before firmware services it.
+                    pendingBufferCompletions[buffer.Direction] |= (byte)(1 << buffer.Index);
+                }
                 bufferStatus |= bit;
             }
             dpram.WriteDoubleWord(buffer.ControlOffset, value);
             UpdateInterrupts();
+        }
+
+        private void AcknowledgeBuffers(uint value, AtomicOperation operation)
+        {
+            if(operation == AtomicOperation.Set || operation == AtomicOperation.Xor)
+            {
+                ClearStatus(ref bufferStatus, value, operation);
+                return;
+            }
+            for(var direction = 0; direction < pendingBufferCompletions.Length; ++direction)
+            {
+                var bit = 1u << direction;
+                if((value & bufferStatus & bit) == 0) continue;
+                var presented = (bufferCPU & bit) != 0 ? 1 : 0;
+                pendingBufferCompletions[direction] &= (byte)~(1 << presented);
+                if(pendingBufferCompletions[direction] != 0)
+                {
+                    bufferCPU = (pendingBufferCompletions[direction] & 1) != 0 ? bufferCPU & ~bit : bufferCPU | bit;
+                    // Keep BUFF_STATUS asserted for the other per-buffer
+                    // completion, without scheduling an individual USB clock edge.
+                    // Per-pair mode has only one notification.
+                    continue;
+                }
+                bufferStatus &= ~bit;
+            }
         }
 
         private void Setup(SetupPacket packet)
@@ -469,6 +506,7 @@ namespace Antmicro.Renode.Peripherals.USB
         private readonly RP2_USB_DPRAM dpram;
         private readonly Endpoint[] endpoints;
         private readonly int[] bufferIndex;
+        private readonly byte[] pendingBufferCompletions;
         private readonly LimitTimer frameTimer;
         private readonly uint[] registers = new uint[RegisterBytes / 4];
         private uint sieStatus;

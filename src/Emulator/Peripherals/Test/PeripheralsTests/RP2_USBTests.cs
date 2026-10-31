@@ -5,6 +5,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -140,6 +141,252 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.That(input.TryRead(out var second), Is.True);
             Assert.That(second, Is.EqualTo(new byte[] { 2 }));
             Assert.That(usb.ReadDoubleWord(0x58), Is.EqualTo(4));
+        }
+
+        [TestCase(true, 0x58L, 32)]
+        [TestCase(false, 0x58L, 32)]
+        [TestCase(true, 0x3058L, 32)]
+        [TestCase(false, 0x3058L, 32)]
+        [TestCase(true, 0x3058L, 16)]
+        [TestCase(false, 0x3058L, 16)]
+        [TestCase(true, 0x3058L, 8)]
+        [TestCase(false, 0x3058L, 8)]
+        public void ShouldRetainTheOtherPerBufferCompletionAfterAcknowledgment(bool input, long address, int width)
+        {
+            ArmDoubleBuffers(input);
+            CompletePacket(input);
+            CompletePacket(input);
+            usb.WriteDoubleWord(0x90, 1u << 4);
+            AssertTwoBufferNotifications(input, address, width);
+            Assert.That(usb.IRQ.IsSet, Is.False);
+        }
+
+        [TestCase(true)]
+        [TestCase(false)]
+        public void ShouldAcknowledgeIndividuallyServicedDoubleBuffers(bool input)
+        {
+            ArmDoubleBuffers(input);
+            var bit = CompletionBit(input);
+            CompletePacket(input);
+            Assert.That(usb.ReadDoubleWord(0x5c) & bit, Is.Zero);
+            usb.WriteDoubleWord(0x3058, bit);
+            Assert.That(usb.ReadDoubleWord(0x58), Is.Zero);
+            CompletePacket(input);
+            Assert.That(usb.ReadDoubleWord(0x58), Is.EqualTo(bit));
+            Assert.That(usb.ReadDoubleWord(0x5c) & bit, Is.EqualTo(bit));
+            usb.WriteDoubleWord(0x3058, bit);
+            Assert.That(usb.ReadDoubleWord(0x58), Is.Zero);
+        }
+
+        [TestCase(true)]
+        [TestCase(false)]
+        public void ShouldAcknowledgeAnInterruptPerPairOnlyOnce(bool input)
+        {
+            ArmDoubleBuffers(input, perBuffer: false);
+            CompletePacket(input);
+            Assert.That(usb.ReadDoubleWord(0x58), Is.Zero);
+            CompletePacket(input);
+            Assert.That(usb.ReadDoubleWord(0x58), Is.EqualTo(CompletionBit(input)));
+            // BUFF_CPU is not defined for an interrupt per pair. The handler
+            // processes both buffers after one status acknowledgment.
+            usb.WriteDoubleWord(0x3058, CompletionBit(input));
+            Assert.That(usb.ReadDoubleWord(0x58), Is.Zero);
+        }
+
+        [TestCase(true, 0)]
+        [TestCase(false, 0)]
+        [TestCase(true, 7)]
+        [TestCase(false, 7)]
+        public void ShouldRetainShortAndZeroLengthPerBufferCompletions(bool input, int length)
+        {
+            ArmDoubleBuffers(input, firstLength: length);
+            CompletePacket(input, length: length);
+            CompletePacket(input);
+            AssertTwoBufferNotifications(input);
+        }
+
+        [TestCase(true)]
+        [TestCase(false)]
+        public void ShouldNotInventAnotherNotificationWhenTheSameBufferIsRearmed(bool input)
+        {
+            ArmDoubleBuffers(input);
+            CompletePacket(input);
+            var control = 0x88 + (input ? 0 : 4);
+            dpram.WriteWord(control, (ushort)(0x1401 | (input ? 0x8000 : 0)));
+            CompletePacket(input);
+            usb.WriteDoubleWord(0x3058, CompletionBit(input));
+            Assert.That(usb.ReadDoubleWord(0x58), Is.Zero);
+        }
+
+        [TestCase(true, "abort")]
+        [TestCase(false, "abort")]
+        [TestCase(true, "selector")]
+        [TestCase(false, "selector")]
+        public void ShouldRetainCompletedNotificationsAcrossAbortOrSelectorReset(bool input, string operation)
+        {
+            ArmDoubleBuffers(input);
+            CompletePacket(input);
+            CompletePacket(input);
+            if(operation == "abort")
+            {
+                usb.WriteDoubleWord(0x2060, CompletionBit(input));
+                usb.WriteDoubleWord(0x3060, CompletionBit(input));
+                usb.WriteDoubleWord(0x3064, CompletionBit(input));
+            }
+            else
+            {
+                var control = 0x88 + (input ? 0 : 4);
+                dpram.WriteDoubleWord(control, dpram.ReadDoubleWord(control) | 0x1000);
+            }
+            AssertTwoBufferNotifications(input);
+        }
+
+        [TestCase(true)]
+        [TestCase(false)]
+        public void ShouldRetainCompletedControlBuffersAcrossSetup(bool input)
+        {
+            ArmDoubleBuffers(input, endpoint: 0);
+            CompletePacket(input, endpoint: 0);
+            CompletePacket(input, endpoint: 0);
+            connection.ConnectEndpointSetup(0).SetupPacketWrite(new SetupPacket { Request = 6, Count = 8 });
+            AssertTwoBufferNotifications(input, endpoint: 0);
+        }
+
+        [TestCase(true, "controller")]
+        [TestCase(false, "controller")]
+        [TestCase(true, "bus")]
+        [TestCase(false, "bus")]
+        public void ShouldDiscardBothCompletionsWhenTheControllerOrBusResets(bool input, string reset)
+        {
+            ArmDoubleBuffers(input);
+            CompletePacket(input);
+            CompletePacket(input);
+            if(reset == "controller")
+            {
+                usb.Reset();
+                usb.WriteDoubleWord(0x40, 1);
+                usb.WriteDoubleWord(0x4c, 0x20010000);
+            }
+            else
+            {
+                connection.Dispose();
+                connection = usb.ConnectUSB();
+            }
+            Assert.That(usb.ReadDoubleWord(0x58), Is.Zero);
+            Assert.That(usb.ReadDoubleWord(0x5c), Is.Zero);
+            ArmDoubleBuffers(input);
+            CompletePacket(input);
+            usb.WriteDoubleWord(0x3058, CompletionBit(input));
+            Assert.That(usb.ReadDoubleWord(0x58), Is.Zero);
+        }
+
+        [TestCase(true)]
+        [TestCase(false)]
+        public void ShouldRetainBothCompletionsAcrossClockGating(bool input)
+        {
+            ArmDoubleBuffers(input);
+            CompletePacket(input);
+            CompletePacket(input);
+            clocks.Set(125000000, 0);
+            Assert.That(usb.ReadDoubleWord(0x58), Is.EqualTo(CompletionBit(input)));
+            clocks.Set(125000000, 48000000);
+            AssertTwoBufferNotifications(input);
+        }
+
+        [Test]
+        public void ShouldKeepInputAndOutputCompletionAcknowledgmentsIndependent()
+        {
+            ArmDoubleBuffers(true);
+            ArmDoubleBuffers(false);
+            CompletePacket(true);
+            CompletePacket(true);
+            CompletePacket(false);
+            CompletePacket(false);
+            usb.WriteDoubleWord(0x3058, 4);
+            Assert.That(usb.ReadDoubleWord(0x58), Is.EqualTo(12));
+            usb.WriteDoubleWord(0x3058, 4);
+            Assert.That(usb.ReadDoubleWord(0x58), Is.EqualTo(8));
+            usb.WriteDoubleWord(0x3058, 8);
+            Assert.That(usb.ReadDoubleWord(0x58), Is.EqualTo(8));
+            usb.WriteDoubleWord(0x3058, 8);
+            Assert.That(usb.ReadDoubleWord(0x58), Is.Zero);
+        }
+
+        [TestCase(true)]
+        [TestCase(false)]
+        public void ShouldNotCreateBufferEntriesForSyntheticSetStatus(bool input)
+        {
+            var bit = CompletionBit(input);
+            usb.WriteDoubleWord(0x2058, bit);
+            Assert.That(usb.ReadDoubleWord(0x58), Is.EqualTo(bit));
+            usb.WriteDoubleWord(0x3058, bit);
+            Assert.That(usb.ReadDoubleWord(0x58), Is.Zero);
+            ArmDoubleBuffers(input);
+            CompletePacket(input);
+            CompletePacket(input);
+            usb.WriteDoubleWord(0x2058, bit);
+            AssertTwoBufferNotifications(input);
+        }
+
+        [TestCase(true)]
+        [TestCase(false)]
+        public void ShouldRetainBufferEntriesWhenSyntheticXorMasksAndRestoresStatus(bool input)
+        {
+            var bit = CompletionBit(input);
+            usb.WriteDoubleWord(0x1058, bit);
+            usb.WriteDoubleWord(0x3058, bit);
+            Assert.That(usb.ReadDoubleWord(0x58), Is.Zero);
+            ArmDoubleBuffers(input);
+            CompletePacket(input);
+            CompletePacket(input);
+            usb.WriteDoubleWord(0x1058, bit);
+            Assert.That(usb.ReadDoubleWord(0x58), Is.Zero);
+            usb.WriteDoubleWord(0x1058, bit);
+            AssertTwoBufferNotifications(input);
+        }
+
+        private static uint CompletionBit(bool input, int endpoint = 1) => 1u << (endpoint * 2 + (input ? 0 : 1));
+
+        private void ArmDoubleBuffers(bool input, bool perBuffer = true, int firstLength = 1, int endpoint = 1)
+        {
+            var notification = perBuffer ? 1u << 29 : 1u << 28;
+            if(endpoint == 0) usb.WriteDoubleWord(0x4c, 0x40010000 | notification);
+            else dpram.WriteDoubleWord(8 + (endpoint - 1) * 8 + (input ? 0 : 4), 0xc8000180 | notification);
+            var address = endpoint == 0 ? 0x100 : 0x180;
+            dpram.WriteBytes(address, Enumerable.Repeat((byte)1, firstLength).ToArray());
+            dpram.WriteBytes(address + 64, new byte[] { 2 });
+            var first = (uint)(0x400 | (input ? 0x8000 | firstLength : 64));
+            var second = (uint)(0x400 | (input ? 0x8001 : 64));
+            dpram.WriteDoubleWord(0x80 + endpoint * 8 + (input ? 0 : 4), first | (second << 16));
+        }
+
+        private void CompletePacket(bool input, int length = 1, int endpoint = 1)
+        {
+            if(input)
+            {
+                Assert.That(connection.ConnectEndpointRead((byte)endpoint).TryRead(out var data), Is.True);
+                Assert.That(data.Length, Is.EqualTo(length));
+            }
+            else connection.ConnectEndpointWrite((byte)endpoint).WriteAsync(new byte[length]).GetAwaiter().GetResult();
+        }
+
+        private void AssertTwoBufferNotifications(bool input, long address = 0x3058, int width = 32, int endpoint = 1)
+        {
+            var bit = CompletionBit(input, endpoint);
+            Assert.That(usb.ReadDoubleWord(0x58), Is.EqualTo(bit));
+            Assert.That(usb.ReadDoubleWord(0x5c) & bit, Is.Zero);
+            AcknowledgeBuffer(bit, address, width);
+            Assert.That(usb.ReadDoubleWord(0x58), Is.EqualTo(bit));
+            Assert.That(usb.ReadDoubleWord(0x5c) & bit, Is.EqualTo(bit));
+            AcknowledgeBuffer(bit, address, width);
+            Assert.That(usb.ReadDoubleWord(0x58), Is.Zero);
+        }
+
+        private void AcknowledgeBuffer(uint value, long address, int width)
+        {
+            if(width == 8) usb.WriteByte(address, (byte)value);
+            else if(width == 16) usb.WriteWord(address, (ushort)value);
+            else usb.WriteDoubleWord(address, value);
         }
 
         [Test]
