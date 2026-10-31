@@ -454,7 +454,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             lock(pauseLock)
             {
                 this.Trace();
-                var value = isHalted || !clocked || haltedByDebugger || IsHeldInReset;
+                var value = isHalted || !clocked || HaltedByDebugger || IsHeldInReset;
                 if(isHaltedRequested == value)
                 {
                     return;

@@ -38,6 +38,49 @@ namespace Antmicro.Renode.PeripheralsTests
         [TearDown]
         public void TearDown() { EmulationManager.Instance.CurrentEmulation.RemoveMachine(machine); }
 
+        [TestCase(false)]
+        [TestCase(true)]
+        public void ShouldPreserveHostDebuggerHaltAcrossDeferredDebugRelease(bool resetCore)
+        {
+            var flags = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+            var schedulerMonitor = typeof(CortexM).GetField("debugWorkerSync", flags).GetValue(cpu);
+            var worker = typeof(CortexM).GetField("debugWorker", flags);
+            lock(schedulerMonitor)
+            {
+                // Queue reconciliation, but prevent it from observing the host
+                // halt until after the reset or DHCSR write has returned.
+                if(resetCore) cpu.Reset();
+                else nvic.WriteDoubleWord(0xdf0, 0xa05f0001);
+                Assert.IsNotNull(worker.GetValue(cpu));
+                cpu.HaltedByDebugger = true;
+            }
+            Assert.IsTrue(SpinWait.SpinUntil(() =>
+            {
+                lock(schedulerMonitor) return worker.GetValue(cpu) == null;
+            }, TimeSpan.FromSeconds(5)), "Deferred debug release did not complete");
+            Assert.AreEqual(0, nvic.ReadDoubleWord(0xdf0) & 0x20000);
+            Assert.IsTrue(cpu.HaltedByDebugger);
+            Assert.IsTrue(cpu.HasAnyHaltingCondition);
+            cpu.HaltedByDebugger = false;
+            Assert.IsFalse(cpu.HaltedByDebugger);
+            Assert.IsFalse(cpu.HasAnyHaltingCondition);
+        }
+
+        [Test]
+        public void ShouldPreserveMemoryMappedDebugHaltWhenHostDebuggerResumes()
+        {
+            nvic.WriteDoubleWord(0xdf0, 0xa05f0003);
+            WaitForHalt();
+            cpu.HaltedByDebugger = true;
+            cpu.HaltedByDebugger = false;
+            Assert.IsTrue(cpu.HaltedByDebugger);
+            Assert.IsTrue(cpu.HasAnyHaltingCondition);
+            Assert.AreNotEqual(0, nvic.ReadDoubleWord(0xdf0) & 0x20000);
+            nvic.WriteDoubleWord(0xdf0, 0xa05f0001);
+            WaitForHalt(false);
+            Assert.IsFalse(cpu.HasAnyHaltingCondition);
+        }
+
         [Test]
         public void ShouldRequireTheDebugKeyAndEnableBeforeHalting()
         {

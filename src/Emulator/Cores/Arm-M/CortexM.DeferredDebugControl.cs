@@ -11,6 +11,13 @@ namespace Antmicro.Renode.Peripherals.CPU
 {
     public partial class CortexM
     {
+        // Host/GDB and memory-mapped debug own independent halt sources.
+        public override bool HaltedByDebugger
+        {
+            get => base.HaltedByDebugger || haltedByExternalDebug;
+            set => base.HaltedByDebugger = value;
+        }
+
         internal void RequestExternalDebugControl()
         {
             // Called from MMIO and native callbacks. Neither may join the
@@ -58,7 +65,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                         // callback may need that monitor before it can return.
                         if(nvic.BeginExternalDebugControl(generation, true))
                         {
-                            base.HaltedByDebugger = true;
+                            haltedByExternalDebug = true;
                             UpdateRequestedHaltedState();
                             uint previousState;
                             lock(reset) previousState = tlibEnterHaltingDebug();
@@ -80,7 +87,8 @@ namespace Antmicro.Renode.Peripherals.CPU
                                 // Restore interrupt delivery before releasing
                                 // the PE when C_MASKINTS has been cleared.
                                 nvic.FindPendingInterrupt();
-                                base.HaltedByDebugger = false;
+                                haltedByExternalDebug = false;
+                                UpdateRequestedHaltedState();
                                 nvic.CompleteExternalDebugControl(generation, false);
                             }
                         }
@@ -148,6 +156,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         private readonly Func<uint> tlibEnterHaltingDebug;
 #pragma warning restore 649
 
+        private volatile bool haltedByExternalDebug;
         private readonly object debugWorkerSync = new object();
         private ulong debugWorkerRevision;
         [Transient]
