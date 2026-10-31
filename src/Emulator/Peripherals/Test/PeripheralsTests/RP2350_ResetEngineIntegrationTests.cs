@@ -33,6 +33,19 @@ namespace Antmicro.Renode.PeripheralsTests
             machine = null;
         }
 
+        [Test]
+        public void ShouldConstructAndResetStandaloneWithoutATimeDomain()
+        {
+            using(var standalone = new Machine())
+            {
+                Assert.IsNull(standalone.LocalTimeSource);
+                var port = new TestPort(standalone, null, null, null);
+                RP2350_POWMAN power = null;
+                Assert.DoesNotThrow(() => power = new RP2350_POWMAN(standalone, null, null, null, null, port));
+                Assert.DoesNotThrow(() => power.Reset());
+            }
+        }
+
         [TestCase(false)]
         [TestCase(true)]
         public void ShouldRunAnActualArmAircrWriteAndExecuteTheRequestedRiscVEngine(bool alreadyRunning)

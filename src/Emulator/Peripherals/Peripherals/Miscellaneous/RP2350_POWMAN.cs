@@ -56,7 +56,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             machine.SystemBus.SetAddressRangeLocked(new Antmicro.Renode.Core.Range(0x20000000, 0x40000), false);
             machine.SystemBus.SetAddressRangeLocked(new Antmicro.Renode.Core.Range(0x20040000, 0x42000), false);
             var generation = Volatile.Read(ref resetGeneration);
-            machine.LocalTimeSource.ExecuteInNearestSyncedState(_ =>
+            machine.LocalTimeSource?.ExecuteInNearestSyncedState(_ =>
             {
                 if(generation == Volatile.Read(ref resetGeneration)) ApplyRescueHold();
             });
