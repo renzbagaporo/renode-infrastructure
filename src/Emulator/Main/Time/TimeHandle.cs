@@ -382,10 +382,20 @@ namespace Antmicro.Renode.Time
                 }
 
                 DebugHelper.Assert(sinkSideInProgress, "Reporting a used time, but it seems that no grant has recently been requested.");
+                var availableTime = intervalGranted + reportedTimeResiduum - reportedSoFar;
+                if(timeLeft > availableTime)
+                {
+                    throw new ArgumentOutOfRangeException(nameof(timeLeft), "Returned time exceeds the outstanding interval.");
+                }
                 sinkSideInProgress = false;
 
-                intervalToReport = intervalGranted - timeLeft;
-                intervalGranted = timeLeft;
+                // Unused time can include credit already reported to the source
+                // by an earlier Continue. Preserve that credit for the resumed
+                // request, and only report consumption from the current grant.
+                slaveTimeResiduum = timeLeft > intervalGranted ? timeLeft - intervalGranted : TimeInterval.Empty;
+                var currentGrantLeft = timeLeft - slaveTimeResiduum;
+                intervalToReport = intervalGranted - currentGrantLeft;
+                intervalGranted = currentGrantLeft;
                 isBlocking = true;
 
                 reportPending = true;

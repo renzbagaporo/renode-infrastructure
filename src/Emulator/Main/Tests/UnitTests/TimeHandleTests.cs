@@ -5,6 +5,7 @@
 // Full license text is available in 'licenses/MIT.txt'.
 //
 using System;
+using System.Threading;
 
 using Antmicro.Renode.Time;
 using Antmicro.Renode.UnitTests.Utilities;
@@ -59,6 +60,204 @@ namespace UnitTests
 
             WaitOnSource().ShouldFinish();
             Finish();
+        }
+
+        [Test]
+        public void ShouldConserveCarriedCreditAcrossRepeatedBreaks(
+            [Values(0, 50, 100, 150, 500, 1100)] int consumed,
+            [Values(false, true)] bool reportProgress)
+        {
+            try
+            {
+                GrantOnSource();
+                RequestOnSink().ShouldFinish();
+                ReportProgressOnSink(TimeInterval.FromTicks(900));
+                ContinueOnSink(TimeInterval.FromTicks(100));
+                WaitOnSource().ShouldFinish();
+                ShouldWaitReturn(true, false, interval);
+                Assert.AreEqual(1000ul, handle.TotalElapsedTime.Ticks);
+
+                GrantOnSource();
+                RequestOnSink().ShouldFinish();
+                ShouldRequestReturn(true, TimeInterval.FromTicks(1100));
+                if(reportProgress) ReportProgressOnSink(TimeInterval.FromTicks((ulong)consumed));
+                var remaining = TimeInterval.FromTicks((ulong)(1100 - consumed));
+                var currentGrantUsed = (ulong)Math.Max(0, consumed - 100);
+                BreakOnSink(remaining);
+                sinkThread.CheckException();
+                WaitOnSource().ShouldFinish();
+                ShouldWaitReturn(false, false, TimeInterval.FromTicks(currentGrantUsed));
+                Assert.AreEqual(1000ul + currentGrantUsed, handle.TotalElapsedTime.Ticks);
+
+                for(var resume = 0; resume < 3; resume++)
+                {
+                    var request = RequestOnSink();
+                    Assert.IsTrue(SpinWait.SpinUntil(() => handle.IsReadyToBeUnblocked, TimeSpan.FromSeconds(5)),
+                        "The resumed request did not wait for the source to unblock it");
+                    UnblockOnSource();
+                    request.ShouldFinish();
+                    ShouldRequestReturn(true, remaining);
+                    if(resume != 2)
+                    {
+                        BreakOnSink(remaining);
+                        sinkThread.CheckException();
+                        WaitOnSource().ShouldFinish();
+                        ShouldWaitReturn(false, true, TimeInterval.Empty);
+                        Assert.AreEqual(1000ul + currentGrantUsed, handle.TotalElapsedTime.Ticks);
+                    }
+                    else
+                    {
+                        ReportProgressOnSink(remaining);
+                        ContinueOnSink();
+                        WaitOnSource().ShouldFinish();
+                        ShouldWaitReturn(true, true, TimeInterval.FromTicks(1000ul - currentGrantUsed));
+                    }
+                }
+                Assert.AreEqual(2000ul, handle.TotalElapsedTime.Ticks, "Carried time must not be lost or counted twice");
+                GrantOnSource();
+                RequestOnSink().ShouldFinish();
+                ShouldRequestReturn(true, interval);
+                ReportProgressOnSink(interval);
+                ContinueOnSink();
+                WaitOnSource().ShouldFinish();
+                Assert.AreEqual(3000ul, handle.TotalElapsedTime.Ticks);
+            }
+            finally { Finish(); }
+        }
+
+        [Test]
+        public void ShouldRejectLeftoverBeyondOutstandingCreditWithoutChangingState([Values(0, 50, 150)] int consumed)
+        {
+            try
+            {
+                AccumulatePreviouslyReportedCredit();
+                GrantOnSource();
+                RequestOnSink().ShouldFinish();
+                ReportProgressOnSink(TimeInterval.FromTicks((ulong)consumed));
+                var remaining = TimeInterval.FromTicks((ulong)(1100 - consumed));
+                tester.Execute(sinkThread, () =>
+                {
+                    Assert.Throws<ArgumentOutOfRangeException>(() =>
+                        handle.ReportBackAndBreak(remaining + TimeInterval.FromTicks(1)));
+                    return null;
+                }, "Reject excessive leftover").ShouldFinish();
+                sinkThread.CheckException();
+                BreakOnSink(remaining);
+                WaitOnSource().ShouldFinish();
+                var request = RequestOnSink();
+                Assert.IsTrue(SpinWait.SpinUntil(() => handle.IsReadyToBeUnblocked, TimeSpan.FromSeconds(5)));
+                UnblockOnSource();
+                request.ShouldFinish();
+                ShouldRequestReturn(true, remaining);
+                ReportProgressOnSink(remaining);
+                ContinueOnSink();
+                WaitOnSource().ShouldFinish();
+                Assert.AreEqual(2000ul, handle.TotalElapsedTime.Ticks);
+            }
+            finally { Finish(); }
+        }
+
+        [Test]
+        public void ShouldDiscardBlockedCreditWhenDisabledWithoutDuplicatingLaterTime()
+        {
+            try
+            {
+                AccumulatePreviouslyReportedCredit();
+                GrantOnSource();
+                RequestOnSink().ShouldFinish();
+                BreakOnSink(TimeInterval.FromTicks(1100));
+                WaitOnSource().ShouldFinish();
+                SetEnabledOnExternal(false).ShouldFinish();
+                WaitOnSource().ShouldFinish();
+                ShouldWaitReturn(true, false, interval);
+                Assert.AreEqual(2000ul, handle.TotalElapsedTime.Ticks);
+                SetEnabledOnExternal(true).ShouldFinish();
+                GrantOnSource();
+                RequestOnSink().ShouldFinish();
+                ShouldRequestReturn(true, interval);
+                ReportProgressOnSink(interval);
+                ContinueOnSink();
+                WaitOnSource().ShouldFinish();
+                Assert.AreEqual(3000ul, handle.TotalElapsedTime.Ticks);
+            }
+            finally { Finish(); }
+        }
+
+        [Test]
+        public void ShouldDetachWhileBlockedWithCredit([Values(false, true)] bool requestWaiting)
+        {
+            try
+            {
+                AccumulatePreviouslyReportedCredit();
+                GrantOnSource();
+                RequestOnSink().ShouldFinish();
+                BreakOnSink(TimeInterval.FromTicks(1100));
+                WaitOnSource().ShouldFinish();
+                ThreadSyncTester.ExecutionResult request = null;
+                if(requestWaiting)
+                {
+                    request = RequestOnSink();
+                    Assert.IsTrue(SpinWait.SpinUntil(() => handle.IsReadyToBeUnblocked, TimeSpan.FromSeconds(5)));
+                }
+                DisposeOnExternal();
+                if(request == null) request = RequestOnSink();
+                request.ShouldFinish();
+                ShouldRequestReturn(false, TimeInterval.Empty);
+                Assert.IsTrue(handle.DetachRequested);
+                Assert.IsFalse(handle.IsReadyForNewTimeGrant);
+                BreakOnSink(TimeInterval.FromTicks(1100)); // An already detached sink ignores a late report.
+                Assert.AreEqual(1000ul, handle.TotalElapsedTime.Ticks);
+            }
+            finally { Finish(); }
+        }
+
+        [TestCase(0)]
+        [TestCase(100)]
+        public void ShouldHandleZeroGrantsWithOrWithoutCarriedCredit(int credit)
+        {
+            try
+            {
+                if(credit != 0) AccumulatePreviouslyReportedCredit();
+                var before = handle.TotalElapsedTime;
+                interval = TimeInterval.Empty;
+                GrantOnSource();
+                RequestOnSink().ShouldFinish();
+                var carried = TimeInterval.FromTicks((ulong)credit);
+                ShouldRequestReturn(true, carried);
+                BreakOnSink(carried);
+                WaitOnSource().ShouldFinish();
+                ShouldWaitReturn(false, false, TimeInterval.Empty);
+                var request = RequestOnSink();
+                Assert.IsTrue(SpinWait.SpinUntil(() => handle.IsReadyToBeUnblocked, TimeSpan.FromSeconds(5)));
+                UnblockOnSource();
+                request.ShouldFinish();
+                ShouldRequestReturn(true, carried);
+                ReportProgressOnSink(carried);
+                ContinueOnSink();
+                WaitOnSource().ShouldFinish();
+                ShouldWaitReturn(true, true, TimeInterval.Empty);
+                Assert.AreEqual(before, handle.TotalElapsedTime);
+                interval = TimeInterval.FromTicks(1000);
+                GrantOnSource();
+                RequestOnSink().ShouldFinish();
+                ShouldRequestReturn(true, interval);
+                ReportProgressOnSink(interval);
+                ContinueOnSink();
+                WaitOnSource().ShouldFinish();
+                Assert.AreEqual(before + interval, handle.TotalElapsedTime);
+            }
+            finally { Finish(); }
+        }
+
+        private void AccumulatePreviouslyReportedCredit()
+        {
+            GrantOnSource();
+            RequestOnSink().ShouldFinish();
+            ReportProgressOnSink(TimeInterval.FromTicks(900));
+            ContinueOnSink(TimeInterval.FromTicks(100));
+            WaitOnSource().ShouldFinish();
+            ShouldWaitReturn(true, false, interval);
+            Assert.AreEqual(1000ul, handle.TotalElapsedTime.Ticks);
         }
 
         [Test]
