@@ -401,6 +401,40 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.AreEqual(0x4c013477, Read(0xa5));
         }
 
+        [Test]
+        public void ShouldDeliverBothPhysicalPulsesWhileABackendTransferIsBlocked()
+        {
+            Wake();
+            using(var entered = new ManualResetEventSlim())
+            using(var release = new ManualResetEventSlim())
+            {
+                target.OnBegin = () =>
+                {
+                    entered.Set();
+                    Assert.IsTrue(release.Wait(TimeSpan.FromSeconds(5)), "Backend was not released");
+                };
+                var transfer = Task.Run(() => RawSend(0xa5, 8));
+                try
+                {
+                    Assert.IsTrue(entered.Wait(TimeSpan.FromSeconds(5)), "Backend did not start");
+                    target.OnGPIO(2, false);
+                    target.OnGPIO(2, true);
+                    target.OnGPIO(2, false);
+                    target.OnGPIO(2, true);
+                    target.Reset(); // A protocol reset must not erase physical edges.
+                    Assert.AreEqual(0, target.TargetResetCount);
+                    Assert.AreEqual(2, target.TargetReleaseCount);
+                }
+                finally { release.Set(); }
+                Assert.IsTrue(transfer.Wait(TimeSpan.FromSeconds(5)), "Accepted transfer did not finish");
+                Assert.AreEqual(2, target.TargetResetCount);
+                Assert.AreEqual(0, target.BackendOverlap);
+                target.OnBegin = null;
+                Wake();
+                Assert.AreEqual(0x4c013477, Read(0xa5));
+            }
+        }
+
         private void RawSend(uint value, int count)
         {
             for(var i = 0; i < count; i++) RawCycle(((value >> i) & 1) != 0);

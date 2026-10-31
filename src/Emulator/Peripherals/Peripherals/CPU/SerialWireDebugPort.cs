@@ -30,7 +30,7 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         private void ResetProtocol(bool resetTarget)
         {
-            targetResetPending |= resetTarget;
+            if(resetTarget) targetResetsPending++;
             generation++;
             pending.Clear();
             notifications.Clear();
@@ -48,7 +48,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             // Publish the reset state even if a superseded release notification
             // had already changed our latch but had not reached the wire.
             notifications.Enqueue(new Notification(generation, false, false));
-            pending.Enqueue(new Input(generation, targetResetPending));
+            pending.Enqueue(new Input(generation, targetResetsPending != 0));
         }
 
         public void OnGPIO(int number, bool value)
@@ -91,16 +91,19 @@ namespace Antmicro.Renode.Peripherals.CPU
                 return () =>
                 {
                     ResetBackend();
-                    var resetTarget = false;
+                    ulong resetCount = 0;
                     lock(sync)
                     {
-                        if(input.Generation == generation && input.ResetTarget && targetResetPending)
+                        if(input.Generation == generation && input.ResetTarget)
                         {
-                            targetResetPending = false;
-                            resetTarget = true;
+                            resetCount = targetResetsPending;
+                            targetResetsPending = 0;
                         }
                     }
-                    if(resetTarget) ResetTarget();
+                    // Protocol work may coalesce while an accepted backend
+                    // transaction unwinds. Distinct physical RUN edges must
+                    // each reach the chip reset controller.
+                    for(ulong index = 0; index < resetCount; index++) ResetTarget();
                 };
             }
             var value = input.Value;
@@ -421,7 +424,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         private bool processing;
         private bool sampledClock;
         private bool sampledData = true;
-        private bool targetResetPending;
+        private ulong targetResetsPending;
 
         private readonly struct Input
         {
