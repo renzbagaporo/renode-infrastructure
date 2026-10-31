@@ -297,12 +297,15 @@ namespace Antmicro.Renode.Peripherals.DMA
 
         private uint ReadBus(Transfer transfer)
         {
+            uint value;
             switch(transfer.Bytes)
             {
-            case 1: return machine.SystemBus.ReadByte(transfer.ReadAddress, context: this);
-            case 2: return machine.SystemBus.ReadWord(transfer.ReadAddress, context: this);
-            default: return machine.SystemBus.ReadDoubleWord(transfer.ReadAddress, context: this);
+            case 1: value = machine.SystemBus.ReadByte(transfer.ReadAddress, context: this); break;
+            case 2: value = machine.SystemBus.ReadWord(transfer.ReadAddress, context: this); break;
+            default: value = machine.SystemBus.ReadDoubleWord(transfer.ReadAddress, context: this); break;
             }
+            BusAccessCompleted?.Invoke(transfer.ReadAddress, false);
+            return value;
         }
 
         private void WriteBus(Transfer transfer)
@@ -313,7 +316,10 @@ namespace Antmicro.Renode.Peripherals.DMA
             case 2: machine.SystemBus.WriteWord(transfer.WriteAddress, (ushort)transfer.Data, context: this); break;
             default: machine.SystemBus.WriteDoubleWord(transfer.WriteAddress, transfer.Data, context: this); break;
             }
+            BusAccessCompleted?.Invoke(transfer.WriteAddress, true);
         }
+
+        public event Action<ulong, bool> BusAccessCompleted;
 
         private bool Mapped(uint address, int bytes) => (address & (uint)(bytes - 1)) == 0
             && machine.SystemBus.WhatIsAt(address, this) != null && machine.SystemBus.WhatIsAt((ulong)address + (uint)bytes - 1, this) != null;

@@ -230,8 +230,38 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         public void SetHookAtMemoryAccess(MemoryAccessHook hook)
         {
-            TlibOnMemoryAccessEventEnabled(hook != null ? 1 : 0);
-            memoryAccessHook = hook;
+            lock(memoryAccessHooksSync)
+            {
+                memoryAccessHook = hook;
+                UpdateMemoryAccessHookState();
+            }
+        }
+
+        public void AddMemoryAccessHook(MemoryAccessHook hook)
+        {
+            if(hook == null) throw new ArgumentNullException(nameof(hook));
+            lock(memoryAccessHooksSync)
+            {
+                memoryAccessObservers += hook;
+                UpdateMemoryAccessHookState();
+            }
+        }
+
+        public void RemoveMemoryAccessHook(MemoryAccessHook hook)
+        {
+            lock(memoryAccessHooksSync)
+            {
+                memoryAccessObservers -= hook;
+                UpdateMemoryAccessHookState();
+            }
+        }
+
+        private void UpdateMemoryAccessHookState()
+        {
+            var enabled = memoryAccessHook != null || memoryAccessObservers != null;
+            if(disposed || enabled == memoryAccessHooksEnabled) return;
+            memoryAccessHooksEnabled = enabled;
+            TlibOnMemoryAccessEventEnabled(enabled ? 1 : 0);
         }
 
         public void AddHookOnMmuFault(ExternalMmuFaultHook hook)
@@ -1794,6 +1824,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             // We don't care if translation fails here (the address is unchanged in this case)
             TryTranslateAddress(virtualAddress, Misc.MemoryOperationToMpuAccess((MemoryOperation)operation), out var physicalAddress);
             memoryAccessHook?.Invoke(pc, (MemoryOperation)operation, virtualAddress, physicalAddress, width, value);
+            memoryAccessObservers?.Invoke(pc, (MemoryOperation)operation, virtualAddress, physicalAddress, width, value);
         }
 
         private void RemoveHookAtInterruptBegin(Action<ulong> hook)
@@ -1963,10 +1994,11 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
             // TODO: state of the reset events
             FreeState();
-            if(memoryAccessHook != null)
+            if(memoryAccessHook != null || memoryAccessObservers != null)
             {
                 // Repeat memory hook enable to make sure that the tcg context is set not to use the tlb
                 TlibOnMemoryAccessEventEnabled(1);
+                memoryAccessHooksEnabled = true;
             }
         }
 
@@ -2123,6 +2155,9 @@ namespace Antmicro.Renode.Peripherals.CPU
         private Action<ulong> interruptEndHook;
         private ExternalMmuFaultHook mmuFaultHook;
         private MemoryAccessHook memoryAccessHook;
+        private MemoryAccessHook memoryAccessObservers;
+        private bool memoryAccessHooksEnabled;
+        private readonly object memoryAccessHooksSync = new object();
         private Action<bool> wfiStateChangeHook;
         private volatile bool wakeUpFromWfiRequested;
 
