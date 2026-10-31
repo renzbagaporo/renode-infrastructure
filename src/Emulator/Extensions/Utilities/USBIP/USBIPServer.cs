@@ -22,8 +22,11 @@ using Antmicro.Renode.Core.Structure;
 using Antmicro.Renode.Core.USB;
 using Antmicro.Renode.Debugging;
 using Antmicro.Renode.Logging;
+using Antmicro.Renode.Time;
 using Antmicro.Renode.Utilities;
 using Antmicro.Renode.Utilities.Packets;
+
+using Direction = Antmicro.Renode.Core.USB.Direction;
 
 namespace Antmicro.Renode.Extensions.Utilities.USBIP
 {
@@ -472,7 +475,8 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
                     return;
                 }
                 var epoch = generation;
-                var transfer = new PendingTransfer(header, request, setup, payload, conn, epoch, () => Volatile.Read(ref generation) == epoch);
+                var transfer = new PendingTransfer(header, request, setup, payload, conn, epoch, () => Volatile.Read(ref generation) == epoch,
+                    speed: deviceSpeeds[device]);
                 pendingTransfers.Add(header.SequenceNumber, transfer);
                 // EP0 shares one queue for both directions. Other endpoints have
                 // independent IN/OUT queues, preserving submission order per pipe.
@@ -497,7 +501,7 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
                         CompleteTransfer(transfer, status: NoEntry);
                         return;
                     }
-                    transfer.Invoke(() => ep.SetupPacketWrite(transfer.Setup));
+                    WriteSetup(transfer, ep, transfer.Setup);
                     if(transfer.Setup.Count == 0 || transfer.Setup.Direction == Direction.HostToDevice)
                     {
                         // A zero-count host-to-device setup has no OUT data stage;
@@ -572,9 +576,58 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
 
         private void WritePacket(PendingTransfer transfer, IUSBPipeWrite pipe, byte[] data)
         {
-            var completion = transfer.Invoke(() => pipe.WriteAsync(data, transfer.Token));
-            completion.GetAwaiter().GetResult();
+            var packetSize = transfer.Header.EndpointNumber == 0 ? GetEndpointZeroPacketSize(transfer.Connection)
+                : GetEndpointDescriptor(transfer.Connection, (byte)transfer.Header.EndpointNumber, USB.EndpointDirection.Out)?.MaxPacketSize & 0x7ff;
+            var maximum = packetSize.GetValueOrDefault(64);
+            if(maximum == 0) throw new InvalidOperationException("USB endpoint has no packet capacity");
+            var offset = 0;
+            do
+            {
+                var packet = data.Skip(offset).Take(maximum).ToArray();
+                var completion = transfer.Invoke(() => pipe.WriteAsync(packet, transfer.Token));
+                completion.GetAwaiter().GetResult();
+                WaitForTransaction(transfer, packet.Length);
+                offset += packet.Length;
+            }
+            while(offset < data.Length);
             transfer.Token.ThrowIfCancellationRequested();
+        }
+
+        private void WriteSetup(PendingTransfer transfer, IUSBPipeSetup pipe, SetupPacket setup)
+        {
+            // SETUP has an eight-byte DATA0 packet and an ACK handshake. Publish
+            // reception after its wire time, independently of firmware service.
+            WaitForTransaction(transfer, Packet.CalculateLength<SetupPacket>());
+            transfer.Invoke(() => pipe.SetupPacketWrite(setup));
+        }
+
+        private static TimeInterval TransactionDuration(USBSpeed speed, int payloadLength)
+        {
+            // USB 2.0 table 5-9: full-speed control/bulk nominal unstuffed wire
+            // budget includes three SYNC/PID fields, token/CRC5, data CRC16,
+            // and interpacket overhead. Even a zero-length status costs time.
+            // Other links use the pipe API's approximate byte-rate accounting.
+            var overhead = speed == USBSpeed.Full ? 13 : IUSBPipeRead.DataPacketOverheadBytes;
+            return TimeInterval.FromSeconds((payloadLength + overhead) * IUSBPipeRead.SecondsPerByte);
+        }
+
+        private static void WaitForTransaction(PendingTransfer transfer, int payloadLength)
+        {
+            var source = EmulationManager.Instance.CurrentEmulation.MasterTimeSource;
+            var when = new TimeStamp(source.ElapsedVirtualTime + TransactionDuration(transfer.Speed, payloadLength), source.Domain);
+            ulong? action = null;
+            try
+            {
+                Misc.WaitForCallback(done =>
+                {
+                    action = transfer.Invoke(() => source.ExecuteInSyncedState(_ => done(), when));
+                }, transfer.Token);
+                transfer.Invoke(() => { });
+            }
+            finally
+            {
+                if(action.HasValue) source.CancelActionToExecuteInSyncedState(action.Value);
+            }
         }
 
         private (byte[], int) ReadData(PendingTransfer transfer, IUSBPipeRead pipe, int length, int maximumPacketSize)
@@ -671,7 +724,7 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
                             return pipe.TryRead(out data);
                         }))
                         {
-                            Misc.WaitForCallback(onDone => IUSBPipeRead.WrapReadCallbackInDelay(_ => onDone())(data), transfer.Token);
+                            WaitForTransaction(transfer, data.Length);
                             return data;
                         }
                         WaitHandle.WaitAny(new WaitHandle[] { available, transfer.Token.WaitHandle });
@@ -758,7 +811,7 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
 
         private byte[] ReadDescriptor(PendingTransfer transfer, IUSBPipeSetup ep0, SetupPacket setup)
         {
-            transfer.Invoke(() => ep0.SetupPacketWrite(setup));
+            WriteSetup(transfer, ep0, setup);
             var packetSize = GetEndpointZeroPacketSize(transfer.Connection);
             var bytes = new List<byte>();
             while(bytes.Count < setup.Count)
@@ -789,7 +842,7 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
                 if(registration.Discovery == null)
                 {
                     var transfer = new PendingTransfer(default(URBHeader), default(URBRequest), default(SetupPacket), Array.Empty<byte>(), connection, generation,
-                        () => Volatile.Read(ref registration.Version) == version);
+                        () => Volatile.Read(ref registration.Version) == version, speed: deviceSpeeds[device]);
                     var next = new DescriptorDiscovery(transfer);
                     registration.Discovery = next;
                     next.Result = Task.Run(() => DiscoverDevice(device, connection, registration, version, transfer));
@@ -1045,7 +1098,8 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
 
         private sealed class PendingTransfer : IDisposable
         {
-            public PendingTransfer(URBHeader header, URBRequest request, SetupPacket setup, byte[] payload, IUSBConnection connection, int generation, Func<bool> valid = null)
+            public PendingTransfer(URBHeader header, URBRequest request, SetupPacket setup, byte[] payload, IUSBConnection connection, int generation, Func<bool> valid = null,
+                USBSpeed speed = USBSpeed.High)
             {
                 Header = header;
                 Request = request;
@@ -1053,6 +1107,7 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
                 Payload = payload;
                 Connection = connection;
                 Generation = generation;
+                Speed = speed;
                 this.valid = valid;
             }
 
@@ -1092,6 +1147,7 @@ namespace Antmicro.Renode.Extensions.Utilities.USBIP
             public readonly byte[] Payload;
             public readonly IUSBConnection Connection;
             public readonly int Generation;
+            public readonly USBSpeed Speed;
             private readonly Func<bool> valid;
             private readonly object gate = new object();
             private readonly CancellationTokenSource cancellation = new CancellationTokenSource();

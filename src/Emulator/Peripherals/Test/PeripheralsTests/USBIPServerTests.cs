@@ -23,6 +23,7 @@ using Antmicro.Renode.Core.USB;
 using Antmicro.Renode.Peripherals;
 using Antmicro.Renode.Peripherals.USB;
 using Antmicro.Renode.Extensions.Utilities.USBIP;
+using Antmicro.Renode.Time;
 
 using USB = Antmicro.Renode.Extensions.Utilities.USB;
 using Antmicro.Renode.Utilities;
@@ -124,6 +125,313 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.That(AssertReply(2, URBCommand.URBReply).Skip(48), Is.EqualTo(new byte[] { 0x33 }));
             Assert.That(replies.IsEmpty, Is.True);
         }
+
+        [Test]
+        public void ShouldKeepAcceptedOutputPendingUntilItsWireCompletion()
+        {
+            UseFullSpeed();
+            EmulationManager.Instance.CurrentEmulation.PauseAll();
+            Submit(1, URBDirection.Out, 2, 1, new byte[] { 0xa5 });
+            WaitForScheduledTransactionOrReply();
+            Assert.That(device.Connection.Output.Writes.Count, Is.EqualTo(1));
+            Assert.That(replies, Is.Empty, "Device acceptance must not complete the host transaction at the same virtual instant");
+            var source = EmulationManager.Instance.CurrentEmulation.MasterTimeSource;
+            var duration = GetTransactionDuration(USBIPServer.USBSpeed.Full, 1);
+            source.RunFor(TimeInterval.FromTicks(duration.Ticks - 1));
+            Assert.That(replies, Is.Empty);
+            source.RunFor(TimeInterval.FromTicks(1));
+            AssertReply(1, URBCommand.URBReply);
+        }
+
+        [Test]
+        public void ShouldReceiveFullSpeedSetupAfterItsEightByteTransaction()
+        {
+            UseFullSpeed();
+            EmulationManager.Instance.CurrentEmulation.PauseAll();
+            var requests = device.Connection.Setup.DescriptorRequests;
+            Submit(1, URBDirection.In, 0, 18, setup: new SetupPacket { Direction = USBDirection.DeviceToHost, Request = 6, Value = 0x100, Count = 18 });
+            WaitForScheduledTransactionOrReply();
+            Assert.That(device.Connection.Setup.DescriptorRequests, Is.EqualTo(requests));
+            var source = EmulationManager.Instance.CurrentEmulation.MasterTimeSource;
+            source.RunFor(TimeInterval.FromTicks(13999));
+            Assert.That(device.Connection.Setup.DescriptorRequests, Is.EqualTo(requests));
+            source.RunFor(TimeInterval.FromTicks(1));
+            Assert.That(SpinWait.SpinUntil(() => device.Connection.Setup.DescriptorRequests == requests + 1, Timeout), Is.True);
+            server.Reset();
+        }
+
+        [Test]
+        public void ShouldCompleteFullSpeedOutputStatusAfterItsZeroLengthTransaction()
+        {
+            UseFullSpeed();
+            EmulationManager.Instance.CurrentEmulation.PauseAll();
+            Submit(1, URBDirection.In, 0, 18, setup: new SetupPacket { Direction = USBDirection.DeviceToHost, Request = 6, Value = 0x100, Count = 18 });
+            WaitForScheduledTransactionOrReply();
+            var source = EmulationManager.Instance.CurrentEmulation.MasterTimeSource;
+            source.RunFor(TimeInterval.FromTicks(14000));
+            Assert.That(SpinWait.SpinUntil(() => device.Connection.Setup.SuccessfulReads == 1 && ScheduledTransactions != 0, Timeout), Is.True);
+            source.RunFor(GetTransactionDuration(USBIPServer.USBSpeed.Full, 18));
+            Assert.That(SpinWait.SpinUntil(() => device.Connection.Setup.Writes.Count != 0 && (ScheduledTransactions != 0 || replies.Count != 0), Timeout), Is.True);
+            Assert.That(device.Connection.Setup.Writes.Single(), Is.Empty);
+            Assert.That(replies, Is.Empty);
+            source.RunFor(TimeInterval.FromTicks(8665));
+            Assert.That(replies, Is.Empty);
+            source.RunFor(TimeInterval.FromTicks(1));
+            AssertReply(1, URBCommand.URBReply);
+        }
+
+        [Test]
+        public void ShouldServicePriorOutputCompletionBeforeTheNextDescriptorSetup()
+        {
+            UseFullSpeed();
+            device.SetConnection(false);
+            device.SetConnection(true);
+            server.Reset();
+            EmulationManager.Instance.CurrentEmulation.PauseAll();
+            var source = EmulationManager.Instance.CurrentEmulation.MasterTimeSource;
+            var pendingService = 0;
+            var overlap = 0;
+            device.Connection.Setup.AfterWrite = () =>
+            {
+                Volatile.Write(ref pendingService, 1);
+                source.ExecuteInSyncedState(_ => Volatile.Write(ref pendingService, 0),
+                    new TimeStamp(source.ElapsedVirtualTime + TimeInterval.FromTicks(1), source.Domain));
+            };
+            device.Connection.Setup.BeforeSetup = () =>
+            {
+                if(Volatile.Read(ref pendingService) == 0) return;
+                Volatile.Write(ref overlap, 1);
+                throw new InvalidOperationException("SETUP overlapped the preceding OUT completion");
+            };
+            var discovery = Task.Run(() => CacheDescriptors());
+            while(!discovery.IsCompleted)
+            {
+                Assert.That(SpinWait.SpinUntil(() => ScheduledTransactions != 0 || discovery.IsCompleted, Timeout), Is.True);
+                if(Volatile.Read(ref pendingService) != 0)
+                {
+                    // The service event is one action. A second action is the
+                    // host's wire completion; an unpaced host reaches SETUP.
+                    Assert.That(SpinWait.SpinUntil(() => ScheduledTransactions >= 2 || Volatile.Read(ref overlap) != 0 || discovery.IsCompleted, Timeout), Is.True);
+                }
+                if(Volatile.Read(ref overlap) != 0) break;
+                source.RunFor(TimeInterval.FromMicroseconds(100));
+            }
+            Assert.That(Volatile.Read(ref overlap), Is.Zero);
+            discovery.GetAwaiter().GetResult();
+        }
+
+        [TestCase(0, new int[] { 0 })]
+        [TestCase(64, new int[] { 64 })]
+        [TestCase(65, new int[] { 64, 1 })]
+        [TestCase(128, new int[] { 64, 64 })]
+        public void ShouldPreserveOutputPacketBoundariesWithoutAddingATerminatingZeroPacket(int length, int[] sizes)
+        {
+            var payload = Enumerable.Range(0, length).Select(x => (byte)x).ToArray();
+            Submit(1, URBDirection.Out, 2, (uint)length, payload);
+            AssertReply(1, URBCommand.URBReply);
+            Assert.That(device.Connection.Output.Writes.Select(x => x.Length), Is.EqualTo(sizes));
+            Assert.That(device.Connection.Output.Writes.SelectMany(x => x), Is.EqualTo(payload));
+        }
+
+        [TestCase(17, new int[] { 8, 8, 1 })]
+        [TestCase(64, new int[] { 8, 8, 8, 8, 8, 8, 8, 8 })]
+        [TestCase(65, new int[] { 8, 8, 8, 8, 8, 8, 8, 8, 1 })]
+        public void ShouldUseTheOutputDescriptorPacketSize(int length, int[] sizes)
+        {
+            device.Connection.Setup.EndpointPacketSize = 8;
+            device.SetConnection(false);
+            device.SetConnection(true);
+            CacheDescriptors();
+            SetURBState();
+            Submit(1, URBDirection.Out, 0, 0, setup: new SetupPacket { Request = 9, Value = 1 });
+            AssertReply(1, URBCommand.URBReply);
+            var payload = Enumerable.Range(0, length).Select(x => (byte)x).ToArray();
+            Submit(2, URBDirection.Out, 2, (uint)payload.Length, payload);
+            AssertReply(2, URBCommand.URBReply);
+            Assert.That(device.Connection.Output.Writes.Select(x => x.Length), Is.EqualTo(sizes));
+            Assert.That(device.Connection.Output.Writes.SelectMany(x => x), Is.EqualTo(payload));
+        }
+
+        [Test]
+        public void ShouldPreserveAcceptedOutputPrefixWhenTheSecondPacketStalls()
+        {
+            device.Connection.Output.RejectWriteAfter = 1;
+            var payload = Enumerable.Range(0, 129).Select(x => (byte)x).ToArray();
+            Submit(1, URBDirection.Out, 2, (uint)payload.Length, payload);
+            var reply = AssertReply(1, URBCommand.URBReply);
+            Assert.That(unchecked((int)Packet.Decode<URBHeader>(reply).FlagsOrStatus), Is.EqualTo(-32));
+            Assert.That(device.Connection.Output.Writes.Select(x => x.Length), Is.EqualTo(new[] { 64 }));
+            Assert.That(device.Connection.Output.Writes.SelectMany(x => x), Is.EqualTo(payload.Take(64)));
+        }
+
+        [Test]
+        public void ShouldRejectTheUnacceptedSecondPacketOnUnlink()
+        {
+            device.Connection.Output.BlockWriteAfter = 1;
+            Submit(1, URBDirection.Out, 2, 129, new byte[129]);
+            Assert.That(device.Connection.Output.BlockedWrite.Wait(Timeout), Is.True);
+            Feed(new URBHeader { Command = URBCommand.Unlink, SequenceNumber = 2, FlagsOrStatus = 1 }, default(URBRequest));
+            AssertReply(2, URBCommand.UnlinkReply);
+            EmulationManager.Instance.CurrentEmulation.PauseAll();
+            EmulationManager.Instance.CurrentEmulation.MasterTimeSource.RunFor(TimeInterval.FromMilliseconds(1));
+            Assert.That(device.Connection.Output.Writes.Select(x => x.Length), Is.EqualTo(new[] { 64 }));
+            Assert.That(replies, Is.Empty);
+        }
+
+        [TestCase("reset")]
+        [TestCase("unplug")]
+        [TestCase("unregister")]
+        [TestCase("dispose")]
+        public void ShouldDiscardCanceledWireCompletionsAndOutputSuffix(string action)
+        {
+            EmulationManager.Instance.CurrentEmulation.PauseAll();
+            Submit(1, URBDirection.Out, 2, 129, new byte[129]);
+            WaitForScheduledTransactionOrReply();
+            switch(action)
+            {
+            case "reset": server.Reset(); break;
+            case "unplug": device.SetConnection(false); break;
+            case "unregister": server.Unregister(device); break;
+            case "dispose": server.Dispose(); break;
+            }
+            Assert.That(SpinWait.SpinUntil(() => ScheduledTransactions == 0, Timeout), Is.True);
+            EmulationManager.Instance.CurrentEmulation.MasterTimeSource.RunFor(TimeInterval.FromMilliseconds(1));
+            Assert.That(device.Connection.Output.Writes.Select(x => x.Length), Is.EqualTo(new[] { 64 }));
+            Assert.That(replies, Is.Empty);
+        }
+
+        [Test]
+        public void ShouldRejectOutputSuffixAfterControllerResetDuringWireCompletion()
+        {
+            using(var machine = new Machine())
+            {
+                var dpram = new RP2_USB_DPRAM();
+                var usb = new RP2_USB(machine, dpram, new TestClocks());
+                usb.WriteDoubleWord(0x40, 1);
+                usb.WriteDoubleWord(0x4c, 0x20010000);
+                dpram.WriteDoubleWord(0x14, 0xa0000180);
+                var recording = new RecordingDevice(usb);
+                server.Register(recording, new NumberRegistrationPoint<int>(1), USBIPServer.USBSpeed.Full);
+                // Feed exercises imported URBs directly; install the connection
+                // identity that the TCP import handshake normally establishes.
+                var connection = GetField<IDictionary<IUSBDevice, IUSBConnection>>(server, "deviceToConnection")[recording];
+                typeof(USBIPServer).GetField("importedConnection", BindingFlags.Instance | BindingFlags.NonPublic).SetValue(server, connection);
+                EmulationManager.Instance.CurrentEmulation.PauseAll();
+                var payload = Enumerable.Range(0, 129).Select(x => (byte)x).ToArray();
+                Feed(new URBHeader { Command = URBCommand.URBRequest, SequenceNumber = 1, BusId = 1,
+                    DeviceId = 1, Direction = URBDirection.Out, EndpointNumber = 2 },
+                    new URBRequest { TransferBufferLength = (uint)payload.Length }, payload);
+                Assert.That(recording.WriteStarted.Wait(Timeout), Is.True);
+                dpram.WriteWord(0x94, 0x440);
+                WaitForScheduledTransactionOrReply();
+                Assert.That(dpram.ReadBytes(0x180, 64), Is.EqualTo(payload.Take(64)));
+                usb.Reset();
+                Assert.That(SpinWait.SpinUntil(() => ScheduledTransactions == 0, Timeout), Is.True);
+                usb.WriteDoubleWord(0x40, 1);
+                usb.WriteDoubleWord(0x4c, 0x20010000);
+                dpram.WriteDoubleWord(0x14, 0xa0000180);
+                var replacement = Enumerable.Repeat((byte)0xcc, 64).ToArray();
+                dpram.WriteBytes(0x180, replacement);
+                dpram.WriteWord(0x94, 0x440);
+                EmulationManager.Instance.CurrentEmulation.MasterTimeSource.RunFor(TimeInterval.FromMilliseconds(1));
+                Assert.That(dpram.ReadBytes(0x180, 64), Is.EqualTo(replacement));
+                Assert.That(replies, Is.Empty);
+                server.Unregister(recording);
+            }
+        }
+
+        [Test]
+        public void ShouldUnlinkAcceptedOutputBeforeSendingItsRemainingPackets()
+        {
+            EmulationManager.Instance.CurrentEmulation.PauseAll();
+            Submit(1, URBDirection.Out, 2, 129, new byte[129]);
+            WaitForScheduledTransactionOrReply();
+            Feed(new URBHeader { Command = URBCommand.Unlink, SequenceNumber = 2, FlagsOrStatus = 1 }, default(URBRequest));
+            AssertReply(2, URBCommand.UnlinkReply);
+            Assert.That(SpinWait.SpinUntil(() => ScheduledTransactions == 0, Timeout), Is.True);
+            EmulationManager.Instance.CurrentEmulation.MasterTimeSource.RunFor(TimeInterval.FromMilliseconds(1));
+            Assert.That(device.Connection.Output.Writes.Select(x => x.Length), Is.EqualTo(new[] { 64 }));
+            Assert.That(replies, Is.Empty);
+        }
+
+        [Test]
+        public void ShouldUnlinkSetupBeforePublishingReception()
+        {
+            EmulationManager.Instance.CurrentEmulation.PauseAll();
+            var requests = device.Connection.Setup.DescriptorRequests;
+            Submit(1, URBDirection.In, 0, 18, setup: new SetupPacket { Direction = USBDirection.DeviceToHost, Request = 6, Value = 0x100, Count = 18 });
+            WaitForScheduledTransactionOrReply();
+            Assert.That(device.Connection.Setup.DescriptorRequests, Is.EqualTo(requests));
+            Feed(new URBHeader { Command = URBCommand.Unlink, SequenceNumber = 2, FlagsOrStatus = 1 }, default(URBRequest));
+            AssertReply(2, URBCommand.UnlinkReply);
+            Assert.That(SpinWait.SpinUntil(() => ScheduledTransactions == 0, Timeout), Is.True);
+            EmulationManager.Instance.CurrentEmulation.MasterTimeSource.RunFor(TimeInterval.FromMilliseconds(1));
+            Assert.That(device.Connection.Setup.DescriptorRequests, Is.EqualTo(requests));
+            Assert.That(replies, Is.Empty);
+        }
+
+        [TestCase("reset")]
+        [TestCase("unplug")]
+        [TestCase("unregister")]
+        [TestCase("dispose")]
+        public void ShouldCancelDelayedSetupWithoutTouchingTheNextGeneration(string action)
+        {
+            EmulationManager.Instance.CurrentEmulation.PauseAll();
+            var requests = device.Connection.Setup.DescriptorRequests;
+            Submit(1, URBDirection.In, 0, 18, setup: new SetupPacket { Direction = USBDirection.DeviceToHost, Request = 6, Value = 0x100, Count = 18 });
+            WaitForScheduledTransactionOrReply();
+            switch(action)
+            {
+            case "reset": server.Reset(); break;
+            case "unplug": device.SetConnection(false); break;
+            case "unregister": server.Unregister(device); break;
+            case "dispose": server.Dispose(); break;
+            }
+            Assert.That(SpinWait.SpinUntil(() => ScheduledTransactions == 0, Timeout), Is.True);
+            EmulationManager.Instance.CurrentEmulation.MasterTimeSource.RunFor(TimeInterval.FromMilliseconds(1));
+            Assert.That(device.Connection.Setup.DescriptorRequests, Is.EqualTo(requests));
+            Assert.That(replies, Is.Empty);
+        }
+
+        [TestCase(USBIPServer.USBSpeed.Full, 0, 8666ul)]
+        [TestCase(USBIPServer.USBSpeed.Full, 8, 14000ul)]
+        [TestCase(USBIPServer.USBSpeed.Full, 64, 51333ul)]
+        [TestCase(USBIPServer.USBSpeed.High, 0, 2666ul)]
+        [TestCase(USBIPServer.USBSpeed.Low, 8, 8000ul)]
+        [TestCase(USBIPServer.USBSpeed.Super, 8, 8000ul)]
+        public void ShouldAccountForTransactionPayloadAndNonzeroOverhead(USBIPServer.USBSpeed speed, int payload, ulong nanoseconds)
+        {
+            Assert.That(GetTransactionDuration(speed, payload).Ticks, Is.EqualTo(nanoseconds));
+        }
+
+        private static TimeInterval GetTransactionDuration(USBIPServer.USBSpeed speed, int payload)
+            => (TimeInterval)typeof(USBIPServer).GetMethod("TransactionDuration", BindingFlags.Static | BindingFlags.NonPublic)
+                .Invoke(null, new object[] { speed, payload });
+
+        private void UseFullSpeed()
+        {
+            server.Unregister(device);
+            server.Register(device, new NumberRegistrationPoint<int>(0), USBIPServer.USBSpeed.Full);
+            CacheDescriptors();
+            SetURBState();
+            Submit(0, URBDirection.Out, 0, 0, setup: new SetupPacket { Request = 9, Value = 1 });
+            AssertReply(0, URBCommand.URBReply);
+            device.Connection.Setup.SuccessfulReads = 0;
+            device.Connection.Setup.Writes.Clear();
+        }
+
+        private int ScheduledTransactions
+        {
+            get
+            {
+                var source = EmulationManager.Instance.CurrentEmulation.MasterTimeSource;
+                var actions = typeof(TimeSourceBase).GetField("delayedActions", BindingFlags.Instance | BindingFlags.NonPublic).GetValue(source);
+                lock(actions) return (int)actions.GetType().GetProperty("Count").GetValue(actions);
+            }
+        }
+
+        private void WaitForScheduledTransactionOrReply()
+            => Assert.That(SpinWait.SpinUntil(() => ScheduledTransactions != 0 || replies.Count != 0, Timeout), Is.True);
 
         [Test]
         public void ShouldProcessControlWhileNotificationInputIsPending()
@@ -649,12 +957,18 @@ namespace Antmicro.Renode.PeripheralsTests
             public event Action ClockChanged { add { } remove { } }
         }
 
-        private sealed class RecordingDevice : IUSBDevice
+        private sealed class RecordingDevice : IUSBDevice, IUSBDeviceConnectionState
         {
             public RecordingDevice(IUSBDevice device) { this.device = device; }
             public IUSBConnection ConnectUSB() => new RecordingConnection(device.ConnectUSB(), WriteStarted);
             public byte Address => device.Address;
             public void Reset() => device.Reset();
+            public bool IsConnected => ((IUSBDeviceConnectionState)device).IsConnected;
+            public event Action<bool> ConnectionStateChanged
+            {
+                add { ((IUSBDeviceConnectionState)device).ConnectionStateChanged += value; }
+                remove { ((IUSBDeviceConnectionState)device).ConnectionStateChanged -= value; }
+            }
             public readonly ManualResetEventSlim WriteStarted = new ManualResetEventSlim();
             private readonly IUSBDevice device;
         }
@@ -765,9 +1079,31 @@ namespace Antmicro.Renode.PeripheralsTests
                 Interlocked.Increment(ref SuccessfulReads);
                 return true;
             }
-            public void Write(byte[] data) => Writes.Enqueue(data);
+            public void Write(byte[] data)
+            {
+                Writes.Enqueue(data);
+                AfterWrite?.Invoke();
+            }
+            public Task WriteAsync(byte[] data, CancellationToken token = default)
+            {
+                token.ThrowIfCancellationRequested();
+                if(RejectWriteAfter.HasValue && Writes.Count >= RejectWriteAfter.Value) throw new USBStallException();
+                if(BlockWriteAfter.HasValue && Writes.Count >= BlockWriteAfter.Value) return WaitForWriteCancellation(token);
+                Write(data);
+                return Task.CompletedTask;
+            }
+            private async Task WaitForWriteCancellation(CancellationToken token)
+            {
+                var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                using(token.Register(() => completion.TrySetCanceled(token)))
+                {
+                    BlockedWrite.Set();
+                    await completion.Task.ConfigureAwait(false);
+                }
+            }
             public void SetupPacketWrite(SetupPacket setup)
             {
+                BeforeSetup?.Invoke();
                 if(setup.Request == 6 && setup.Value >> 8 != 0)
                 {
                     stalledInput = false;
@@ -848,6 +1184,11 @@ namespace Antmicro.Renode.PeripheralsTests
             }
             private event Action newPacket;
             public Action BeforeReadUnsubscribed;
+            public Action AfterWrite;
+            public Action BeforeSetup;
+            public int? RejectWriteAfter;
+            public int? BlockWriteAfter;
+            public readonly ManualResetEventSlim BlockedWrite = new ManualResetEventSlim();
             public string NextDescriptorFailure;
             public byte[] SetupResponse = Array.Empty<byte>();
             public bool HoldDescriptors;
