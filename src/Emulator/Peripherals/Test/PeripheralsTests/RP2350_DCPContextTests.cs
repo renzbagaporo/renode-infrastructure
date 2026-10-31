@@ -54,7 +54,7 @@ namespace Antmicro.Renode.PeripheralsTests
         public void ShouldMatchAllCapturedProcessedStatusCombinations()
         {
             // Literal NZCV nibbles from 1024 physical RP2350 observations,
-            // CHIP_ID=0x30004d27, DCP VERSION=4. Index: XF[9:6], YF[5:2],
+            // CHIP_ID=0x30004927, DCP VERSION=4. Index: XF[9:6], YF[5:2],
             // saved comparison[1:0], engaged=1. This oracle is independent
             // of the emulator's boolean status implementation.
             // Raw sweep SHA256:
