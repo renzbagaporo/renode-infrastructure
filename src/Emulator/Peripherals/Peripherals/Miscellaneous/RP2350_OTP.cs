@@ -12,7 +12,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 {
     public sealed class RP2350_OTP : RP2APBPeripheral
     {
-        public RP2350_OTP(IMachine machine) : base(machine) { Reset(); }
+        public RP2350_OTP(IMachine machine) : base(machine) { Reset(); ResetArchitectureSelection(); }
 
         public override void Reset()
         {
@@ -30,6 +30,23 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             if(data.Length != rows.Length * 4) throw new ArgumentException("OTP raw image must contain 4096 32-bit rows");
             for(var i = 0; i < rows.Length; i++) rows[i] = BitConverter.ToUInt32(data, i * 4) & 0xffffff;
             Reset();
+            ResetArchitectureSelection();
+        }
+
+        // ARCHSEL belongs to the earliest switched-domain reset, ahead of the
+        // PSM processor-cold stage. Resetting the OTP controller stage alone
+        // must preserve the request that the boot ROM prepared for a watchdog.
+        public void ResetArchitectureSelection()
+        {
+            architectureRequest = ConstrainArchitecture((Critical & 8) != 0 ? 3u : 0u);
+        }
+
+        public bool LatchArchitecture(int core)
+        {
+            if(core < 0 || core > 1) throw new ArgumentOutOfRangeException(nameof(core));
+            var bit = 1u << core;
+            architectureStatus = (architectureStatus & ~bit) | (architectureRequest & bit);
+            return (architectureStatus & bit) != 0;
         }
 
         public bool UserInterfaceEnabled => (userControl & 0x11) == 1;
@@ -83,7 +100,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 return valid;
             case 0x150: return debugEnable;
             case 0x154: return debugLock;
-            case 0x158: case 0x15c: return 0;
+            case 0x158: return architectureRequest;
+            case 0x15c: return architectureStatus;
             case 0x160: return bootDisable;
             default: this.LogUnhandledRead(offset); return 0;
             }
@@ -111,7 +129,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 return;
             case 0x154: debugLock |= value & 0x10f; return;
             case 0x158:
-                if(value != 0) this.Log(LogLevel.Error, "RISC-V architecture selection is not supported by this Arm platform");
+                architectureRequest = ConstrainArchitecture(ApplyOperation(architectureRequest, value, operation, 3));
                 return;
             case 0x160:
                 if((value & 1) != 0) bootDisable &= ~1u;
@@ -132,8 +150,22 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     for(var row = 0x40; row < 0x48; row++) count += (int)((rows[row] >> bit) & 1);
                     if(count >= 3) result |= 1u << bit;
                 }
-                return result & 0x7f;
+                for(var bit = 0; bit < 2; bit++)
+                {
+                    var count = 0;
+                    for(var row = 0x38; row < 0x40; row++) count += (int)((rows[row] >> bit) & 1);
+                    if(count >= 3) result |= 1u << (16 + bit);
+                }
+                return result & 0x3007f;
             }
+        }
+
+        private uint ConstrainArchitecture(uint request)
+        {
+            var critical = Critical;
+            if((critical & 0x10000) != 0) return 3;
+            if((critical & 0x20001) != 0) return 0;
+            return request & 3;
         }
 
         private static uint MajorityByte(uint value) => ((value & (value >> 8)) | ((value >> 8) & (value >> 16)) | (value & (value >> 16))) & 0xff;
@@ -149,6 +181,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private uint bootDisable;
         private uint debugEnable;
         private uint debugLock;
+        private uint architectureRequest;
+        private uint architectureStatus;
         private static readonly uint[] ParityMasks = { 0x1ad5b, 0x2366d, 0x4c78e, 0x807f0, 0x10f800 };
     }
 }

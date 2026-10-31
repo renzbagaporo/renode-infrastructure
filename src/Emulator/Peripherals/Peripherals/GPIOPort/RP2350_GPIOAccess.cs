@@ -29,6 +29,11 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             {
                 return cortexM.SecureState;
             }
+            if(cpu is RP2350_Hazard3 riscv)
+            {
+                return bus.TryGetCurrentContextState<RP2350_Hazard3.ContextState>(out var _, out var riscvState)
+                    ? riscvState.Privileged : riscv.CurrentPrivilegeLevel == PrivilegeLevel.Machine;
+            }
             // Debug transactions without explicit attributes use the Secure view.
             return true;
         }

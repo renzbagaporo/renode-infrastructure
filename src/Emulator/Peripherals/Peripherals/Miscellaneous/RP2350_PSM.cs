@@ -25,6 +25,22 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         {
         }
 
+        public RP2350_ArchitectureSelector ArchitectureSelector { get; set; }
+
+        protected override BaseCPU GetProcessor(int core) => ArchitectureSelector?.ActiveProcessor(core) ?? base.GetProcessor(core);
+
+        protected override void SetProcessorResetHold(int core, bool held)
+        {
+            if(ArchitectureSelector != null) ArchitectureSelector.SetPowerSequencerResetHold(core, held);
+            else base.SetProcessorResetHold(core, held);
+        }
+
+        protected override void ResetProcessor(int core)
+        {
+            if(ArchitectureSelector != null) ArchitectureSelector.ResetProcessor(core);
+            else base.ResetProcessor(core);
+        }
+
         public void Register(IPeripheral peripheral, NumberRegistrationPoint<int> registrationPoint)
         {
             var domain = registrationPoint.Address;
@@ -65,16 +81,18 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 // power scratch and externally powered NOR remain available.
                 var retained = machine.GetRegisteredPeripherals().Select(entry => entry.Peripheral)
                     .Where(peripheral => peripheral is RP2350_DebugPort || peripheral is RP2350_POWMAN
-                        || peripheral is WinbondW25QFlash || peripheral == watchdog).Distinct().ToList();
+                        || peripheral is WinbondW25QFlash || peripheral == watchdog
+                        || peripheral == ArchitectureSelector).Distinct().ToList();
                 machine.RequestResetInSafeState(unresetable: retained);
                 return;
             }
-            var resume = cores.Select(core => !core.IsHalted && !core.CpuWaitSignal.IsSet && !core.HaltedByDebugger
+            var processors = Enumerable.Range(0, 2).Select(GetProcessor).ToArray();
+            var resume = processors.Select(core => !core.IsHalted && !(core is CortexM arm && arm.CpuWaitSignal.IsSet) && !core.HaltedByDebugger
                 && (!core.IsPaused || machine.IsPaused)).ToArray();
             machine.LocalTimeSource.ExecuteInNearestSyncedState(_ =>
             {
                 if(generation != Volatile.Read(ref resetGeneration)) return;
-                var paused = cores.Select(core => core.IsPaused && !machine.IsPaused).ToArray();
+                var paused = processors.Select(core => core.IsPaused && !machine.IsPaused).ToArray();
                 // Domain resets run after watchdog/clock callbacks release their
                 // state locks and while processors cannot receive a time grant.
                 using(machine.ObtainPausedState(true))
@@ -92,11 +110,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                         if(domain >= Processor0Bit)
                         {
                             var core = domain - Processor0Bit;
-                            nvics[core].Reset();
-                            cores[core].Reset();
+                            ResetProcessor(core);
                             // Normalize Reset's pause request even when an
                             // independent hardware/debug hold prevents execution.
-                            if(resume[core] || cores[core].HasAnyHaltingCondition) cores[core].Resume();
+                            if(resume[core] || GetProcessor(core).HasAnyHaltingCondition) GetProcessor(core).Resume();
                             continue;
                         }
                         foreach(var peripheral in peripherals.Where(entry => entry.Value == domain).Select(entry => entry.Key))
@@ -109,7 +126,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 // own-life. Restore host pauses within this synchronization phase.
                 for(var core = 0; core < cores.Length; core++)
                 {
-                    if(paused[core]) cores[core].Pause();
+                    if(paused[core]) GetProcessor(core).Pause();
                 }
             });
         }

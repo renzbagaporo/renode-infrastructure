@@ -22,6 +22,7 @@ EXTERNAL_AS(void, HandlePreStackAccessHook, tlib_handle_pre_stack_access_hook,
             uint64_t, uint32_t, uint32_t)
 EXTERNAL_AS(void, ClicClearEdgeInterrupt, tlib_clic_clear_edge_interrupt)
 EXTERNAL_AS(void, ClicAcknowledgeInterrupt, tlib_clic_acknowledge_interrupt)
+EXTERNAL_AS(void, Hazard3SendEvent, tlib_hazard3_send_event)
 
 EXTERNAL_AS(void, ExternalPMPConfigCSRWrite, tlib_extpmp_cfg_csr_write, uint32_t, uint64_t)
 EXTERNAL_AS(uint64_t, ExternalPMPConfigCSRRead, tlib_extpmp_cfg_csr_read, uint32_t)

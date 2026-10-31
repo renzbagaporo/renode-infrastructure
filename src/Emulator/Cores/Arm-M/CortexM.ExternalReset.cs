@@ -22,7 +22,15 @@ namespace Antmicro.Renode.Peripherals.CPU
             UpdateRequestedHaltedState();
         }
 
-        protected override bool IsHeldInReset => externalResetHeld || powerSequencerResetHeld;
+        internal void SetArchitectureResetHold(bool asserted)
+        {
+            architectureResetHeld = asserted;
+            UpdateRequestedHaltedState();
+        }
+
+        protected override bool IsHeldInReset => externalResetHeld || powerSequencerResetHeld || architectureResetHeld;
+
+        private volatile bool architectureResetHeld;
 
         private volatile bool powerSequencerResetHeld;
 

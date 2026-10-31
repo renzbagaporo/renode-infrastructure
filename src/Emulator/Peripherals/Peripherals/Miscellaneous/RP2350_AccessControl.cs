@@ -118,6 +118,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             if(machine.SystemBus.TryGetCurrentContextState<CortexM.ContextState>(out var _, out var transaction) && transaction.DebugAccess)
                 return transaction.AttributionSecure && transaction.Privileged;
             if(!machine.SystemBus.TryGetTransactionInitiator(out var initiator)) return true;
+            if(initiator is RP2350_Hazard3 riscv)
+            {
+                master = (int)riscv.MultiprocessingId;
+                var privileged = machine.SystemBus.TryGetCurrentContextState<RP2350_Hazard3.ContextState>(out var _, out var riscvState)
+                    ? riscvState.Privileged : riscv.CurrentPrivilegeLevel == PrivilegeLevel.Machine;
+                return privileged && !CoreIsForcedNonSecure(master);
+            }
             if(!(initiator is CortexM core)) { master = 2; return false; }
             master = (int)core.MultiprocessingId;
             if(machine.SystemBus.TryGetCurrentContextState<CortexM.ContextState>(out var _, out var state))

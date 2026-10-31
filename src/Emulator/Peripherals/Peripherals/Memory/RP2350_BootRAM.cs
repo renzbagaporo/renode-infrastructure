@@ -120,6 +120,11 @@ namespace Antmicro.Renode.Peripherals.Memory
                     throw new BusAccessException(BusAccessError.CommandError);
                 if(!state.AttributionSecure) throw new BusAccessException(BusAccessError.CommandError);
             }
+            else if(bus.TryGetTransactionInitiator(out var riscvInitiator) && riscvInitiator is RP2350_Hazard3 riscv
+                && (!(bus.TryGetCurrentContextState<RP2350_Hazard3.ContextState>(out var _, out var riscvState)
+                        ? riscvState.Privileged : riscv.CurrentPrivilegeLevel == PrivilegeLevel.Machine)
+                    || accessControl != null && accessControl.CoreIsForcedNonSecure((int)riscv.MultiprocessingId)))
+                throw new BusAccessException(BusAccessError.CommandError);
             else if(bus.TryGetTransactionInitiator(out var initiator) && initiator is CortexM core && core.TrustZoneEnabled
                 && (!core.SecureState || accessControl != null && accessControl.CoreIsForcedNonSecure((int)core.MultiprocessingId)))
                 throw new BusAccessException(BusAccessError.CommandError);

@@ -28,10 +28,11 @@ namespace Antmicro.Renode.Peripherals.CPU
             InterruptMode interruptMode = InterruptMode.Auto,
             PrivilegeLevels privilegeLevels = PrivilegeLevels.MachineSupervisorUser,
             bool useMachineAtomicState = true,
-            uint pmpEntryCount = 64
+            uint pmpEntryCount = 64,
+            uint minimalPmpNapotInBytes = 8
         )
             : base(timeProvider, hartId, cpuType, machine, privilegedArchitecture, endianness, CpuBitness.Bits32, nmiVectorAddress, nmiVectorLength,
-                    allowUnalignedAccesses, interruptMode, privilegeLevels: privilegeLevels, pmpNumberOfAddrBits: pmpNumberOfAddrBits, useMachineAtomicState: useMachineAtomicState, pmpEntryCount: pmpEntryCount)
+                    allowUnalignedAccesses, interruptMode, privilegeLevels: privilegeLevels, pmpNumberOfAddrBits: pmpNumberOfAddrBits, useMachineAtomicState: useMachineAtomicState, pmpEntryCount: pmpEntryCount, minimalPmpNapotInBytes: minimalPmpNapotInBytes)
         {
         }
 

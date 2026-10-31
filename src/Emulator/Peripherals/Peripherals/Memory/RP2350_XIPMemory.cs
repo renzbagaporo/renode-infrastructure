@@ -143,8 +143,11 @@ namespace Antmicro.Renode.Peripherals.Memory
         private void RememberReadPages(long offset, int count)
         {
             var bus = machine.GetSystemBus(this);
-            if(!bus.TryGetCurrentContextState<CortexM.ContextState>(out var _, out var state)
-                || !state.InstructionFetch) return;
+            var instructionFetch = bus.TryGetCurrentContextState<CortexM.ContextState>(out var _, out var state)
+                && state.InstructionFetch;
+            instructionFetch |= bus.TryGetCurrentContextState<RP2350_Hazard3.ContextState>(out var _, out var riscvState)
+                && riscvState.InstructionFetch;
+            if(!instructionFetch) return;
             if(offset < 0 || count <= 0 || offset >= Size) return;
             var end = Math.Min(Size - 1, offset + count - 1);
             lock(readPages)

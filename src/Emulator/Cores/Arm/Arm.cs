@@ -23,7 +23,7 @@ using Endianess = ELFSharp.ELF.Endianess;
 namespace Antmicro.Renode.Peripherals.CPU
 {
     [GPIO(NumberOfInputs = 2)]
-    public abstract partial class Arm : TranslationCPU, ICPUWithHooks, IRegisterablePeripheral<SemihostingHandler, NullRegistrationPoint>, IRegisterablePeripheral<ArmPerformanceMonitoringUnit, NullRegistrationPoint>, ICPUWithDirtyAdressesSharing
+    public abstract partial class Arm : TranslationCPU, ICPUWithHooks, IRegisterablePeripheral<SemihostingHandler, NullRegistrationPoint>, IRegisterablePeripheral<ArmPerformanceMonitoringUnit, NullRegistrationPoint>, ICPUWithDirtyAdressesSharing, ISystemEventReceiver
     {
         public Arm(string cpuType, IMachine machine, uint cpuId = 0, Endianess endianness = Endianess.LittleEndian, uint? numberOfMPURegions = null, ArmSignalsUnit signalsUnit = null)
             : base(cpuId, cpuType, machine, endianness)
@@ -82,6 +82,8 @@ namespace Antmicro.Renode.Peripherals.CPU
         {
             TlibSetEventFlag();
         }
+
+        public void ReceiveSystemEvent() => SetEventFlag();
 
         public override void Dispose()
         {
@@ -470,9 +472,9 @@ namespace Antmicro.Renode.Peripherals.CPU
         [Export]
         private void SetSystemEvent()
         {
-            foreach(var cpu in machine.SystemBus.GetCPUs().OfType<Arm>())
+            foreach(var cpu in machine.SystemBus.GetCPUs().OfType<ISystemEventReceiver>())
             {
-                cpu.SetEventFlag();
+                cpu.ReceiveSystemEvent();
             }
         }
 

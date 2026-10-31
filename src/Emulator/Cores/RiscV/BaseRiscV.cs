@@ -67,6 +67,13 @@ namespace Antmicro.Renode.Peripherals.CPU
             TlibRaiseInterrupt(interruptId);
         }
 
+        [Export]
+        private void Hazard3SendEvent()
+        {
+            foreach(var cpu in machine.SystemBus.GetCPUs().OfType<ISystemEventReceiver>())
+                cpu.ReceiveSystemEvent();
+        }
+
         public void ClicPresentInterrupt(int index, bool vectored, int level, PrivilegeLevel mode)
         {
             TlibSetClicInterruptState(index, vectored ? 1u : 0, (uint)level, (uint)mode);
@@ -515,9 +522,9 @@ namespace Antmicro.Renode.Peripherals.CPU
         )
             : base(hartId, cpuType, machine, endianness, bitness, useMachineAtomicState)
         {
-            if(pmpEntryCount != 0 && pmpEntryCount != 16 && pmpEntryCount != 64)
+            if(pmpEntryCount != 0 && pmpEntryCount != 8 && pmpEntryCount != 16 && pmpEntryCount != 64)
             {
-                throw new ConstructionException($"Invalid PMP entry count ({pmpEntryCount}), only 0, 16, and 64 are allowed");
+                throw new ConstructionException($"Invalid PMP entry count ({pmpEntryCount}), only 0, 8, 16, and 64 are allowed");
             }
             HartId = hartId;
             this.timeProvider = timeProvider;

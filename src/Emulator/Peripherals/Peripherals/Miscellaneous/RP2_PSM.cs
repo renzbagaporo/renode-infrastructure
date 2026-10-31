@@ -142,14 +142,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 // blocked in MMIO can finish before Pause/Reset joins it.
                 if(needsReset)
                 {
-                    cores[core].SetPowerSequencerResetHold(true);
-                    nvics[core].Reset();
-                    cores[core].Reset();
+                    SetProcessorResetHold(core, true);
+                    ResetProcessor(core);
                     // Reset requests a pause. Normalize it through Resume while
                     // our independent reset source still prevents PE execution;
                     // the time handle must be disabled rather than waiting for
                     // a thread that the reset hold intentionally does not start.
-                    cores[core].Resume();
+                    GetProcessor(core).Resume();
                     lock(SyncRoot)
                     {
                         appliedProcessorReset |= ProcessorBit(core);
@@ -168,8 +167,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                         appliedProcessorReset &= ~ProcessorBit(core);
                     }
                 }
-                cores[core].SetPowerSequencerResetHold(held);
-                if(!held) cores[core].Resume();
+                SetProcessorResetHold(core, held);
+                if(!held) GetProcessor(core).Resume();
                 lock(SyncRoot)
                 {
                     // Record the physical result even if Reset invalidated the
@@ -183,6 +182,16 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         }
 
         private uint ProcessorBit(int core) => 1u << (processor0Bit + core);
+
+        protected virtual BaseCPU GetProcessor(int core) => cores[core];
+
+        protected virtual void SetProcessorResetHold(int core, bool held) => cores[core].SetPowerSequencerResetHold(held);
+
+        protected virtual void ResetProcessor(int core)
+        {
+            nvics[core].Reset();
+            cores[core].Reset();
+        }
 
         protected int resetGeneration;
         protected readonly CortexM[] cores;

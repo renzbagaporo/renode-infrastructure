@@ -482,6 +482,11 @@ namespace Antmicro.Renode.Peripherals.CPU
             return pauseGuard.RequestTranslationBlockRestart(quiet);
         }
 
+        // Wake the host execution thread without changing the native sleep
+        // condition. Cores with custom event/interrupt inputs evaluate their
+        // own pending state when they next receive a time grant.
+        protected void InterruptExecutionSleep() => sleeper.Interrupt();
+
         public void RequestWakeUpFromWfi()
         {
             wakeUpFromWfiRequested = true;

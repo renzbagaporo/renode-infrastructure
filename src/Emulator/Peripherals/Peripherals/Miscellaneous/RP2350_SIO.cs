@@ -231,6 +231,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 core = (int)(cpu.MultiprocessingId & 1);
                 if(!debugAccess) cpu.SyncTime();
                 if(cpu is CortexM cortex && cortex.TrustZoneEnabled) secure = cortex.SecureState;
+                if(cpu is RP2350_Hazard3 riscv)
+                    secure = bus.TryGetCurrentContextState<RP2350_Hazard3.ContextState>(out var _, out var riscvState)
+                        ? riscvState.Privileged : riscv.CurrentPrivilegeLevel == PrivilegeLevel.Machine;
             }
             if(haveState) secure = state.AttributionSecure;
             if(!debugAccess && accessControl != null && accessControl.CoreIsForcedNonSecure(core)) secure = false;
