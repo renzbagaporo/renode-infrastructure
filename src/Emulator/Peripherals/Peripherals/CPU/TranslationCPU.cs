@@ -1161,9 +1161,9 @@ namespace Antmicro.Renode.Peripherals.CPU
         {
         }
 
-        protected ulong GetCPUStateForMemoryTransaction()
+        protected ulong GetCPUStateForMemoryTransaction(ulong address, bool write = false)
         {
-            return TlibGetCpuStateForMemoryTransaction();
+            return TlibGetCpuStateForMemoryTransaction(address, write ? 1u : 0u);
         }
 
         protected virtual void AfterLoad(IntPtr statePtr)
@@ -1200,12 +1200,12 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         protected void WriteWordToBus(ulong offset, ulong value)
         {
-            WriteWordToBus(offset, value, GetCPUStateForMemoryTransaction());
+            WriteWordToBus(offset, value, GetCPUStateForMemoryTransaction(offset, write: true));
         }
 
         protected ulong ReadDoubleWordFromBus(ulong offset)
         {
-            return ReadDoubleWordFromBus(offset, GetCPUStateForMemoryTransaction());
+            return ReadDoubleWordFromBus(offset, GetCPUStateForMemoryTransaction(offset));
         }
 
         protected override void OnLeavingResetState()
@@ -1437,22 +1437,22 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         protected ulong ReadByteFromBus(ulong offset)
         {
-            return ReadByteFromBus(offset, GetCPUStateForMemoryTransaction());
+            return ReadByteFromBus(offset, GetCPUStateForMemoryTransaction(offset));
         }
 
         protected ulong ReadWordFromBus(ulong offset)
         {
-            return ReadWordFromBus(offset, GetCPUStateForMemoryTransaction());
+            return ReadWordFromBus(offset, GetCPUStateForMemoryTransaction(offset));
         }
 
         protected ulong ReadQuadWordFromBus(ulong offset)
         {
-            return ReadQuadWordFromBus(offset, GetCPUStateForMemoryTransaction());
+            return ReadQuadWordFromBus(offset, GetCPUStateForMemoryTransaction(offset));
         }
 
         protected void WriteByteToBus(ulong offset, ulong value)
         {
-            WriteByteToBus(offset, value, GetCPUStateForMemoryTransaction());
+            WriteByteToBus(offset, value, GetCPUStateForMemoryTransaction(offset, write: true));
         }
 
         /// <remarks>
@@ -1468,12 +1468,12 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         protected void WriteDoubleWordToBus(ulong offset, ulong value)
         {
-            WriteDoubleWordToBus(offset, value, GetCPUStateForMemoryTransaction());
+            WriteDoubleWordToBus(offset, value, GetCPUStateForMemoryTransaction(offset, write: true));
         }
 
         protected void WriteQuadWordToBus(ulong offset, ulong value)
         {
-            WriteQuadWordToBus(offset, value, GetCPUStateForMemoryTransaction());
+            WriteQuadWordToBus(offset, value, GetCPUStateForMemoryTransaction(offset, write: true));
         }
 
         protected virtual string GetExceptionDescription(ulong exceptionIndex)
@@ -2263,7 +2263,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         private readonly Action TlibOnLeavingResetState;
 
         [Import(UseExceptionWrapper = false)] // Not wrapped for performance
-        private readonly Func<ulong> TlibGetCpuStateForMemoryTransaction;
+        private readonly Func<ulong, uint, ulong> TlibGetCpuStateForMemoryTransaction;
 
         [Import]
         private readonly Action<int> TlibSetBroadcastDirty;
