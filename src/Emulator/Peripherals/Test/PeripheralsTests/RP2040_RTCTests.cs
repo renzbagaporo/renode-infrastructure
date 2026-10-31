@@ -3,7 +3,12 @@
 // Full license text is available in 'licenses/MIT.txt'.
 //
 
+using System.Collections.Generic;
+using System.Threading;
+
 using Antmicro.Renode.Core;
+using Antmicro.Renode.Peripherals;
+using Antmicro.Renode.Peripherals.Miscellaneous;
 using Antmicro.Renode.Peripherals.Timers;
 using Antmicro.Renode.Time;
 
@@ -106,6 +111,229 @@ namespace Antmicro.Renode.PeripheralsTests
             AdvanceMilliseconds(2000);
             Assert.AreEqual(0u, rtc.ReadDoubleWord(0xc));
             Assert.AreEqual(0u, rtc.ReadDoubleWord(0x1c));
+        }
+
+        [Test]
+        public void ShouldSynchronizeAlarmEnableAndDisableToRTCClock()
+        {
+            rtc.WriteDoubleWord(0x10, 0x10000000);
+            Assert.AreEqual(0x10000000u, rtc.ReadDoubleWord(0x10));
+            AdvanceMilliseconds(1);
+            Assert.AreEqual(0x10000000u, rtc.ReadDoubleWord(0x10));
+            AdvanceMilliseconds(1);
+            Assert.AreEqual(0x30000000u, rtc.ReadDoubleWord(0x10));
+            rtc.WriteDoubleWord(0x3010, 0x10000000);
+            Assert.AreEqual(0x20000000u, rtc.ReadDoubleWord(0x10));
+            AdvanceMilliseconds(2);
+            Assert.AreEqual(0u, rtc.ReadDoubleWord(0x10));
+        }
+
+        [Test]
+        public void ShouldWaitForCalendarUpdateWhenArmedAtMatchingSecond()
+        {
+            Load(2020, 6, 5, 3, 15, 45, 0);
+            Start();
+            rtc.WriteDoubleWord(0x14, 0x10000000);
+            rtc.WriteDoubleWord(0x10, 0x10000000);
+            rtc.WriteDoubleWord(0x24, 1);
+            AdvanceMilliseconds(2);
+            Assert.AreEqual(0u, rtc.ReadDoubleWord(0x20));
+            Assert.IsFalse(rtc.IRQ.IsSet);
+            AdvanceMilliseconds(1000);
+            Assert.AreEqual(1u, rtc.ReadDoubleWord(0x1c) & 0x3f);
+            Assert.IsFalse(rtc.IRQ.IsSet);
+            AdvanceMilliseconds(59000);
+            Assert.AreEqual(0u, rtc.ReadDoubleWord(0x1c) & 0x3f);
+            Assert.IsTrue(rtc.IRQ.IsSet);
+        }
+
+        [Test]
+        public void ShouldRearmSecondMatchWithoutRefiringWithinSameSecond()
+        {
+            Load(2020, 6, 5, 3, 15, 45, 0);
+            rtc.WriteDoubleWord(0x14, 0x10000001);
+            rtc.WriteDoubleWord(0x10, 0x10000000);
+            rtc.WriteDoubleWord(0x24, 1);
+            Start();
+            AdvanceMilliseconds(1000);
+            Assert.IsTrue(rtc.IRQ.IsSet);
+            rtc.WriteDoubleWord(0x3010, 0x10000000);
+            AdvanceMilliseconds(2);
+            Assert.IsFalse(rtc.IRQ.IsSet);
+            Assert.AreEqual(0u, rtc.ReadDoubleWord(0x20));
+            rtc.WriteDoubleWord(0x2010, 0x10000000);
+            AdvanceMilliseconds(2);
+            Assert.AreEqual(0x30000000u, rtc.ReadDoubleWord(0x10));
+            Assert.IsFalse(rtc.IRQ.IsSet);
+            AdvanceMilliseconds(59000);
+            Assert.IsFalse(rtc.IRQ.IsSet);
+            AdvanceMilliseconds(1000);
+            Assert.AreEqual(1u, rtc.ReadDoubleWord(0x1c) & 0x3f);
+            Assert.IsTrue(rtc.IRQ.IsSet);
+        }
+
+        [Test]
+        public void ShouldEvaluateWildcardAlarmAtEachCalendarUpdate()
+        {
+            Load(2020, 6, 5, 3, 15, 45, 0);
+            rtc.WriteDoubleWord(0x10, 0x10000000);
+            rtc.WriteDoubleWord(0x24, 1);
+            Start();
+            Assert.IsFalse(rtc.IRQ.IsSet);
+            AdvanceMilliseconds(1000);
+            Assert.IsTrue(rtc.IRQ.IsSet);
+            rtc.WriteDoubleWord(0x3010, 0x10000000);
+            AdvanceMilliseconds(2);
+            rtc.WriteDoubleWord(0x2010, 0x10000000);
+            AdvanceMilliseconds(2);
+            Assert.IsFalse(rtc.IRQ.IsSet);
+            AdvanceMilliseconds(1000);
+            Assert.IsTrue(rtc.IRQ.IsSet);
+        }
+
+        [Test]
+        public void ShouldKeepRawAlarmIndependentOfMaskAndForce()
+        {
+            Load(2020, 6, 5, 3, 15, 45, 0);
+            rtc.WriteDoubleWord(0x14, 0x10000001);
+            rtc.WriteDoubleWord(0x10, 0x10000000);
+            Start();
+            AdvanceMilliseconds(1000);
+            Assert.AreEqual(1u, rtc.ReadDoubleWord(0x20));
+            Assert.AreEqual(0u, rtc.ReadDoubleWord(0x2c));
+            Assert.IsFalse(rtc.IRQ.IsSet);
+            rtc.WriteDoubleWord(0x24, 1);
+            Assert.IsTrue(rtc.IRQ.IsSet);
+            rtc.WriteDoubleWord(0x24, 0);
+            rtc.WriteDoubleWord(0x28, 1);
+            Assert.IsTrue(rtc.IRQ.IsSet);
+            rtc.WriteDoubleWord(0x3010, 0x10000000);
+            AdvanceMilliseconds(2);
+            Assert.AreEqual(0u, rtc.ReadDoubleWord(0x20));
+            Assert.IsTrue(rtc.IRQ.IsSet);
+            rtc.WriteDoubleWord(0x28, 0);
+            Assert.IsFalse(rtc.IRQ.IsSet);
+        }
+
+        [Test]
+        public void ShouldResetPendingAlarmSynchronizationAndInterrupt()
+        {
+            Load(2020, 6, 5, 3, 15, 45, 0);
+            Start();
+            rtc.WriteDoubleWord(0x10, 0x10000000);
+            rtc.WriteDoubleWord(0x24, 1);
+            rtc.WriteDoubleWord(0x28, 1);
+            AdvanceMilliseconds(1);
+            rtc.Reset();
+            AdvanceMilliseconds(2000);
+            Assert.AreEqual(0u, rtc.ReadDoubleWord(0x10));
+            Assert.AreEqual(0u, rtc.ReadDoubleWord(0x20));
+            Assert.AreEqual(0u, rtc.ReadDoubleWord(0x2c));
+            Assert.AreEqual(0u, rtc.ReadDoubleWord(0x1c));
+            Assert.IsFalse(rtc.IRQ.IsSet);
+        }
+
+        [Test]
+        public void ShouldPauseCalendarAndAlarmSynchronizationWhenClockIsGated()
+        {
+            var xosc = new RP2_XOSC(machine);
+            var rosc = new RP2040_ROSC(machine);
+            var clocks = new RP2040_Clocks(machine, xosc, rosc,
+                new RP2_PLL(machine, xosc), new RP2_PLL(machine, xosc));
+            clocks.WriteDoubleWord(0x70, 6000u << 8);
+            clocks.WriteDoubleWord(0x6c, 0x840);
+            Assert.AreEqual(1000ul, clocks.GetFrequency(9));
+            rtc = new RP2040_RTC(machine, clocks);
+            rtc.WriteDoubleWord(0, 999);
+            Load(2020, 6, 5, 3, 15, 45, 0);
+            Start();
+            clocks.WriteDoubleWord(0x6c, 0x40);
+            rtc.WriteDoubleWord(0x10, 0x10000000);
+            rtc.WriteDoubleWord(0x24, 1);
+            AdvanceMilliseconds(2000);
+            Assert.AreEqual(0x10000000u, rtc.ReadDoubleWord(0x10));
+            Assert.AreEqual(0u, rtc.ReadDoubleWord(0x1c) & 0x3f);
+            Assert.IsFalse(rtc.IRQ.IsSet);
+            clocks.WriteDoubleWord(0x6c, 0x840);
+            AdvanceMilliseconds(2);
+            Assert.AreEqual(0x30000000u, rtc.ReadDoubleWord(0x10));
+            Assert.IsFalse(rtc.IRQ.IsSet);
+            AdvanceMilliseconds(1000);
+            Assert.AreEqual(1u, rtc.ReadDoubleWord(0x1c) & 0x3f);
+            Assert.IsTrue(rtc.IRQ.IsSet);
+        }
+
+        [Test]
+        public void ShouldPublishIRQAfterReleasingRegisterStateMonitor()
+        {
+            var receiver = new InterruptReceiver(rtc);
+            rtc.IRQ.Connect(receiver, 0);
+            rtc.WriteDoubleWord(0x28, 1);
+            rtc.WriteDoubleWord(0x28, 0);
+            Load(2020, 6, 5, 3, 15, 45, 0);
+            rtc.WriteDoubleWord(0x14, 0x10000001);
+            rtc.WriteDoubleWord(0x10, 0x10000000);
+            rtc.WriteDoubleWord(0x24, 1);
+            Start();
+            AdvanceMilliseconds(1000);
+            rtc.Reset();
+            Assert.That(receiver.States, Does.Contain(true));
+            Assert.That(receiver.States, Does.Contain(false));
+            Assert.That(receiver.CalledUnderStateMonitor, Is.All.False);
+        }
+
+        [TestCase(false)]
+        [TestCase(true)]
+        public void ShouldDrainIRQChangesFromReentrantAcknowledgeOrHeldReset(bool reset)
+        {
+            var receiver = new InterruptReceiver(rtc);
+            receiver.Callback = value =>
+            {
+                if(!value) return;
+                if(reset) rtc.ResetHeld = true;
+                else rtc.WriteDoubleWord(0x28, 0);
+            };
+            rtc.IRQ.Connect(receiver, 0);
+            rtc.WriteDoubleWord(0x28, 1);
+            Assert.AreEqual(1, receiver.States.FindAll(value => value).Count);
+            Assert.IsFalse(receiver.States[receiver.States.Count - 1]);
+            Assert.That(receiver.CalledUnderStateMonitor, Is.All.False);
+            Assert.AreEqual(0u, rtc.ReadDoubleWord(0x2c));
+            Assert.IsFalse(rtc.IRQ.IsSet);
+            if(reset)
+            {
+                rtc.WriteDoubleWord(0x28, 1);
+                AdvanceMilliseconds(2000);
+                Assert.IsFalse(rtc.IRQ.IsSet);
+                rtc.ResetHeld = false;
+                Assert.AreEqual(0u, rtc.ReadDoubleWord(0x2c));
+            }
+        }
+
+        private sealed class InterruptReceiver : IGPIOReceiver
+        {
+            public InterruptReceiver(RP2040_RTC rtc) => this.rtc = rtc;
+
+            public void Reset()
+            {
+                States.Clear();
+                CalledUnderStateMonitor.Clear();
+            }
+
+            public void OnGPIO(int number, bool value)
+            {
+                States.Add(value);
+                CalledUnderStateMonitor.Add(Monitor.IsEntered(rtc));
+                rtc.ReadDoubleWord(0x2c);
+                Callback?.Invoke(value);
+            }
+
+            public readonly List<bool> States = new List<bool>();
+            public readonly List<bool> CalledUnderStateMonitor = new List<bool>();
+
+            public System.Action<bool> Callback;
+
+            private readonly RP2040_RTC rtc;
         }
 
         private void Load(uint year, uint month, uint day, uint weekday, uint hour, uint minute, uint second)
