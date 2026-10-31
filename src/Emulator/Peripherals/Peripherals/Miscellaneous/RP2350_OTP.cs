@@ -41,6 +41,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             architectureRequest = ConstrainArchitecture((Critical & 8) != 0 ? 3u : 0u);
         }
 
+        public bool RequestedRiscV(int core)
+        {
+            if(core < 0 || core > 1) throw new ArgumentOutOfRangeException(nameof(core));
+            return (architectureRequest & (1u << core)) != 0;
+        }
+
         public bool LatchArchitecture(int core)
         {
             if(core < 0 || core > 1) throw new ArgumentOutOfRangeException(nameof(core));

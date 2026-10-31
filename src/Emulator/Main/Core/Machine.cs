@@ -348,18 +348,29 @@ namespace Antmicro.Renode.Core
 
         public void RequestResetInSafeState(Action postReset, ICollection<IPeripheral> unresetable, bool runRegisteredResetEvents, Action preReset)
         {
+            ValidateCPUResetOwnership();
             Action softwareRequestedReset = null;
             softwareRequestedReset = () =>
             {
                 LocalTimeSource.SinksReportedHook -= softwareRequestedReset;
-                var pausedCPUs = registeredPeripherals.OfType<ICPU>()
-                    .Where(cpu => cpu.IsPaused && !IsPaused).ToArray();
+                var resetControllers = registeredPeripherals.OfType<ICPUResetController>().Distinct().ToArray();
+                var processors = registeredPeripherals.OfType<ICPU>().Distinct().ToArray();
+                ValidateCPUResetOwnership();
+                var retainedCPUs = unresetable?.OfType<ICPU>().ToArray() ?? new ICPU[0];
+                var resetProcessors = processors.Where(cpu => !retainedCPUs.Contains(cpu)
+                    && resetControllers.All(controller => !controller.Contains(cpu)
+                        || retainedCPUs.All(retained => !controller.SameProcessor(cpu, retained)))).ToArray();
+                var pausedCPUs = processors.Where(cpu => cpu.IsPaused && !IsPaused
+                    && resetControllers.All(controller => !controller.Contains(cpu) || controller.IsActive(cpu))).ToArray();
+                var attached = pausedCPUs.ToDictionary(cpu => cpu, cpu => (cpu as ITimeSink)?.TimeHandle?.Enabled);
                 using(ObtainPausedState(true))
                 {
                     // Power/reset controllers can prepare retained state and
                     // powered-down memory only once every PE has stopped.
+                    foreach(var controller in resetControllers) controller.HoldInReset(resetProcessors);
                     preReset?.Invoke();
-                    foreach(var peripheral in registeredPeripherals.Distinct().Where(p => p != this && !(unresetable?.Contains(p) ?? false)))
+                    foreach(var peripheral in registeredPeripherals.Distinct().Where(p => p != this && !(unresetable?.Contains(p) ?? false)
+                        && (!(p is ICPU cpu) || resetProcessors.Contains(cpu))))
                     {
                         peripheral.Reset();
                         PeripheralReset?.Invoke(this, peripheral);
@@ -372,10 +383,33 @@ namespace Antmicro.Renode.Core
                 }
                 // A reset must preserve an explicit processor pause requested
                 // before this boundary, including one after the reset edge.
-                foreach(var cpu in pausedCPUs) cpu.Pause();
+                foreach(var cpu in pausedCPUs)
+                {
+                    var controller = resetControllers.FirstOrDefault(candidate => candidate.Contains(cpu));
+                    var target = controller != null && resetProcessors.Contains(cpu) ? controller.GetResetTarget(cpu) : cpu;
+                    target.Pause();
+                    if(controller != null && attached[cpu].HasValue && target is ITimeSink sink)
+                    {
+                        sink.TimeHandle.Enabled = attached[cpu].Value;
+                        sink.TimeHandle.DeferredEnabled = attached[cpu].Value;
+                    }
+                }
+                // Restore physical host pauses before an alternative engine can
+                // receive any time. Architecture/reset sampling happens here.
+                foreach(var controller in resetControllers) controller.ReleaseReset();
                 postReset?.Invoke();
             };
             LocalTimeSource.SinksReportedHook += softwareRequestedReset;
+        }
+
+        private void ValidateCPUResetOwnership()
+        {
+            var controllers = registeredPeripherals.OfType<ICPUResetController>().Distinct().ToArray();
+            foreach(var cpu in registeredPeripherals.OfType<ICPU>().Distinct())
+            {
+                if(controllers.Count(controller => controller.Contains(cpu)) > 1)
+                    throw new RecoverableException("Execution engine belongs to more than one CPU reset controller");
+            }
         }
 
         public void RecordTo(string fileName, RecordingBehaviour recordingBehaviour)

@@ -86,17 +86,21 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 machine.RequestResetInSafeState(unresetable: retained);
                 return;
             }
-            var processors = Enumerable.Range(0, 2).Select(GetProcessor).ToArray();
-            var resume = processors.Select(core => !core.IsHalted && !(core is CortexM arm && arm.CpuWaitSignal.IsSet) && !core.HaltedByDebugger
-                && (!core.IsPaused || machine.IsPaused)).ToArray();
             machine.LocalTimeSource.ExecuteInNearestSyncedState(_ =>
             {
                 if(generation != Volatile.Read(ref resetGeneration)) return;
+
+                var processors = Enumerable.Range(0, 2).Select(GetProcessor).ToArray();
+                var resume = processors.Select(core => !core.IsHalted && !(core is CortexM arm && arm.CpuWaitSignal.IsSet) && !core.HaltedByDebugger
+                    && (!core.IsPaused || machine.IsPaused)).ToArray();
                 var paused = processors.Select(core => core.IsPaused && !machine.IsPaused).ToArray();
+                var attached = processors.Select(core => core.TimeHandle.Enabled).ToArray();
                 // Domain resets run after watchdog/clock callbacks release their
                 // state locks and while processors cannot receive a time grant.
                 using(machine.ObtainPausedState(true))
                 {
+                    ArchitectureSelector?.HoldInReset(Enumerable.Range(0, 2)
+                        .Where(core => (selected & (1u << (Processor0Bit + core))) != 0).Select(core => (ICPU)processors[core]));
                     if((selected & (1u << 4)) == 0)
                     {
                         foreach(var controller in peripherals.Select(entry => entry.Key).OfType<RP2_Resets>())
@@ -126,8 +130,17 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 // own-life. Restore host pauses within this synchronization phase.
                 for(var core = 0; core < cores.Length; core++)
                 {
-                    if(paused[core]) GetProcessor(core).Pause();
+                    if(!paused[core]) continue;
+                    var target = ArchitectureSelector != null && (selected & (1u << (Processor0Bit + core))) != 0
+                        ? (BaseCPU)ArchitectureSelector.GetResetTarget(processors[core]) : GetProcessor(core);
+                    target.Pause();
+                    if(ArchitectureSelector != null)
+                    {
+                        target.TimeHandle.Enabled = attached[core];
+                        target.TimeHandle.DeferredEnabled = attached[core];
+                    }
                 }
+                ArchitectureSelector?.ReleaseReset();
             });
         }
 
