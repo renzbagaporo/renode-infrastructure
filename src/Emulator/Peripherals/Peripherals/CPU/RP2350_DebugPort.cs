@@ -3,22 +3,26 @@
 // Full license text is available in 'licenses/MIT.txt'.
 //
 using System;
+using System.Threading;
 
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Peripherals.Bus;
+using Antmicro.Renode.Peripherals.Miscellaneous;
 
 namespace Antmicro.Renode.Peripherals.CPU
 {
     // RP2350 datasheet 3.5: a DPv3 with two AHB5 MEM-APv2s and an always-on RP-AP.
     public class RP2350_DebugPort : SerialWireDebugPort
     {
-        public RP2350_DebugPort(IMachine machine, CortexM cpu0, CortexM cpu1)
+        public RP2350_DebugPort(IMachine machine, CortexM cpu0, CortexM cpu1,
+            RP2350_ArchitectureSelector architectureSelector = null)
         {
             this.machine = machine;
+            ArchitectureSelector = architectureSelector;
             cores = new[] { cpu0, cpu1 };
             // MachineReset runs after peripheral reset while PEs are paused.
             // Reapply the physical level before the machine can resume them.
-            machine.MachineReset += _ => ApplyRunHold();
+            machine.MachineReset += _ => { ApplyRunHold(); ApplyRescueHold(); };
             aps = new[] { new MemoryAccessPort(machine.SystemBus, cpu0), new MemoryAccessPort(machine.SystemBus, cpu1) };
             if(cpu0 != null) cpu0.EnableMemoryMappedDebug = true;
             if(cpu1 != null) cpu1.EnableMemoryMappedDebug = true;
@@ -27,9 +31,13 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         protected override void ResetBackend()
         {
+            var rescueWasAsserted = RescueResetAsserted;
             select = select1 = readBuffer = rpControl = 0;
             control = 0x40;
             if(aps != null) foreach(var ap in aps) ap.Reset();
+            // RP-AP CTRL belongs to the DP reset domain. Its physical rescue
+            // output deasserts when that register resets, including during RUN.
+            if(rescueWasAsserted) RescueResetChanged?.Invoke(false);
         }
 
         protected override void LineReset()
@@ -52,9 +60,32 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         internal void ApplyRunHold()
         {
-            var asserted = ResetPinAsserted;
-            foreach(var core in cores) core?.SetExternalResetHold(asserted);
+            appliedRunHold = ResetPinAsserted;
+            ReconcileResetHolds();
         }
+
+        internal void ApplyRescueHold()
+        {
+            appliedRescueHold = RescueResetAsserted;
+            ReconcileResetHolds();
+        }
+
+        private void ReconcileResetHolds()
+        {
+            if(ArchitectureSelector != null)
+            {
+                ArchitectureSelector.SetRunResetHold(appliedRunHold);
+                ArchitectureSelector.SetRescueResetHold(appliedRescueHold);
+            }
+            else
+            {
+                foreach(var core in cores) core?.SetExternalResetHold(appliedRunHold || appliedRescueHold);
+            }
+        }
+
+        public bool RescueResetAsserted => (Volatile.Read(ref rpControl) & 0x80000000) != 0;
+
+        internal RP2350_ArchitectureSelector ArchitectureSelector { get; set; }
 
         protected override Acknowledgement BeginTransfer(bool accessPort, bool read, byte address, out uint value)
         {
@@ -320,5 +351,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         private readonly CortexM[] cores;
         private readonly MemoryAccessPort[] aps;
         private uint select, select1, control, readBuffer, rpControl;
+        private bool appliedRunHold;
+        private bool appliedRescueHold;
     }
 }

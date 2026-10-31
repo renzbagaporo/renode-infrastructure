@@ -5,8 +5,8 @@
 
 using System;
 using System.Collections.Generic;
-using System.Threading;
 using System.Linq;
+using System.Threading;
 
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Logging;
@@ -22,11 +22,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
     {
         public RP2350_POWMAN(IMachine machine, CortexM core0, CortexM core1, NVIC nvic0, NVIC nvic1,
             RP2350_DebugPort debugPort, RP2350_BootRAM bootRAM = null, RP2350_XIP xip = null,
-            MappedMemory sramLow = null, MappedMemory sramHigh = null) : base(machine)
+            MappedMemory sramLow = null, MappedMemory sramHigh = null,
+            RP2350_ArchitectureSelector architectureSelector = null) : base(machine)
         {
             cores = new[] { core0, core1 };
             nvics = new[] { nvic0, nvic1 };
             this.debugPort = debugPort;
+            this.architectureSelector = architectureSelector ?? debugPort.ArchitectureSelector;
+            if(architectureSelector != null) debugPort.ArchitectureSelector = architectureSelector;
             this.bootRAM = bootRAM;
             this.xip = xip;
             this.sramLow = sramLow;
@@ -45,7 +48,6 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             debugPowerConfiguration = 0;
             debugConfiguration = 0;
             watchdogSelect = 0;
-            rescueHeld = false;
             powerState = timerControl = 0;
             Array.Clear(powerUp, 0, powerUp.Length);
             Array.Clear(scratch, 0, scratch.Length);
@@ -53,6 +55,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             xip?.SetPowerPresent(true);
             machine.SystemBus.SetAddressRangeLocked(new Antmicro.Renode.Core.Range(0x20000000, 0x40000), false);
             machine.SystemBus.SetAddressRangeLocked(new Antmicro.Renode.Core.Range(0x20040000, 0x42000), false);
+            var generation = Volatile.Read(ref resetGeneration);
+            machine.LocalTimeSource.ExecuteInNearestSyncedState(_ =>
+            {
+                if(generation == Volatile.Read(ref resetGeneration)) ApplyRescueHold();
+            });
         }
 
         public void OnGPIO(int number, bool value)
@@ -61,20 +68,43 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             // AIRCR SYSRESETREQ is an individual warm core reset on RP2350
             // (datasheet AIRCR bit 2). SW-DP and the sibling core keep running.
             var generation = Volatile.Read(ref resetGeneration);
-            var core = cores[number];
-            var resume = !core.IsHalted && !core.CpuWaitSignal.IsSet && !core.HaltedByDebugger
-                && (!core.IsPaused || machine.IsPaused);
             machine.LocalTimeSource.ExecuteInNearestSyncedState(_ =>
             {
-                if(generation != Volatile.Read(ref resetGeneration) || rescueHeld) return;
-                nvics[number].Reset();
-                cores[number].Reset();
-                // Reset pauses the execution thread. Resume preserves native
-                // debugger halt/vector-catch state while restarting time progress.
-                if(resume || cores[number].HasAnyHaltingCondition) cores[number].Resume();
+                if(generation != Volatile.Read(ref resetGeneration) || debugPort.RescueResetAsserted) return;
+                var processors = Enumerable.Range(0, 2).Select(GetProcessor).ToArray();
+                var paused = processors.Select(core => core.IsPaused && !machine.IsPaused).ToArray();
+                var attached = processors.Select(core => core.TimeHandle.Enabled).ToArray();
+                var core = processors[number];
+                var target = architectureSelector != null ? (BaseCPU)architectureSelector.GetResetTarget(core) : core;
+                var halted = core.IsHalted || target.IsHalted;
+                var resume = !core.IsHalted && !(core is CortexM arm && arm.CpuWaitSignal.IsSet) && !core.HaltedByDebugger
+                    && (!core.IsPaused || machine.IsPaused);
+                using(machine.ObtainPausedState(true))
+                {
+                    architectureSelector?.HoldInReset(new[] {(ICPU)core});
+                    if(architectureSelector != null) architectureSelector.ResetProcessor(number);
+                    else
+                    {
+                        nvics[number].Reset();
+                        cores[number].Reset();
+                    }
+                    if(halted) target.IsHalted = true;
+                    if(resume || target.HasAnyHaltingCondition) target.Resume();
+                }
+                for(var physical = 0; physical < processors.Length; physical++)
+                {
+                    if(!paused[physical]) continue;
+                    var pausedTarget = physical == number ? target : processors[physical];
+                    pausedTarget.Pause();
+                    pausedTarget.TimeHandle.Enabled = attached[physical];
+                    pausedTarget.TimeHandle.DeferredEnabled = attached[physical];
+                }
+                architectureSelector?.ReleaseReset();
                 WarmReset?.Invoke(number);
             });
         }
+
+        private BaseCPU GetProcessor(int core) => architectureSelector?.ActiveProcessor(core) ?? cores[core];
 
         public event Action<int> WarmReset;
         public uint WatchdogSelection => watchdogSelect;
@@ -196,42 +226,36 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
         }
 
+        private void ApplyRescueHold()
+        {
+            debugPort.ApplyRescueHold();
+        }
+
         private void OnRescueReset(bool asserted)
         {
-            rescueHeld = asserted;
             if(!asserted)
             {
                 var generation = Volatile.Read(ref resetGeneration);
                 machine.LocalTimeSource.ExecuteInNearestSyncedState(_ =>
                 {
-                    if(generation != Volatile.Read(ref resetGeneration) || rescueHeld) return;
-                    foreach(var core in cores)
-                    {
-                        // A protocol/MMIO callback can own the machine clock.
-                        // Apply lifecycle changes only after that transaction
-                        // and preserve independent PSM/RUN/debug hold sources.
-                        core.CpuWaitSignal.Unset();
-                        core.IsHalted = false;
-                        core.Resume();
-                    }
+                    if(generation == Volatile.Read(ref resetGeneration)) ApplyRescueHold();
                 });
                 return;
             }
-            // A rescue request resets POWMAN and the switched domain but retains
-            // the always-on DP/RP-AP and the externally powered serial flash.
-            var retainedScratch = (uint[])scratch.Clone();
-            var retainedDoubleTap = chipReset & 1;
-            Reset();
-            Array.Copy(retainedScratch, scratch, scratch.Length);
-            rescueHeld = true;
-            chipReset = (1u << 21) | 0x10 | retainedDoubleTap;
+            // RP-AP rescue resets POWMAN and the switched domain. It retains
+            // the always-on DP/RP-AP and externally powered serial flash.
             var retained = new List<IPeripheral> { this, debugPort };
             retained.AddRange(machine.GetRegisteredPeripherals().Select(entry => entry.Peripheral).OfType<WinbondW25QFlash>());
-            foreach(var core in cores) core.CpuWaitSignal.Set();
-            machine.RequestResetInSafeState(() =>
+            machine.RequestResetInSafeState(postReset: ApplyRescueHold, unresetable: retained, runRegisteredResetEvents: false, preReset: () =>
             {
-                foreach(var core in cores) core.CpuWaitSignal.Set(rescueHeld);
-            }, retained);
+                ApplyRescueHold();
+                var retainedScratch = (uint[])scratch.Clone();
+                var retainedDoubleTap = chipReset & 1;
+                Reset();
+                Array.Copy(retainedScratch, scratch, scratch.Length);
+                chipReset = (1u << 21) | 0x10 | retainedDoubleTap;
+                ApplyRescueHold();
+            });
         }
 
         private void OnRunReset()
@@ -245,9 +269,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             machine.RequestResetInSafeState(postReset: () =>
             {
                 debugPort.ApplyRunHold();
+                ApplyRescueHold();
             }, unresetable: retained, runRegisteredResetEvents: true, preReset: () =>
             {
                 debugPort.ApplyRunHold();
+                ApplyRescueHold();
                 var doubleTap = chipReset & 1;
                 Reset();
                 chipReset = (1u << 18) | doubleTap;
@@ -264,6 +290,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private readonly CortexM[] cores;
         private readonly NVIC[] nvics;
         private readonly RP2350_DebugPort debugPort;
+        private readonly RP2350_ArchitectureSelector architectureSelector;
         private readonly uint[] scratch = new uint[12];
         private readonly uint[] powerUp = new uint[4];
         private uint powerState;
@@ -274,6 +301,5 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private uint debugPowerConfiguration;
         private uint debugConfiguration;
         private bool badPassword;
-        private bool rescueHeld;
     }
 }
