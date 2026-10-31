@@ -314,8 +314,9 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.AreEqual(0u, arms[1].ExecutedInstructions);
         }
 
-        [Test]
-        public void ShouldKeepAnExcludedPhysicalProcessorAndItsAlternativeEngineUnchanged()
+        [TestCase(false)]
+        [TestCase(true)]
+        public void ShouldKeepAnExcludedPhysicalProcessorAndItsAlternativeEngineUnchanged(bool retainSelector)
         {
             BuildEngines();
             Advance();
@@ -334,7 +335,7 @@ namespace Antmicro.Renode.PeripheralsTests
                     var instructions = riscv[1].ExecutedInstructions;
                     otp.WriteDoubleWord(0x158, 0); // Requests an architecture different from retained PE1.
                     machine.RequestResetInSafeState(postReset: () => completed.Set(),
-                        unresetable: new IPeripheral[] {riscv[1], selector});
+                        unresetable: retainSelector ? new IPeripheral[] {riscv[1], selector} : new IPeripheral[] {riscv[1]});
                     Assert.IsTrue(completed.Wait(TimeSpan.FromSeconds(5)));
                     Assert.AreSame(riscv[1], selector.ActiveProcessor(1));
                     Assert.AreEqual(2u, otp.ReadDoubleWord(0x15c));
