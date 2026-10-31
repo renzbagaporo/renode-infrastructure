@@ -32,6 +32,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             this.sramLow = sramLow;
             this.sramHigh = sramHigh;
             debugPort.RescueResetChanged += OnRescueReset;
+            debugPort.RunResetRequested += OnRunReset;
             Reset();
         }
 
@@ -231,6 +232,28 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
                 foreach(var core in cores) core.CpuWaitSignal.Set(rescueHeld);
             }, retained);
+        }
+
+        private void OnRunReset()
+        {
+            var retained = machine.GetRegisteredPeripherals().Select(entry => entry.Peripheral)
+                .Where(peripheral => peripheral is WinbondW25QFlash).ToList();
+            retained.Add(this);
+            // RP2350 datasheet table 560: RUN hard-resets POWMAN and the debug
+            // port, but preserves DOUBLE_TAP. Ordinary SRAM loses power. Zero
+            // is the model's deterministic policy for undefined power-up data.
+            machine.RequestResetInSafeState(postReset: () =>
+            {
+                debugPort.ApplyRunHold();
+            }, unresetable: retained, runRegisteredResetEvents: true, preReset: () =>
+            {
+                debugPort.ApplyRunHold();
+                var doubleTap = chipReset & 1;
+                Reset();
+                chipReset = (1u << 18) | doubleTap;
+                sramLow?.ZeroAll();
+                sramHigh?.ZeroAll();
+            });
         }
 
         private readonly RP2350_BootRAM bootRAM;

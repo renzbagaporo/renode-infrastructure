@@ -98,6 +98,8 @@ namespace Antmicro.Renode.Core
 
         void RequestResetInSafeState(Action postReset = null, ICollection<IPeripheral> unresetable = null, bool runRegisteredResetEvents = false);
 
+        void RequestResetInSafeState(Action postReset, ICollection<IPeripheral> unresetable, bool runRegisteredResetEvents, Action preReset);
+
         void Reset();
 
         void ScheduleAction(TimeInterval delay, Action<TimeInterval> action, string name = null);

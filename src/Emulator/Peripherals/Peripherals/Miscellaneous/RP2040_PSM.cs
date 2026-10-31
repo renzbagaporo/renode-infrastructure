@@ -14,14 +14,42 @@ using Antmicro.Renode.Core.Structure;
 using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Peripherals.CPU;
 using Antmicro.Renode.Peripherals.IRQControllers;
+using Antmicro.Renode.Peripherals.SPI;
 
 namespace Antmicro.Renode.Peripherals.Miscellaneous
 {
-    public class RP2040_PSM : RP2_PSM, IPeripheralContainer<IPeripheral, NumberRegistrationPoint<int>>
+    public class RP2040_PSM : RP2_PSM, IPeripheralContainer<IPeripheral, NumberRegistrationPoint<int>>, IGPIOReceiver
     {
         public RP2040_PSM(IMachine machine, CortexM core0, CortexM core1, NVIC nvic0, NVIC nvic1)
             : base(machine, core0, core1, nvic0, nvic1, processor0Bit: 15, domainMask: 0x1ffff)
         {
+            machine.MachineReset += _ => ApplyRunHold();
+        }
+
+        // Input 0 is the physical active-low RUN pin. SRAM retains its contents
+        // across RUN on RP2040; externally powered NOR retains its own state.
+        public void OnGPIO(int number, bool value)
+        {
+            if(number != 0 || runHeld == !value) return;
+            runHeld = !value;
+            if(value)
+            {
+                machine.LocalTimeSource.ExecuteInNearestSyncedState(_ => ApplyRunHold());
+                return;
+            }
+            var retained = machine.GetRegisteredPeripherals().Select(entry => entry.Peripheral)
+                .Where(peripheral => peripheral is WinbondW25QFlash).ToList();
+            // Every falling edge queues a reset, even if release arrives before
+            // the synchronized callback. Release reconciles the current level.
+            machine.RequestResetInSafeState(postReset: () =>
+            {
+                ApplyRunHold();
+            }, unresetable: retained, runRegisteredResetEvents: true, preReset: ApplyRunHold);
+        }
+
+        private void ApplyRunHold()
+        {
+            foreach(var core in cores) core.SetExternalResetHold(runHeld);
         }
 
         public void Register(IPeripheral peripheral, NumberRegistrationPoint<int> registrationPoint)
@@ -114,6 +142,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         }
 
         private readonly Dictionary<IPeripheral, int> domains = new Dictionary<IPeripheral, int>();
+        private volatile bool runHeld;
 
         // RP2040 datasheet 2.13.2/2.13.4: sequence dependencies are not register
         // bit order. Figure 27 groups ROM/SRAM and the processor complex;

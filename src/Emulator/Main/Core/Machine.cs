@@ -343,12 +343,22 @@ namespace Antmicro.Renode.Core
 
         public void RequestResetInSafeState(Action postReset = null, ICollection<IPeripheral> unresetable = null, bool runRegisteredResetEvents = false)
         {
+            RequestResetInSafeState(postReset, unresetable, runRegisteredResetEvents, null);
+        }
+
+        public void RequestResetInSafeState(Action postReset, ICollection<IPeripheral> unresetable, bool runRegisteredResetEvents, Action preReset)
+        {
             Action softwareRequestedReset = null;
             softwareRequestedReset = () =>
             {
                 LocalTimeSource.SinksReportedHook -= softwareRequestedReset;
+                var pausedCPUs = registeredPeripherals.OfType<ICPU>()
+                    .Where(cpu => cpu.IsPaused && !IsPaused).ToArray();
                 using(ObtainPausedState(true))
                 {
+                    // Power/reset controllers can prepare retained state and
+                    // powered-down memory only once every PE has stopped.
+                    preReset?.Invoke();
                     foreach(var peripheral in registeredPeripherals.Distinct().Where(p => p != this && !(unresetable?.Contains(p) ?? false)))
                     {
                         peripheral.Reset();
@@ -360,6 +370,9 @@ namespace Antmicro.Renode.Core
                         MachineReset?.Invoke(this);
                     }
                 }
+                // A reset must preserve an explicit processor pause requested
+                // before this boundary, including one after the reset edge.
+                foreach(var cpu in pausedCPUs) cpu.Pause();
                 postReset?.Invoke();
             };
             LocalTimeSource.SinksReportedHook += softwareRequestedReset;

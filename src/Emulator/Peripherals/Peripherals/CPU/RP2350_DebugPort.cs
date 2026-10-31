@@ -39,7 +39,8 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         protected override void ResetTarget()
         {
-            machine.RequestReset();
+            if(RunResetRequested != null) RunResetRequested();
+            else machine.RequestReset();
         }
 
         protected override void ReleaseTarget()
@@ -49,7 +50,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             machine.LocalTimeSource.ExecuteInNearestSyncedState(_ => ApplyRunHold());
         }
 
-        private void ApplyRunHold()
+        internal void ApplyRunHold()
         {
             var asserted = ResetPinAsserted;
             foreach(var core in cores) core?.SetExternalResetHold(asserted);
@@ -188,6 +189,10 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         // This reports physical reset assertion/release to the SoC power/reset model.
         public event Action<bool> RescueResetChanged;
+
+        // A falling physical RUN edge requests a chip reset. Protocol resets
+        // alone never raise this event, including while RUN remains asserted.
+        public event Action RunResetRequested;
 
         private static uint ComponentRegister(uint offset, uint peripheralId, uint componentClass, uint architecture)
         {
