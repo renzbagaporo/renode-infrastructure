@@ -279,18 +279,27 @@ namespace Antmicro.Renode.PeripheralsTests
                 {
                     Assert.IsTrue(trigger.InputReturned);
                     Assert.IsFalse(Monitor.IsEntered(trigger));
+                    // The safe reset boundary has paused both native callbacks.
+                    core0.SetHookAtBlockBegin(null);
+                    core1.SetHookAtBlockBegin(null);
                     Assert.IsTrue(Task.Run(() => machine.ClockSource.ExecuteInLock(() => { }))
                         .Wait(TimeSpan.FromSeconds(5)), "Reset preparation still owns the originating clock lock");
                 };
                 probe.AfterReset = () => resetCompleted.Set();
                 var before = probe.Count;
+                trigger.PrepareNativeEntries(core0, core1);
                 var emulation = EmulationManager.Instance.CurrentEmulation;
-                emulation.StartAll();
                 try
                 {
+                    emulation.StartAll();
                     Assert.IsTrue(resetCompleted.Wait(TimeSpan.FromSeconds(10)), trigger.Failure ?? "Native reset did not complete");
                 }
-                finally { emulation.PauseAll(); }
+                finally
+                {
+                    emulation.PauseAll();
+                    core0.SetHookAtBlockBegin(null);
+                    core1.SetHookAtBlockBegin(null);
+                }
                 Assert.IsTrue(trigger.InputReturned, "The native MMIO reset input must return without joining the clock-blocked peer");
                 Assert.IsTrue(trigger.PeerEntered);
                 Assert.IsNull(trigger.Failure);
@@ -341,6 +350,28 @@ namespace Antmicro.Renode.PeripheralsTests
                 Reader = new PeerReader(this);
             }
 
+            public void PrepareNativeEntries(CortexM publisher, CortexM peer)
+            {
+                // Both PEs must pass their clock-budget read before the publisher
+                // owns the clock. The peer then attempts its native LDR within
+                // that admitted grant while the publisher holds the clock lock.
+                var publisherGateUsed = 0;
+                var peerGateUsed = 0;
+                publisher.SetHookAtBlockBegin((_, __) =>
+                {
+                    if(Interlocked.Exchange(ref publisherGateUsed, 1) != 0) return;
+                    if(!peerNativeReady.Wait(TimeSpan.FromSeconds(5)))
+                        Failure = "Peer did not reach its native entry gate";
+                });
+                peer.SetHookAtBlockBegin((_, __) =>
+                {
+                    if(Interlocked.Exchange(ref peerGateUsed, 1) != 0) return;
+                    peerNativeReady.Set();
+                    if(!clockOwned.Wait(TimeSpan.FromSeconds(5)))
+                        Failure = "Publisher did not acquire the clock before peer entry";
+                });
+            }
+
             public uint ReadDoubleWord(long offset) => 0;
 
             private uint ReadPeer()
@@ -385,11 +416,12 @@ namespace Antmicro.Renode.PeripheralsTests
             public bool PeerEntered => peerEntered.IsSet;
             public string Failure { get; private set; }
             public PeerReader Reader { get; }
-            public void Dispose() { clockOwned.Dispose(); peerEntered.Dispose(); }
+            public void Dispose() { clockOwned.Dispose(); peerEntered.Dispose(); peerNativeReady.Dispose(); }
             private readonly Machine machine;
             private readonly Action<bool> setRun;
             private readonly ManualResetEventSlim clockOwned = new ManualResetEventSlim();
             private readonly ManualResetEventSlim peerEntered = new ManualResetEventSlim();
+            private readonly ManualResetEventSlim peerNativeReady = new ManualResetEventSlim();
             private int armed = 1;
 
             // Separate bus peripherals allow simultaneous native transactions;
