@@ -4,6 +4,7 @@
 //
 
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -16,9 +17,11 @@ using Antmicro.Renode.Peripherals.SPI;
 
 namespace Antmicro.Renode.Peripherals.Memory
 {
-    // Reads and instruction fetches use the bus so SSI/NOR availability is
-    // observed without changing mapped memory while a clock callback runs.
-    // Programming remains available only through the flash serial interface.
+    // While the SSI and NOR accept XIP reads, CPUs read and fetch directly
+    // from the NOR contents, mapped read-only; writes reach this peripheral and
+    // are ignored. Otherwise every CPU access goes through the bus and observes
+    // SSI/NOR availability. Other bus masters always use the bus. Programming
+    // remains available only through the flash serial interface.
     public sealed class RP2040_XIPMemory : IBytePeripheral, IWordPeripheral, IDoubleWordPeripheral,
         IQuadWordPeripheral, IMultibyteWritePeripheral, IExecutableIO, IKnownSize, IDisposable
     {
@@ -29,6 +32,7 @@ namespace Antmicro.Renode.Peripherals.Memory
             this.xip = xip;
             flash.StateChanged += InvalidateInstructions;
             xip.AvailabilityChanged += InvalidateInstructions;
+            xip.AvailabilityChanged += UpdateDirectAccess;
             machine.PeripheralsChanged += OnPeripheralsChanged;
         }
 
@@ -120,21 +124,72 @@ namespace Antmicro.Renode.Peripherals.Memory
             machine.PeripheralsChanged -= OnPeripheralsChanged;
             flash.StateChanged -= InvalidateInstructions;
             xip.AvailabilityChanged -= InvalidateInstructions;
+            xip.AvailabilityChanged -= UpdateDirectAccess;
             flash.UnderlyingMemory.Dispose();
         }
 
         public void Reset()
         {
             RouteDataAccessesThroughBus();
+            UpdateDirectAccess(force: true);
         }
 
         public long Size => flash.UnderlyingMemory.Size;
 
         private void OnPeripheralsChanged(IMachine _, PeripheralsChangedEventArgs change)
         {
+            if(change.Peripheral == this && change.Operation == PeripheralsChangedEventArgs.PeripheralChangeType.Addition)
+            {
+                MapFlashContents();
+            }
             if(change.Peripheral == this || change.Peripheral is ICPUWithMappedMemory)
             {
                 RouteDataAccessesThroughBus();
+                UpdateDirectAccess(force: true);
+            }
+        }
+
+        // Each alias is registered separately, so map every registration
+        // point when it appears.
+        private void MapFlashContents()
+        {
+            var bus = machine.GetSystemBus(this);
+            foreach(var registration in bus.GetRegistrationPoints(this))
+            {
+                if(!mappedAliases.Add(registration.Range.StartAddress)) continue;
+                var start = registration.Range.StartAddress - registration.Offset;
+                foreach(var segment in flash.UnderlyingMemory.MappedSegments)
+                {
+                    if(segment.StartingOffset >= registration.Range.Size + registration.Offset) continue;
+                    var size = Math.Min(segment.Size, registration.Range.Size + registration.Offset - segment.StartingOffset);
+                    bus.MapMemory(new SystemBus.MappedSegmentWrapper(segment, start, size, null), this, relative: false);
+                }
+            }
+        }
+
+        private void UpdateDirectAccess() => UpdateDirectAccess(force: false);
+
+        private void UpdateDirectAccess(bool force)
+        {
+            if(mappedAliases.Count == 0) return;
+            var available = xip.Available;
+            lock(directAccessLock)
+            {
+                if(!force && available == directAccess) return;
+                directAccess = available;
+                if(available)
+                {
+                    // Translations may now come from the mapping without a bus fetch.
+                    Volatile.Write(ref hasFetchedInstructions, 1);
+                }
+                var bus = machine.GetSystemBus(this);
+                foreach(var registration in bus.GetRegistrationPoints(this))
+                {
+                    foreach(var cpu in bus.GetCPUs().OfType<TranslationCPU>())
+                    {
+                        cpu.RequestReadOnlyMemoryAccess(registration.Range, available);
+                    }
+                }
             }
         }
 
@@ -162,6 +217,9 @@ namespace Antmicro.Renode.Peripherals.Memory
         }
 
         private int hasFetchedInstructions;
+        private readonly HashSet<ulong> mappedAliases = new HashSet<ulong>();
+        private bool directAccess;
+        private readonly object directAccessLock = new object();
         private readonly IMachine machine;
         private readonly WinbondW25QFlash flash;
         private readonly RP2040_XIP xip;

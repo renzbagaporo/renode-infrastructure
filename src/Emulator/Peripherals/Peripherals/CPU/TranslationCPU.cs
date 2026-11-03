@@ -113,6 +113,18 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
         }
 
+        /// <summary>
+        /// Selects how this CPU reaches a range it maps with <see cref="MapMemory"/>: reads and
+        /// instruction fetches directly from host memory with writes passed to the bus
+        /// (<paramref name="direct"/> true), or every access through the bus (false). The change
+        /// is applied on the CPU thread before the CPU executes another instruction.
+        /// </summary>
+        public void RequestReadOnlyMemoryAccess(Range range, bool direct)
+        {
+            InvokeInCpuThreadSafely(() => ApplyReadOnlyMemoryAccess(range, direct));
+            RequestReturn();
+        }
+
         public void UnmapMemory(Range range)
         {
             using(machine?.ObtainPausedState(true))
@@ -2081,22 +2093,62 @@ namespace Antmicro.Renode.Peripherals.CPU
         {
             using(machine?.ObtainPausedState(true))
             {
-                ValidateMemoryRangeAndThrow(range);
-                if(!mappedMemory.ContainsWholeRange(range))
+                SetAccessMethodOnStoppedCpu(range, asMemory);
+            }
+        }
+
+        private void SetAccessMethodOnStoppedCpu(Range range, bool asMemory)
+        {
+            ValidateMemoryRangeAndThrow(range);
+            if(!mappedMemory.ContainsWholeRange(range))
+            {
+                throw new RecoverableException(
+                    $"Tried to set mapped memory access method at {range} which isn't mapped memory in CPU: {this.GetName()}"
+                );
+            }
+
+            if(!asMemory)
+            {
+                TlibUnmapRange(range.StartAddress, range.EndAddress);
+            }
+            else if(readOnlyMemory.ContainsWholeRange(range))
+            {
+                TlibMapRangeReadOnly(range.StartAddress, range.Size);
+            }
+            else
+            {
+                if(readOnlyMemory.ContainsOverlappingRange(range))
                 {
                     throw new RecoverableException(
-                        $"Tried to set mapped memory access method at {range} which isn't mapped memory in CPU: {this.GetName()}"
+                        $"Tried to map {range}, which is only partly read-only memory, in CPU: {this.GetName()}"
                     );
                 }
+                TlibMapRange(range.StartAddress, range.Size);
+            }
+        }
 
-                if(asMemory)
-                {
-                    TlibMapRange(range.StartAddress, range.Size);
-                }
-                else
-                {
-                    TlibUnmapRange(range.StartAddress, range.EndAddress);
-                }
+        // Runs on the CPU thread between translation library executions, so the
+        // CPU's own memory map can change without pausing the machine.
+        private void ApplyReadOnlyMemoryAccess(Range range, bool direct)
+        {
+            if(!mappedMemory.ContainsWholeRange(range))
+            {
+                // An exception here would end the CPU thread.
+                this.Log(LogLevel.Error, "Tried to set read-only access at {0}, which isn't mapped memory", range);
+                return;
+            }
+            readOnlyMemory.Add(range);
+            // Unmapping first restores page flags registered before the mapping,
+            // such as executable I/O, so the mapping below replaces them cleanly.
+            SetAccessMethodOnStoppedCpu(range, asMemory: false);
+            if(direct)
+            {
+                disabledMemory.Remove(range);
+                SetAccessMethodOnStoppedCpu(range, asMemory: true);
+            }
+            else
+            {
+                disabledMemory.Add(range);
             }
         }
 
@@ -2335,6 +2387,9 @@ namespace Antmicro.Renode.Peripherals.CPU
         private readonly Action<ulong, ulong> TlibMapRange;
 
         [Import]
+        private readonly Action<ulong, ulong> TlibMapRangeReadOnly;
+
+        [Import]
         private readonly Action<int> TlibSetOnBlockTranslationEnabled;
 
         [Import]
@@ -2418,6 +2473,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         private readonly CpuThreadPauseGuard pauseGuard;
 
         private readonly MinimalRangesCollection disabledMemory = new MinimalRangesCollection();
+        private readonly MinimalRangesCollection readOnlyMemory = new MinimalRangesCollection();
         private const int DefaultMaximumTranslationCacheSize = 512 * 1024 * 1024; // 512 MiB
         private const int DefaultMinimumTranslationCacheSize = 32 * 1024 * 1024; // 32 MiB
 
