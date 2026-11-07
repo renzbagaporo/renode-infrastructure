@@ -171,6 +171,31 @@ namespace Antmicro.Renode.Time
             blockingEvent.Set();
         }
 
+        /// <summary>
+        /// Runs <paramref name="action"/> holding the virtual time synchronization lock, unless another thread holds it.
+        /// </summary>
+        /// <remarks>
+        /// A thread that synchronizes virtual time runs clock callbacks, which may access the bus. A CPU synchronizing
+        /// its time from inside a peripheral access holds that peripheral's locks, so it must not wait for this one.
+        /// </remarks>
+        /// <returns>False if another thread holds the lock and <paramref name="action"/> did not run.</returns>
+        public bool TryExecuteHoldingTimeProgressLock(Action action)
+        {
+            if(!Monitor.TryEnter(virtualTimeSyncLock))
+            {
+                return false;
+            }
+            try
+            {
+                action();
+            }
+            finally
+            {
+                Monitor.Exit(virtualTimeSyncLock);
+            }
+            return true;
+        }
+
         /// <see cref="ITimeSource.ReportTimeProgress">
         public void ReportTimeProgress(ulong previousElapsedTicks = 0)
         {

@@ -596,6 +596,8 @@ namespace Antmicro.Renode.UnitTests
             Assert.IsFalse(writtenDuringRead);
             Assert.IsTrue(write.Wait(TimeSpan.FromSeconds(5)));
             Assert.IsTrue(read.Wait(TimeSpan.FromSeconds(5)));
+            Assert.IsTrue(peripheral.ReadUnderAccessLock);
+            Assert.IsFalse(PeripheralAccessMethods.AccessLock.HeldByCurrentThread);
         }
 
         [Test]
@@ -611,6 +613,7 @@ namespace Antmicro.Renode.UnitTests
             Assert.IsTrue(writtenDuringRead);
             Assert.IsTrue(peripheral.Written);
             Assert.IsTrue(read.Wait(TimeSpan.FromSeconds(5)));
+            Assert.IsFalse(peripheral.ReadUnderAccessLock);
         }
 
         private IBusController sysbus;
@@ -622,6 +625,7 @@ namespace Antmicro.Renode.UnitTests
         {
             public uint ReadDoubleWord(long _)
             {
+                ReadUnderAccessLock = PeripheralAccessMethods.AccessLock.HeldByCurrentThread;
                 ReadEntered.Set();
                 ReleaseRead.Wait();
                 return 0;
@@ -641,6 +645,8 @@ namespace Antmicro.Renode.UnitTests
             public ManualResetEventSlim ReleaseRead { get; } = new ManualResetEventSlim();
 
             public bool Written { get; private set; }
+
+            public bool ReadUnderAccessLock { get; private set; }
         }
 
         private class SelfSynchronizedBlockingReadPeripheral : BlockingReadPeripheral, ISelfSynchronizedBusPeripheral

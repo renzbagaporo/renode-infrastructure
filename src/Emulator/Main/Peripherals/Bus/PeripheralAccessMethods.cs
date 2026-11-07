@@ -214,6 +214,7 @@ namespace Antmicro.Renode.Peripherals.Bus
                 if(lockObject != null)
                 {
                     Monitor.Enter(lockObject);
+                    heldByCurrentThread++;
                 }
             }
 
@@ -221,11 +222,18 @@ namespace Antmicro.Renode.Peripherals.Bus
             {
                 if(lockObject != null)
                 {
+                    heldByCurrentThread--;
                     Monitor.Exit(lockObject);
                 }
             }
 
+            // True while the current thread is inside a locked peripheral access.
+            public static bool HeldByCurrentThread => heldByCurrentThread > 0;
+
             private readonly object lockObject;
+
+            [ThreadStatic]
+            private static int heldByCurrentThread;
         }
 
         private static void SetReadOrWriteMethod<TR, TW>(MethodInfo i, object obj, BusAccess.Operation operation, ref TR readMethod, ref TW writeMethod)

@@ -745,6 +745,20 @@ namespace Antmicro.Renode.Peripherals.CPU
                 return;
             }
 
+            // A peripheral holding its bus lock must not wait for another CPU that
+            // advances virtual time, as that CPU's clock callbacks may access the
+            // same peripheral; leave these instructions to the next report.
+            if(PeripheralAccessMethods.AccessLock.HeldByCurrentThread
+                && TimeHandle.TimeSource is Antmicro.Renode.Time.TimeSourceBase timeSource)
+            {
+                timeSource.TryExecuteHoldingTimeProgressLock(ReportExecutedInstructions);
+                return;
+            }
+            ReportExecutedInstructions();
+        }
+
+        private void ReportExecutedInstructions()
+        {
             var numberOfExecutedInstructions = TlibGetExecutedInstructions();
             this.Trace($"CPU executed {numberOfExecutedInstructions} instructions and time synced");
             ReportProgress(numberOfExecutedInstructions);

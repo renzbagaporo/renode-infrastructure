@@ -27,6 +27,30 @@ namespace UnitTests
     public class TimeSourceTests
     {
         [Test]
+        public void ShouldNotRunTimeProgressActionsWhileAnotherThreadSynchronizes()
+        {
+            using(var timeSource = new MasterTimeSource())
+            {
+                var held = new ManualResetEventSlim();
+                var release = new ManualResetEventSlim();
+                var holder = Task.Run(() => timeSource.TryExecuteHoldingTimeProgressLock(() =>
+                {
+                    held.Set();
+                    release.Wait();
+                }));
+                Assert.IsTrue(held.Wait(TimeSpan.FromSeconds(5)));
+                var ran = false;
+                Assert.IsFalse(timeSource.TryExecuteHoldingTimeProgressLock(() => ran = true));
+                Assert.IsFalse(ran);
+                release.Set();
+                Assert.IsTrue(holder.Wait(TimeSpan.FromSeconds(5)));
+                Assert.IsTrue(holder.Result);
+                Assert.IsTrue(timeSource.TryExecuteHoldingTimeProgressLock(() => ran = true));
+                Assert.IsTrue(ran);
+            }
+        }
+
+        [Test]
         public void ShouldHandleMultipleSinks()
         {
             const int slavesCount = 5;
