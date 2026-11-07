@@ -9,6 +9,7 @@
 using System;
 using System.Collections.Generic;
 using System.Reflection;
+using System.Threading;
 
 using Antmicro.Renode.Core.Extensions;
 using Antmicro.Renode.Debugging;
@@ -203,6 +204,29 @@ namespace Antmicro.Renode.Peripherals.Bus
         public IBusPeripheral Peripheral;
         public string Tag;
         public object Lock;
+
+        // Holds Lock for one access. Self-synchronized peripherals have no Lock.
+        public readonly struct AccessLock : IDisposable
+        {
+            public AccessLock(object lockObject)
+            {
+                this.lockObject = lockObject;
+                if(lockObject != null)
+                {
+                    Monitor.Enter(lockObject);
+                }
+            }
+
+            public void Dispose()
+            {
+                if(lockObject != null)
+                {
+                    Monitor.Exit(lockObject);
+                }
+            }
+
+            private readonly object lockObject;
+        }
 
         private static void SetReadOrWriteMethod<TR, TW>(MethodInfo i, object obj, BusAccess.Operation operation, ref TR readMethod, ref TW writeMethod)
         {

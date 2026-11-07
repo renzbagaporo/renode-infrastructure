@@ -1283,6 +1283,10 @@ namespace Antmicro.Renode.Peripherals.Bus
                 lockObject = new object();
                 peripheralAccessLocks.Add(peripheral.GetHashCode(), lockObject);
             }
+            if(peripheral is ISelfSynchronizedBusPeripheral)
+            {
+                lockObject = null;
+            }
             var methods = PeripheralAccessMethods.CreateWithLock(lockObject);
             if(registrationPoint is BusParametrizedRegistration parametrizedRegistrationPoint)
             {

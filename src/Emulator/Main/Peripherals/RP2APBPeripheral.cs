@@ -11,7 +11,10 @@ namespace Antmicro.Renode.Peripherals
 {
     // RP-series APB bridges replicate narrow writes across the data bus. The
     // upper address bits select an atomic operation on the destination register.
-    public abstract class RP2APBPeripheral : IDoubleWordPeripheral, IWordPeripheral, IBytePeripheral, IKnownSize, IRP2ResettablePeripheral
+    // Accesses serialize on SyncRoot, after the access clock's lock, so the
+    // system bus holds no lock of its own around them.
+    public abstract class RP2APBPeripheral : IDoubleWordPeripheral, IWordPeripheral, IBytePeripheral, IKnownSize, IRP2ResettablePeripheral,
+        ISelfSynchronizedBusPeripheral
     {
         public uint ReadDoubleWord(long offset)
         {

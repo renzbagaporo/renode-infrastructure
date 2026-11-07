@@ -62,7 +62,7 @@ namespace Antmicro.Renode.Peripherals.Bus
                     this.Log(LogLevel.Warning, "Tried to read a locked peripheral: {0}. Address 0x{1:X}.", accessMethods.Peripheral.GetName(), address);
                     return 0;
                 }
-                lock(accessMethods.Lock)
+                using(new PeripheralAccessMethods.AccessLock(accessMethods.Lock))
                 {
                     if(accessMethods.SetAbsoluteAddress != null)
                     {
@@ -128,7 +128,7 @@ namespace Antmicro.Renode.Peripherals.Bus
                     return;
                 }
 
-                lock(accessMethods.Lock)
+                using(new PeripheralAccessMethods.AccessLock(accessMethods.Lock))
                 {
                     if(accessMethods.SetAbsoluteAddress != null)
                     {
@@ -196,7 +196,7 @@ namespace Antmicro.Renode.Peripherals.Bus
                     this.Log(LogLevel.Warning, "Tried to read a locked peripheral: {0}. Address 0x{1:X}.", accessMethods.Peripheral.GetName(), address);
                     return 0;
                 }
-                lock(accessMethods.Lock)
+                using(new PeripheralAccessMethods.AccessLock(accessMethods.Lock))
                 {
                     if(accessMethods.SetAbsoluteAddress != null)
                     {
@@ -262,7 +262,7 @@ namespace Antmicro.Renode.Peripherals.Bus
                     return;
                 }
 
-                lock(accessMethods.Lock)
+                using(new PeripheralAccessMethods.AccessLock(accessMethods.Lock))
                 {
                     if(accessMethods.SetAbsoluteAddress != null)
                     {
@@ -330,7 +330,7 @@ namespace Antmicro.Renode.Peripherals.Bus
                     this.Log(LogLevel.Warning, "Tried to read a locked peripheral: {0}. Address 0x{1:X}.", accessMethods.Peripheral.GetName(), address);
                     return 0;
                 }
-                lock(accessMethods.Lock)
+                using(new PeripheralAccessMethods.AccessLock(accessMethods.Lock))
                 {
                     if(accessMethods.SetAbsoluteAddress != null)
                     {
@@ -396,7 +396,7 @@ namespace Antmicro.Renode.Peripherals.Bus
                     return;
                 }
 
-                lock(accessMethods.Lock)
+                using(new PeripheralAccessMethods.AccessLock(accessMethods.Lock))
                 {
                     if(accessMethods.SetAbsoluteAddress != null)
                     {
@@ -464,7 +464,7 @@ namespace Antmicro.Renode.Peripherals.Bus
                     this.Log(LogLevel.Warning, "Tried to read a locked peripheral: {0}. Address 0x{1:X}.", accessMethods.Peripheral.GetName(), address);
                     return 0;
                 }
-                lock(accessMethods.Lock)
+                using(new PeripheralAccessMethods.AccessLock(accessMethods.Lock))
                 {
                     if(accessMethods.SetAbsoluteAddress != null)
                     {
@@ -530,7 +530,7 @@ namespace Antmicro.Renode.Peripherals.Bus
                     return;
                 }
 
-                lock(accessMethods.Lock)
+                using(new PeripheralAccessMethods.AccessLock(accessMethods.Lock))
                 {
                     if(accessMethods.SetAbsoluteAddress != null)
                     {

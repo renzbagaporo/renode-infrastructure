@@ -9,6 +9,8 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
 
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Exceptions;
@@ -581,9 +583,69 @@ namespace Antmicro.Renode.UnitTests
             }
         }
 
+        [Test]
+        public void ShouldSerializeAccessesToAPeripheral()
+        {
+            var peripheral = new BlockingReadPeripheral();
+            sysbus.Register(peripheral, 0x1000.By(0x100));
+            var read = Task.Run(() => sysbus.ReadDoubleWord(0x1000));
+            Assert.IsTrue(peripheral.ReadEntered.Wait(TimeSpan.FromSeconds(5)));
+            var write = Task.Run(() => sysbus.WriteDoubleWord(0x1004, 1));
+            var writtenDuringRead = write.Wait(TimeSpan.FromMilliseconds(300));
+            peripheral.ReleaseRead.Set();
+            Assert.IsFalse(writtenDuringRead);
+            Assert.IsTrue(write.Wait(TimeSpan.FromSeconds(5)));
+            Assert.IsTrue(read.Wait(TimeSpan.FromSeconds(5)));
+        }
+
+        [Test]
+        public void ShouldNotSerializeAccessesToASelfSynchronizedPeripheral()
+        {
+            var peripheral = new SelfSynchronizedBlockingReadPeripheral();
+            sysbus.Register(peripheral, 0x1000.By(0x100));
+            var read = Task.Run(() => sysbus.ReadDoubleWord(0x1000));
+            Assert.IsTrue(peripheral.ReadEntered.Wait(TimeSpan.FromSeconds(5)));
+            var write = Task.Run(() => sysbus.WriteDoubleWord(0x1004, 1));
+            var writtenDuringRead = write.Wait(TimeSpan.FromSeconds(5));
+            peripheral.ReleaseRead.Set();
+            Assert.IsTrue(writtenDuringRead);
+            Assert.IsTrue(peripheral.Written);
+            Assert.IsTrue(read.Wait(TimeSpan.FromSeconds(5)));
+        }
+
         private IBusController sysbus;
         private byte[] bytes;
         private const int PauseResumeRetries = 5;
+
+        // A read waits until the test releases it; a write completes at once.
+        private class BlockingReadPeripheral : IDoubleWordPeripheral
+        {
+            public uint ReadDoubleWord(long _)
+            {
+                ReadEntered.Set();
+                ReleaseRead.Wait();
+                return 0;
+            }
+
+            public void WriteDoubleWord(long _, uint __)
+            {
+                Written = true;
+            }
+
+            public void Reset()
+            {
+            }
+
+            public ManualResetEventSlim ReadEntered { get; } = new ManualResetEventSlim();
+
+            public ManualResetEventSlim ReleaseRead { get; } = new ManualResetEventSlim();
+
+            public bool Written { get; private set; }
+        }
+
+        private class SelfSynchronizedBlockingReadPeripheral : BlockingReadPeripheral, ISelfSynchronizedBusPeripheral
+        {
+        }
 
         private class MultiRegistrationPeripheral : IBusPeripheral, IDoubleWordPeripheral
         {
