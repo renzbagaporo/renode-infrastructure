@@ -11,19 +11,41 @@ using Antmicro.Migrant;
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.CPU;
+using Antmicro.Renode.Peripherals.GPIOPort;
 using Antmicro.Renode.Peripherals.Timers;
 using Antmicro.Renode.Time;
 
 namespace Antmicro.Renode.Peripherals.UART
 {
     // RP2040/RP2350 use a PL011 UART with 32-entry FIFOs and an atomic APB
-    // interposer. The IUART connection represents complete serial characters;
-    // electrical pin sampling and the IrDA encoder are not modeled.
+    // interposer. The IUART connection carries complete serial characters.
+    // With a GPIO bank and instance index, the UART also drives its function 2
+    // TX pins bit by bit and receives from its function 2 RX pins, sampling
+    // each bit at its centre; the IrDA encoder is not modeled.
     public sealed class RP2_UART : RP2APBPeripheral, IUART, IGPIOReceiver
     {
-        public RP2_UART(IMachine machine, IRP2ClockSource clocks = null, ulong frequency = 125000000) : base(machine)
+        public RP2_UART(IMachine machine, IRP2ClockSource clocks = null, ulong frequency = 125000000,
+            RP2_GPIOBank0 gpio = null, int index = -1) : base(machine)
         {
             this.clocks = clocks;
+            this.gpio = index >= 0 ? gpio : null;
+            var txPins = new List<int>();
+            var rxPins = new List<int>();
+            if(this.gpio != null)
+            {
+                // GPIO function 2 repeats UART0/UART1 in blocks of eight pins
+                // offset by four; TX, RX, CTS and RTS follow pin % 4.
+                for(var pin = 0; pin < MaximumPins; pin++)
+                {
+                    if((pin + 4) / 8 % 2 != index) continue;
+                    if(pin % 4 == 0) txPins.Add(pin);
+                    else if(pin % 4 == 1) rxPins.Add(pin);
+                }
+                this.gpio.InputChanged += OnPinInput;
+            }
+            this.txPins = txPins.ToArray();
+            this.rxPins = rxPins.ToArray();
+            rxLevels = new Dictionary<int, bool>();
             fallbackFrequency = frequency;
             tx = new Queue<byte>();
             rx = new Queue<uint>();
@@ -34,8 +56,14 @@ namespace Antmicro.Renode.Peripherals.UART
                 limit: 1, workMode: WorkMode.OneShot, eventEnabled: true);
             timeoutTimer = new LimitTimer(machine.ClockSource, Math.Max(1ul, frequency * 4), this, "receive timeout",
                 limit: 1, workMode: WorkMode.OneShot, eventEnabled: true);
+            bitTimer = new LimitTimer(machine.ClockSource, Math.Max(1ul, frequency * 4), this, "transmit bit",
+                limit: 1, workMode: WorkMode.Periodic, eventEnabled: true);
+            sampleTimer = new LimitTimer(machine.ClockSource, Math.Max(1ul, frequency * 4), this, "receive sample",
+                limit: 1, workMode: WorkMode.Periodic, eventEnabled: true);
             txTimer.LimitReached += CompleteTransmit;
             timeoutTimer.LimitReached += ReceiveTimeout;
+            bitTimer.LimitReached += TransmitNextBit;
+            sampleTimer.LimitReached += SampleReceiveBit;
             if(clocks != null) clocks.ClockChanged += OnClockChanged;
             Reset();
         }
@@ -48,6 +76,10 @@ namespace Antmicro.Renode.Peripherals.UART
                 {
                     txTimer.Reset();
                     timeoutTimer.Reset();
+                    bitTimer.Reset();
+                    sampleTimer.Reset();
+                    receiving = awaitingIdle = false;
+                    txLevel = false;
                     tx.Clear();
                     rx.Clear();
                     notifications.Clear();
@@ -59,6 +91,7 @@ namespace Antmicro.Renode.Peripherals.UART
                     interruptMask = interruptStatus = dmaControl = receiveStatus = irdaDivisor = 0;
                     UpdateClock();
                     UpdateSignals();
+                    UpdateTransmitLine();
                 }
             });
             PublishPending();
@@ -217,6 +250,7 @@ namespace Antmicro.Renode.Peripherals.UART
                 activeDivisor = integerDivisor * 64 + fractionalDivisor;
                 TryStartTransmit();
                 RestartTimeout();
+                UpdateTransmitLine();
                 break;
             case 0x30:
                 var oldModem = ModemFlags;
@@ -229,6 +263,7 @@ namespace Antmicro.Renode.Peripherals.UART
                 }
                 TryStartTransmit();
                 UpdateClock();
+                UpdateTransmitLine();
                 break;
             case 0x34:
                 fifoLevels = value & 0x3f;
@@ -269,6 +304,161 @@ namespace Antmicro.Renode.Peripherals.UART
             txTimer.Limit = activeDivisor * (ulong)FrameBits;
             txTimer.ResetValue();
             txTimer.Enabled = true;
+            if(txPins.Length != 0 && !shiftLoopback)
+            {
+                // Start bit now; data, parity and stop bits at bit boundaries.
+                frameLevels = FrameLevels(shiftByte);
+                frameBit = 1;
+                bitTimer.Enabled = false;
+                bitTimer.Limit = activeDivisor;
+                bitTimer.ResetValue();
+                bitTimer.Enabled = true;
+                SetTransmitLine(false);
+            }
+        }
+
+        private bool[] FrameLevels(byte value)
+        {
+            var levels = new List<bool> { false };
+            var ones = 0;
+            for(var bit = 0; bit < DataBits; bit++)
+            {
+                var one = (value >> bit & 1) != 0;
+                if(one) ones++;
+                levels.Add(one);
+            }
+            if((lineControl & 2) != 0) levels.Add(ParityLevel(ones));
+            levels.Add(true);
+            return levels.ToArray();
+        }
+
+        // PEN with EPS selects even parity, SPS forces the bit to !EPS.
+        private bool ParityLevel(int ones)
+        {
+            var even = (lineControl & 4) != 0;
+            if((lineControl & 0x80) != 0) return !even;
+            return even ? ones % 2 != 0 : ones % 2 == 0;
+        }
+
+        private void TransmitNextBit()
+        {
+            lock(SyncRoot)
+            {
+                if(!shifting || frameLevels == null || frameBit >= frameLevels.Length)
+                {
+                    bitTimer.Enabled = false;
+                    return;
+                }
+                SetTransmitLine(frameLevels[frameBit]);
+                // The stop level holds until the frame timer starts the next frame.
+                if(++frameBit >= frameLevels.Length) bitTimer.Enabled = false;
+            }
+            PublishPending();
+        }
+
+        // Idle and stop are high; BRK holds the line low. Loopback and a
+        // disabled transmitter keep the line high.
+        private void UpdateTransmitLine()
+        {
+            if(txPins.Length == 0) return;
+            if((lineControl & 1) != 0 && !Loopback && !ResetHeld) SetTransmitLine(false);
+            else if(!shifting || shiftLoopback) SetTransmitLine(true);
+        }
+
+        private void SetTransmitLine(bool level)
+        {
+            if(txLevel == level) return;
+            txLevel = level;
+            notifications.Enqueue(new Notification(TransmitLine, level ? 1 : 0, generation));
+        }
+
+        private void OnPinInput(int pin, bool level)
+        {
+            if(Array.IndexOf(rxPins, pin) < 0) return;
+            machine.ClockSource.ExecuteInLock(() =>
+            {
+                lock(SyncRoot)
+                {
+                    rxLevels[pin] = level;
+                    if(gpio.GetFunction(pin) != UartFunction || ResetHeld) return;
+                    if(level)
+                    {
+                        awaitingIdle = false;
+                        return;
+                    }
+                    if(receiving || awaitingIdle || !ReceiveEnabled || Loopback) return;
+                    // A falling edge starts the frame; check the start bit at its centre.
+                    receiving = true;
+                    receivePin = pin;
+                    receiveBit = -1;
+                    receiveValue = 0;
+                    receiveOnes = 0;
+                    receiveErrors = 0;
+                    sampleTimer.Enabled = false;
+                    sampleTimer.Limit = Math.Max(1u, activeDivisor / 2);
+                    sampleTimer.ResetValue();
+                    sampleTimer.Enabled = true;
+                }
+            });
+            PublishPending();
+        }
+
+        private void SampleReceiveBit()
+        {
+            lock(SyncRoot)
+            {
+                if(!receiving)
+                {
+                    sampleTimer.Enabled = false;
+                    return;
+                }
+                var level = !rxLevels.TryGetValue(receivePin, out var known) || known;
+                var parityBit = (lineControl & 2) != 0 ? 1 : 0;
+                if(receiveBit < 0)
+                {
+                    if(level)
+                    {
+                        // A pulse shorter than half a bit is not a start bit.
+                        receiving = false;
+                        sampleTimer.Enabled = false;
+                        return;
+                    }
+                    // Restart the period: a limit change alone keeps the current count.
+                    sampleTimer.Enabled = false;
+                    sampleTimer.Limit = activeDivisor;
+                    sampleTimer.ResetValue();
+                    sampleTimer.Enabled = true;
+                    receiveBit = 0;
+                    return;
+                }
+                if(receiveBit < DataBits)
+                {
+                    if(level)
+                    {
+                        receiveValue |= 1 << receiveBit;
+                        receiveOnes++;
+                    }
+                }
+                else if(receiveBit < DataBits + parityBit)
+                {
+                    if(level) receiveOnes++;
+                    if(level != ParityLevel(receiveOnes - (level ? 1 : 0))) receiveErrors |= ParityError;
+                }
+                else
+                {
+                    sampleTimer.Enabled = false;
+                    receiving = false;
+                    if(!level)
+                    {
+                        // Data, parity and stop all low is a break; otherwise a framing error.
+                        receiveErrors |= receiveValue == 0 && receiveOnes == 0 ? BreakError | FramingError : FramingError;
+                        awaitingIdle = true;
+                    }
+                    if(ReceiveEnabled && !Loopback) ReceiveCharacter((byte)receiveValue, receiveErrors);
+                }
+                if(receiving) receiveBit++;
+            }
+            PublishPending();
         }
 
         private void CompleteTransmit()
@@ -283,13 +473,19 @@ namespace Antmicro.Renode.Peripherals.UART
                 }
                 else notifications.Enqueue(new Notification(TransmittedCharacter, shiftByte, generation));
                 TryStartTransmit();
+                UpdateTransmitLine();
                 UpdateSignals();
             }
             PublishPending();
         }
 
-        private void ReceiveCharacter(byte value)
+        // Errors use the UARTDR bit positions: FE 8, PE 9, BE 10.
+        private void ReceiveCharacter(byte value, uint errors = 0)
         {
+            receiveStatus |= errors >> 8 & 7;
+            if((errors & FramingError) != 0) interruptStatus |= FramingInterrupt;
+            if((errors & ParityError) != 0) interruptStatus |= ParityInterrupt;
+            if((errors & BreakError) != 0) interruptStatus |= BreakInterrupt;
             if(rx.Count >= Capacity)
             {
                 pendingOverrun = true;
@@ -298,7 +494,7 @@ namespace Antmicro.Renode.Peripherals.UART
             }
             else
             {
-                rx.Enqueue((uint)(value & DataMask) | (pendingOverrun ? 0x800u : 0));
+                rx.Enqueue((uint)(value & DataMask) | errors | (pendingOverrun ? 0x800u : 0));
                 pendingOverrun = false;
                 if(rx.Count >= ReceiveThreshold) interruptStatus |= ReceiveInterrupt;
             }
@@ -343,6 +539,8 @@ namespace Antmicro.Renode.Peripherals.UART
             {
                 txTimer.Frequency = frequency * 4;
                 timeoutTimer.Frequency = frequency * 4;
+                bitTimer.Frequency = frequency * 4;
+                sampleTimer.Frequency = frequency * 4;
             }
             txTimer.Enabled = !ResetHeld && frequency != 0 && shifting;
             timeoutTimer.Enabled = frequency != 0 && timeoutPending && ReceiveEnabled;
@@ -400,6 +598,9 @@ namespace Antmicro.Renode.Peripherals.UART
                     case 1: RTS.Set(notification.Value != 0); break;
                     case 2: RxDMA.Set(notification.Value != 0); break;
                     case 3: TxDMA.Set(notification.Value != 0); break;
+                    case TransmitLine:
+                        foreach(var pin in txPins) gpio.SetPeripheralOutput(UartFunction, pin, notification.Value != 0, true);
+                        break;
                     default: CharReceived?.Invoke((byte)notification.Value); break;
                     }
                 }
@@ -452,6 +653,17 @@ namespace Antmicro.Renode.Peripherals.UART
         }
 
         private readonly IRP2ClockSource clocks;
+        private readonly RP2_GPIOBank0 gpio;
+        private readonly int[] txPins;
+        private readonly int[] rxPins;
+        private readonly Dictionary<int, bool> rxLevels;
+        private readonly LimitTimer bitTimer;
+        private readonly LimitTimer sampleTimer;
+        private bool[] frameLevels;
+        private int frameBit;
+        private bool txLevel, receiving, awaitingIdle;
+        private int receivePin, receiveBit, receiveValue, receiveOnes;
+        private uint receiveErrors;
         private readonly ulong fallbackFrequency;
         private readonly Queue<byte> tx;
         private readonly Queue<uint> rx;
@@ -469,6 +681,15 @@ namespace Antmicro.Renode.Peripherals.UART
         private static readonly int[] FifoThresholds = { 4, 8, 16, 24, 28 };
         private static readonly byte[] Identification = { 0x11, 0x10, 0x34, 0, 0x0d, 0xf0, 5, 0xb1 };
         private const int TransmittedCharacter = 4;
+        private const int TransmitLine = 5;
+        private const int UartFunction = 2;
+        private const int MaximumPins = 48;
+        private const uint FramingError = 1u << 8;
+        private const uint ParityError = 1u << 9;
+        private const uint BreakError = 1u << 10;
+        private const uint FramingInterrupt = 1u << 7;
+        private const uint ParityInterrupt = 1u << 8;
+        private const uint BreakInterrupt = 1u << 9;
         private const uint ReceiveInterrupt = 1u << 4;
         private const uint TransmitInterrupt = 1u << 5;
         private const uint TimeoutInterrupt = 1u << 6;

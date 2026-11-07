@@ -167,6 +167,15 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
                 || (accessControl?.GPIOIsNonSecure(pin + securityPinOffset) ?? false);
         }
 
+        // GPIO_CTRL.FUNCSEL: the peripheral function routed to the pin.
+        public int GetFunction(int pin)
+        {
+            lock(SyncRoot)
+            {
+                return IsBondedPin(pin) ? (int)(control[pin] & 0x1f) : -1;
+            }
+        }
+
         public bool GetInput(int pin)
         {
             lock(SyncRoot)
