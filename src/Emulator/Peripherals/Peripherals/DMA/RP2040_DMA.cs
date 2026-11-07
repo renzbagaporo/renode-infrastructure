@@ -45,39 +45,25 @@ namespace Antmicro.Renode.Peripherals.DMA
         public void OnGPIO(int number, bool value)
         {
             if(number < 0 || number >= requests.Length) return;
-            lock(SyncRoot)
+            machine.ClockSource.ExecuteInLock(() =>
             {
-                requests[number] = value;
-                Schedule();
-            }
+                lock(SyncRoot)
+                {
+                    requests[number] = value;
+                    Schedule();
+                }
+            });
         }
 
         public override void Reset()
         {
-            lock(SyncRoot)
-            {
-                timer.Enabled = false;
-                scheduled = false;
-                pending = null;
-                highServed = 0;
-                lowCursor = highCursor = 0;
-                rawInterrupts = sniffControl = sniffData = 0;
-                Array.Clear(irqEnable, 0, irqEnable.Length);
-                Array.Clear(irqForce, 0, irqForce.Length);
-                Array.Clear(pacing, 0, pacing.Length);
-                Array.Clear(pacingPhase, 0, pacingPhase.Length);
-                lastTimerCycle = cycleCounter.Value;
-                foreach(var channel in channels)
-                {
-                    channel.Generation++;
-                    channel.ReadAddress = channel.WriteAddress = channel.Reload = channel.Remaining = channel.Control = channel.Errors = 0;
-                    channel.Busy = channel.Aborting = false;
-                    channel.TimerCredit = 0;
-                }
-                UpdateInterrupts();
-            }
+            machine.ClockSource.ExecuteInLock(() => ResetState());
             PublishPending();
         }
+
+        // Register accesses, DREQ inputs and resets take the clock lock before
+        // the register monitor, the order the bus timer's callback runs in.
+        protected override IClockSource AccessClock => machine.ClockSource;
 
         protected override void OnBeforeAccess()
         {
@@ -204,6 +190,32 @@ namespace Antmicro.Renode.Peripherals.DMA
             }
             UpdateInterrupts();
             Schedule();
+        }
+
+        private void ResetState()
+        {
+            lock(SyncRoot)
+            {
+                timer.Enabled = false;
+                scheduled = false;
+                pending = null;
+                highServed = 0;
+                lowCursor = highCursor = 0;
+                rawInterrupts = sniffControl = sniffData = 0;
+                Array.Clear(irqEnable, 0, irqEnable.Length);
+                Array.Clear(irqForce, 0, irqForce.Length);
+                Array.Clear(pacing, 0, pacing.Length);
+                Array.Clear(pacingPhase, 0, pacingPhase.Length);
+                lastTimerCycle = cycleCounter.Value;
+                foreach(var channel in channels)
+                {
+                    channel.Generation++;
+                    channel.ReadAddress = channel.WriteAddress = channel.Reload = channel.Remaining = channel.Control = channel.Errors = 0;
+                    channel.Busy = channel.Aborting = false;
+                    channel.TimerCredit = 0;
+                }
+                UpdateInterrupts();
+            }
         }
 
         private void Trigger(Channel channel)
@@ -415,20 +427,23 @@ namespace Antmicro.Renode.Peripherals.DMA
 
         private void OnClockChanged()
         {
-            lock(SyncRoot)
+            machine.ClockSource.ExecuteInLock(() =>
             {
-                UpdatePacing();
-                timer.Enabled = false;
-                scheduled = false;
-                frequency = clocks.SystemFrequency;
-                cycleCounter.Enabled = frequency != 0;
-                if(frequency != 0)
+                lock(SyncRoot)
                 {
-                    cycleCounter.Frequency = frequency;
-                    timer.Frequency = frequency;
+                    UpdatePacing();
+                    timer.Enabled = false;
+                    scheduled = false;
+                    frequency = clocks.SystemFrequency;
+                    cycleCounter.Enabled = frequency != 0;
+                    if(frequency != 0)
+                    {
+                        cycleCounter.Frequency = frequency;
+                        timer.Frequency = frequency;
+                    }
+                    Schedule();
                 }
-                Schedule();
-            }
+            });
         }
 
         private void Sniff(Transfer transfer)
