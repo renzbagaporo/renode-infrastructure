@@ -83,6 +83,9 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
             return true;
         }
 
+        // The ATRANS entry that translates the given 4 MiB window.
+        public uint GetAddressTranslation(int window) => addressTranslation[window];
+
         // True when the 4 MiB window maps every offset to the same physical
         // address, as it does after reset.
         public bool TranslatesIdentically(int window)

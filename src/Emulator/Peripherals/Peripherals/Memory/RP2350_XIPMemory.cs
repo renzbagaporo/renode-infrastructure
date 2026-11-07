@@ -52,10 +52,14 @@ namespace Antmicro.Renode.Peripherals.Memory
                 xip.ContentsChanged += UpdateDirectAccessForContents;
             }
             machine.PeripheralsChanged += OnPeripheralsChanged;
-            flash.StateChanged += InvalidateInstructions;
-            qmi.ConfigurationChanged += InvalidateInstructions;
-            flash.StateChanged += UpdateDirectAccess;
-            qmi.ConfigurationChanged += UpdateDirectAccess;
+            // Above the first 32 MiB only pinned lines respond, so the upper
+            // windows never read the QMI or the NOR array.
+            if(ReadsFlash)
+            {
+                flash.ArrayChanged += InvalidateArray;
+                flash.StateChanged += UpdateReadPath;
+                qmi.ConfigurationChanged += UpdateReadPath;
+            }
         }
 
         public byte ReadByte(long offset) => (byte)ReadTransaction(offset, 1);
@@ -142,10 +146,12 @@ namespace Antmicro.Renode.Peripherals.Memory
         public void Dispose()
         {
             machine.PeripheralsChanged -= OnPeripheralsChanged;
-            flash.StateChanged -= InvalidateInstructions;
-            qmi.ConfigurationChanged -= InvalidateInstructions;
-            flash.StateChanged -= UpdateDirectAccess;
-            qmi.ConfigurationChanged -= UpdateDirectAccess;
+            if(ReadsFlash)
+            {
+                flash.ArrayChanged -= InvalidateArray;
+                flash.StateChanged -= UpdateReadPath;
+                qmi.ConfigurationChanged -= UpdateReadPath;
+            }
             if(xip != null)
             {
                 xip.ConfigurationChanged -= InvalidateInstructions;
@@ -252,6 +258,18 @@ namespace Antmicro.Renode.Peripherals.Memory
 
         private void UpdateDirectAccessForContents(long offset, int count) => UpdateDirectAccess();
 
+        private void InvalidateArray(long offset, long count) => InvalidateInstructions();
+
+        // QMI and flash notifications arrive at the end of every serial
+        // transaction. A mapped alias compares the read path on the CPU
+        // threads and clears translations only when it changes; an alias
+        // without mapped windows clears them on every notification.
+        private void UpdateReadPath()
+        {
+            if(mappedAliases.Count == 0) InvalidateInstructions();
+            else UpdateDirectAccess();
+        }
+
         // Notifications arrive from register accesses, timer callbacks and
         // other devices' locks, so they only ask each CPU to evaluate the
         // windows on its own thread, outside those locks.
@@ -292,12 +310,24 @@ namespace Antmicro.Renode.Peripherals.Memory
         private void EvaluateDirectAccess()
         {
             var readable = qmi.Available && qmi.FlashReadConfigured && flash.ReadAvailable;
+            // Instructions translated from bus reads hold NOR data only while
+            // the read path is readable, and translated data depends on ATRANS.
+            // A fetch while the QMI is unavailable faults without translating,
+            // so availability toggles between direct-mode commands, which keep
+            // the path unreadable, do not clear translations.
+            var readPath = new ReadPath(readable, untranslated ? null
+                : Enumerable.Range(0, DirectWindows).Select(qmi.GetAddressTranslation).ToArray());
+            if(!readPath.Equals(lastReadPath))
+            {
+                lastReadPath = readPath;
+                InvalidateInstructions();
+            }
             for(var window = 0; window < DirectWindows; window++)
             {
                 var start = (long)DirectWindowSize * window;
-                var available = readable && (untranslated || qmi.TranslatesIdentically(window))
+                var direct = readable && (untranslated || qmi.TranslatesIdentically(window))
                     && (xip == null || xip.ReadsBypassCache(start, start + (long)DirectWindowSize, useCache, untranslated));
-                if(available && !directAccess[window])
+                if(direct && !directAccess[window])
                 {
                     // Code translated from the mapping is never fetched through
                     // this peripheral, so flash changes must clear it as well.
@@ -307,7 +337,7 @@ namespace Antmicro.Renode.Peripherals.Memory
                         for(var page = first; page < first + (long)DirectWindowSize / PageSize; page++) readPages.Add(page);
                     }
                 }
-                directAccess[window] = available;
+                directAccess[window] = direct;
             }
         }
 
@@ -323,6 +353,29 @@ namespace Antmicro.Renode.Peripherals.Memory
             }
         }
 
+        private bool ReadsFlash => windowOffset < 0x2000000;
+
+        private sealed class ReadPath
+        {
+            public ReadPath(bool readable, uint[] translation)
+            {
+                this.readable = readable;
+                this.translation = translation;
+            }
+
+            public override bool Equals(object other)
+            {
+                return other is ReadPath path && path.readable == readable
+                    && (path.translation == null ? translation == null : translation != null && path.translation.SequenceEqual(translation));
+            }
+
+            public override int GetHashCode() => readable ? 1 : 0;
+
+            private readonly bool readable;
+            private readonly uint[] translation;
+        }
+
+        private ReadPath lastReadPath;
         private readonly HashSet<long> readPages = new HashSet<long>();
         private readonly HashSet<ulong> mappedAliases = new HashSet<ulong>();
         private readonly bool[] directAccess = new bool[DirectWindows];

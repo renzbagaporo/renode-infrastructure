@@ -182,10 +182,16 @@ namespace Antmicro.Renode.Peripherals.SPI
             if(offset < 0 || offset > underlyingMemory.Size - data.Length)
                 throw new ArgumentOutOfRangeException(nameof(offset), "Flash image must fit in the NOR array");
             underlyingMemory.WriteBytes(offset, data, 0, data.Length);
+            ArrayChanged?.Invoke(offset, data.Length);
             StateChanged?.Invoke();
         }
 
+        // Fires at the end of every transaction and operation.
         public event Action StateChanged;
+
+        // Fires when a program, erase or loaded image changes the NOR array,
+        // with the changed byte range.
+        public event Action<long, long> ArrayChanged;
 
         public bool ReadAvailable => !Busy;
 
@@ -225,6 +231,8 @@ namespace Antmicro.Renode.Peripherals.SPI
         private void CompleteOperation()
         {
             var address = pendingData.Length >= 4 ? ((pendingData[1] << 16) | (pendingData[2] << 8) | pendingData[3]) & AddressMask : 0;
+            long changedStart = 0;
+            long changedLength = 0;
             switch(pendingCommand)
             {
             case 0x01:
@@ -246,6 +254,8 @@ namespace Antmicro.Renode.Peripherals.SPI
                 {
                     if(!IsProtected(entry.Key)) underlyingMemory.WriteByte(entry.Key, (byte)(underlyingMemory.ReadByte(entry.Key) & entry.Value));
                 }
+                changedStart = address & ~255;
+                changedLength = 256;
                 break;
             default:
                 var length = pendingCommand == 0x20 ? 4096 : pendingCommand == 0x52 ? 32768 : pendingCommand == 0xd8 ? 65536 : AddressMask + 1;
@@ -254,10 +264,13 @@ namespace Antmicro.Renode.Peripherals.SPI
                 {
                     if(!IsProtected(i)) underlyingMemory.WriteByte(i, 0xff);
                 }
+                changedStart = address;
+                changedLength = length;
                 break;
             }
             writeEnabled = false;
             pendingData = null;
+            if(changedLength != 0) ArrayChanged?.Invoke(changedStart, changedLength);
             StateChanged?.Invoke();
         }
 

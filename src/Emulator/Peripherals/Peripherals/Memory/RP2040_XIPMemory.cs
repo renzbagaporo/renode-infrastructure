@@ -30,8 +30,10 @@ namespace Antmicro.Renode.Peripherals.Memory
             this.machine = machine;
             this.flash = flash;
             this.xip = xip;
-            flash.StateChanged += InvalidateInstructions;
-            xip.AvailabilityChanged += InvalidateInstructions;
+            // Availability notifications arrive at the end of every serial
+            // transaction; translations are cleared when the array or the
+            // availability actually changes.
+            flash.ArrayChanged += InvalidateArray;
             xip.AvailabilityChanged += UpdateDirectAccess;
             machine.PeripheralsChanged += OnPeripheralsChanged;
         }
@@ -122,8 +124,7 @@ namespace Antmicro.Renode.Peripherals.Memory
         public void Dispose()
         {
             machine.PeripheralsChanged -= OnPeripheralsChanged;
-            flash.StateChanged -= InvalidateInstructions;
-            xip.AvailabilityChanged -= InvalidateInstructions;
+            flash.ArrayChanged -= InvalidateArray;
             xip.AvailabilityChanged -= UpdateDirectAccess;
             flash.UnderlyingMemory.Dispose();
         }
@@ -167,16 +168,25 @@ namespace Antmicro.Renode.Peripherals.Memory
             }
         }
 
+        private void InvalidateArray(long offset, long count) => InvalidateInstructions();
+
         private void UpdateDirectAccess() => UpdateDirectAccess(force: false);
 
         private void UpdateDirectAccess(bool force)
         {
-            if(mappedAliases.Count == 0) return;
+            if(mappedAliases.Count == 0)
+            {
+                InvalidateInstructions();
+                return;
+            }
             var available = xip.Available;
             lock(directAccessLock)
             {
                 if(!force && available == directAccess) return;
                 directAccess = available;
+                // Code translated while XIP was available must not run while
+                // it is not, and the reverse.
+                InvalidateInstructions();
                 if(available)
                 {
                     // Translations may now come from the mapping without a bus fetch.
