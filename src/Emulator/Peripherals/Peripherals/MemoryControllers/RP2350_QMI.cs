@@ -83,6 +83,14 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
             return true;
         }
 
+        // True when the 4 MiB window maps every offset to the same physical
+        // address, as it does after reset.
+        public bool TranslatesIdentically(int window)
+        {
+            var entry = addressTranslation[window];
+            return (entry & 0xfff) == (uint)window * 0x400 && ((entry >> 16) & 0x7ff) >= 0x400;
+        }
+
         public bool FlashReadConfigured
         {
             get
@@ -213,6 +221,9 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
             if(transactionActive) flash.FinishTransmission();
             transactionActive = false;
         }
+
+        // Availability depends on the reset hold.
+        protected override void OnResetHeldChanged() => NotifyConfiguration();
 
         private void NotifyConfiguration()
         {

@@ -25,6 +25,7 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
             {
                 control = 0x83;
                 accesses = hits = 0;
+                countersCleared = false;
                 configurationPending = true;
             }
             PublishNotifications();
@@ -48,6 +49,22 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
 
         public event Action ConfigurationChanged;
         public event Action<long, int> ContentsChanged;
+
+        // True while every M0 read of the given alias, in either security
+        // state, reaches the QMI without a pinned line or a recorded count.
+        public bool ReadsBypassCache(long start, long end, bool useCache, bool untranslated)
+        {
+            lock(SyncRoot)
+            {
+                if(!powerPresent || countersCleared) return false;
+                if(!useCache) return (control & (untranslated ? 0xc0u : 0x30u)) == 0;
+                for(var line = 0; line < pinned.Length; line++)
+                {
+                    if(pinned[line] && tags[line] >= start && tags[line] < end) return false;
+                }
+                return true;
+            }
+        }
 
         internal T ExecuteTransaction<T>(Func<T> action)
         {
@@ -183,8 +200,9 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
                 if((control & 8) != 0) control &= ~3u;
                 configurationPending = true;
                 return;
-            case 0xc: hits = 0; return;
-            case 0x10: accesses = 0; return;
+            // Clearing a counter starts a measurement, so later reads are counted.
+            case 0xc: hits = 0; MarkCountersCleared(); return;
+            case 0x10: accesses = 0; MarkCountersCleared(); return;
             case 0x18:
                 if(value != 0) this.Log(LogLevel.Error, "XIP streaming reads are not implemented; transfer will not complete");
                 return;
@@ -192,6 +210,13 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
             }
         }
         protected override void OnAccessCompleted() => PublishNotifications();
+
+        private void MarkCountersCleared()
+        {
+            if(countersCleared) return;
+            countersCleared = true;
+            configurationPending = true;
+        }
 
         private void PublishNotifications()
         {
@@ -245,6 +270,7 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
         }
         private readonly Queue<KeyValuePair<long, int>> pendingRanges = new Queue<KeyValuePair<long, int>>();
         private bool powerPresent = true;
+        private bool countersCleared;
         private bool configurationPending;
         private bool publishing;
         private readonly byte[] data = new byte[0x4000];

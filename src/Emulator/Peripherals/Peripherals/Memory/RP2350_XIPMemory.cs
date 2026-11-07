@@ -6,6 +6,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
 
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Peripherals.Bus;
@@ -13,11 +14,19 @@ using Antmicro.Renode.Peripherals.CPU;
 using Antmicro.Renode.Peripherals.MemoryControllers;
 using Antmicro.Renode.Peripherals.SPI;
 
+using Range = Antmicro.Renode.Core.Range;
+
 namespace Antmicro.Renode.Peripherals.Memory
 {
     // Pinned cache lines provide SRAM while ordinary reads fetch from serial
-    // NOR. Instruction fetches and data accesses traverse the same bus path to
-    // preserve QMI availability, translation, and pinned-cache semantics.
+    // NOR. In each 4 MiB window of the lower 16 MiB, CPUs read and fetch
+    // directly from the NOR contents, mapped read-only, while the QMI accepts
+    // reads, the window translates identically, and the XIP controller would
+    // pass every read to the QMI: no pinned line in the window, no uncached
+    // access restriction, and no counter measurement. Writes reach this
+    // peripheral. Otherwise every CPU access traverses the bus to preserve
+    // QMI availability, translation, and pinned-cache semantics. Other bus
+    // masters always use the bus.
     public sealed class RP2350_XIPMemory : IBytePeripheral, IWordPeripheral, IDoubleWordPeripheral,
         IQuadWordPeripheral, IMultibyteWritePeripheral, IExecutableIO, IKnownSize, IDisposable
     {
@@ -34,14 +43,19 @@ namespace Antmicro.Renode.Peripherals.Memory
             this.untranslated = untranslated;
             this.xip = xip;
             this.useCache = useCache;
+            directAccessEvaluators = Enumerable.Range(0, DirectWindows).Select(window => (Func<bool>)(() => IsDirect(window))).ToArray();
             if(xip != null)
             {
                 xip.ConfigurationChanged += InvalidateInstructions;
                 xip.ContentsChanged += InvalidateCacheRange;
+                xip.ConfigurationChanged += UpdateDirectAccess;
+                xip.ContentsChanged += UpdateDirectAccessForContents;
             }
             machine.PeripheralsChanged += OnPeripheralsChanged;
             flash.StateChanged += InvalidateInstructions;
             qmi.ConfigurationChanged += InvalidateInstructions;
+            flash.StateChanged += UpdateDirectAccess;
+            qmi.ConfigurationChanged += UpdateDirectAccess;
         }
 
         public byte ReadByte(long offset) => (byte)ReadTransaction(offset, 1);
@@ -130,14 +144,22 @@ namespace Antmicro.Renode.Peripherals.Memory
             machine.PeripheralsChanged -= OnPeripheralsChanged;
             flash.StateChanged -= InvalidateInstructions;
             qmi.ConfigurationChanged -= InvalidateInstructions;
+            flash.StateChanged -= UpdateDirectAccess;
+            qmi.ConfigurationChanged -= UpdateDirectAccess;
             if(xip != null)
             {
                 xip.ConfigurationChanged -= InvalidateInstructions;
                 xip.ContentsChanged -= InvalidateCacheRange;
+                xip.ConfigurationChanged -= UpdateDirectAccess;
+                xip.ContentsChanged -= UpdateDirectAccessForContents;
             }
         }
 
-        public void Reset() => InvalidateInstructions();
+        public void Reset()
+        {
+            InvalidateInstructions();
+            UpdateDirectAccess();
+        }
         public long Size { get; }
 
         private void RememberReadPages(long offset, int count)
@@ -192,7 +214,101 @@ namespace Antmicro.Renode.Peripherals.Memory
 
         private void OnPeripheralsChanged(IMachine _, PeripheralsChangedEventArgs change)
         {
-            if(change.Peripheral == this || change.Peripheral is ICPUWithMappedMemory) RouteDataAccessesThroughBus();
+            if(change.Peripheral == this && change.Operation == PeripheralsChangedEventArgs.PeripheralChangeType.Addition)
+            {
+                MapFlashContents();
+            }
+            if(change.Peripheral == this || change.Peripheral is ICPUWithMappedMemory)
+            {
+                RouteDataAccessesThroughBus();
+                UpdateDirectAccess();
+            }
+        }
+
+        // Each registration maps the NOR contents, repeated at the flash size,
+        // across the lower 16 MiB that the identical translation reaches.
+        // The upper XIP address space holds only pinned lines and is not mapped.
+        private void MapFlashContents()
+        {
+            if(windowOffset != 0) return;
+            var bus = machine.GetSystemBus(this);
+            var flashSize = (ulong)flash.UnderlyingMemory.Size;
+            foreach(var registration in bus.GetRegistrationPoints(this))
+            {
+                if(registration.Offset != 0 || !mappedAliases.Add(registration.Range.StartAddress)) continue;
+                var mapped = Math.Min(registration.Range.Size, DirectWindowSize * DirectWindows);
+                for(var copy = 0UL; copy < mapped; copy += flashSize)
+                {
+                    foreach(var segment in flash.UnderlyingMemory.MappedSegments)
+                    {
+                        if(copy + segment.StartingOffset >= mapped) continue;
+                        var size = Math.Min(segment.Size, mapped - copy - segment.StartingOffset);
+                        bus.MapMemory(new SystemBus.MappedSegmentWrapper(segment, registration.Range.StartAddress + copy, size, null),
+                            this, relative: false);
+                    }
+                }
+            }
+        }
+
+        private void UpdateDirectAccessForContents(long offset, int count) => UpdateDirectAccess();
+
+        // Notifications arrive from register accesses, timer callbacks and
+        // other devices' locks, so they only ask each CPU to evaluate the
+        // windows on its own thread, outside those locks.
+        private void UpdateDirectAccess()
+        {
+            if(mappedAliases.Count == 0) return;
+            Interlocked.Increment(ref directAccessGeneration);
+            var bus = machine.GetSystemBus(this);
+            foreach(var registration in bus.GetRegistrationPoints(this))
+            {
+                if(!mappedAliases.Contains(registration.Range.StartAddress)) continue;
+                for(var window = 0; window < DirectWindows; window++)
+                {
+                    var range = new Range(registration.Range.StartAddress + DirectWindowSize * (ulong)window, DirectWindowSize);
+                    foreach(var cpu in bus.GetCPUs().OfType<TranslationCPU>())
+                    {
+                        cpu.RequestReadOnlyMemoryAccess(range, directAccessEvaluators[window]);
+                    }
+                }
+            }
+        }
+
+        // Called on CPU threads only, while they hold no other lock.
+        private bool IsDirect(int window)
+        {
+            lock(directAccessLock)
+            {
+                var generation = Volatile.Read(ref directAccessGeneration);
+                if(generation != evaluatedGeneration)
+                {
+                    evaluatedGeneration = generation;
+                    EvaluateDirectAccess();
+                }
+                return directAccess[window];
+            }
+        }
+
+        private void EvaluateDirectAccess()
+        {
+            var readable = qmi.Available && qmi.FlashReadConfigured && flash.ReadAvailable;
+            for(var window = 0; window < DirectWindows; window++)
+            {
+                var start = (long)DirectWindowSize * window;
+                var available = readable && (untranslated || qmi.TranslatesIdentically(window))
+                    && (xip == null || xip.ReadsBypassCache(start, start + (long)DirectWindowSize, useCache, untranslated));
+                if(available && !directAccess[window])
+                {
+                    // Code translated from the mapping is never fetched through
+                    // this peripheral, so flash changes must clear it as well.
+                    lock(readPages)
+                    {
+                        var first = start / PageSize;
+                        for(var page = first; page < first + (long)DirectWindowSize / PageSize; page++) readPages.Add(page);
+                    }
+                }
+                directAccess[window] = available;
+            }
         }
 
         private void RouteDataAccessesThroughBus()
@@ -208,7 +324,15 @@ namespace Antmicro.Renode.Peripherals.Memory
         }
 
         private readonly HashSet<long> readPages = new HashSet<long>();
+        private readonly HashSet<ulong> mappedAliases = new HashSet<ulong>();
+        private readonly bool[] directAccess = new bool[DirectWindows];
+        private readonly Func<bool>[] directAccessEvaluators;
+        private readonly object directAccessLock = new object();
+        private long directAccessGeneration;
+        private long evaluatedGeneration = -1;
         private const long PageSize = 4096;
+        private const ulong DirectWindowSize = 0x400000;
+        private const int DirectWindows = 4;
         private readonly long windowOffset;
         private readonly RP2350_XIP xip;
         private readonly bool useCache;

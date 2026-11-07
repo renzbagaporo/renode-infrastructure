@@ -117,11 +117,33 @@ namespace Antmicro.Renode.Peripherals.CPU
         /// Selects how this CPU reaches a range it maps with <see cref="MapMemory"/>: reads and
         /// instruction fetches directly from host memory with writes passed to the bus
         /// (<paramref name="direct"/> true), or every access through the bus (false). The change
-        /// is applied on the CPU thread before the CPU executes another instruction.
+        /// is applied on the CPU thread before the CPU executes another instruction; the last
+        /// request for a range wins.
         /// </summary>
         public void RequestReadOnlyMemoryAccess(Range range, bool direct)
         {
-            InvokeInCpuThreadSafely(() => ApplyReadOnlyMemoryAccess(range, direct));
+            RequestReadOnlyMemoryAccess(range, () => direct);
+        }
+
+        /// <summary>
+        /// Like <see cref="RequestReadOnlyMemoryAccess(Range, bool)"/>, with the access method
+        /// decided by <paramref name="direct"/> on the CPU thread before the CPU executes another
+        /// instruction. It runs outside the translation library and every peripheral and clock
+        /// lock, so a peripheral can request from any callback and read other devices' state there.
+        /// </summary>
+        public void RequestReadOnlyMemoryAccess(Range range, Func<bool> direct)
+        {
+            bool schedule;
+            lock(readOnlyMemoryRequests)
+            {
+                readOnlyMemoryRequests[range] = direct;
+                schedule = !readOnlyMemoryRequestsScheduled;
+                readOnlyMemoryRequestsScheduled = true;
+            }
+            // One queued action serves every request made before it runs, so a
+            // CPU that is not executing holds at most one.
+            if(!schedule) return;
+            InvokeInCpuThreadSafely(ApplyReadOnlyMemoryRequests);
             RequestReturn();
         }
 
@@ -2129,12 +2151,31 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         // Runs on the CPU thread between translation library executions, so the
         // CPU's own memory map can change without pausing the machine.
+        private void ApplyReadOnlyMemoryRequests()
+        {
+            KeyValuePair<Range, Func<bool>>[] requests;
+            lock(readOnlyMemoryRequests)
+            {
+                requests = readOnlyMemoryRequests.ToArray();
+                readOnlyMemoryRequests.Clear();
+                readOnlyMemoryRequestsScheduled = false;
+            }
+            foreach(var request in requests) ApplyReadOnlyMemoryAccess(request.Key, request.Value());
+        }
+
         private void ApplyReadOnlyMemoryAccess(Range range, bool direct)
         {
             if(!mappedMemory.ContainsWholeRange(range))
             {
                 // An exception here would end the CPU thread.
                 this.Log(LogLevel.Error, "Tried to set read-only access at {0}, which isn't mapped memory", range);
+                return;
+            }
+            // Remapping clears translations of the range, so keep a range that
+            // already has the requested access method.
+            if(readOnlyMemory.ContainsWholeRange(range)
+                && (direct ? !disabledMemory.ContainsOverlappingRange(range) : disabledMemory.ContainsWholeRange(range)))
+            {
                 return;
             }
             readOnlyMemory.Add(range);
@@ -2474,6 +2515,8 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         private readonly MinimalRangesCollection disabledMemory = new MinimalRangesCollection();
         private readonly MinimalRangesCollection readOnlyMemory = new MinimalRangesCollection();
+        private readonly Dictionary<Range, Func<bool>> readOnlyMemoryRequests = new Dictionary<Range, Func<bool>>();
+        private bool readOnlyMemoryRequestsScheduled;
         private const int DefaultMaximumTranslationCacheSize = 512 * 1024 * 1024; // 512 MiB
         private const int DefaultMinimumTranslationCacheSize = 32 * 1024 * 1024; // 32 MiB
 
