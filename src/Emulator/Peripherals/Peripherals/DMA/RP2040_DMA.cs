@@ -19,28 +19,59 @@ namespace Antmicro.Renode.Peripherals.DMA
     // writes already accepted into that slot drain independently of DREQ and EN.
     // This conservative bus pipeline completes at most one transfer per two
     // system cycles; it does not model the RP2040 crossbar's parallel masters.
+    // With rp2350 set it is the RP2350 DMA: 16 channels, the RP2350 CTRL field
+    // layout with reversed increments, TRANS_COUNT modes, four interrupt
+    // outputs and the RP2350 register map. SECCFG and MPU registers hold their
+    // values; channel security attributes are not enforced on bus accesses.
     public sealed class RP2040_DMA : RP2APBPeripheral, IGPIOReceiver
     {
-        public RP2040_DMA(IMachine machine, IRP2ClockSource clocks = null, ulong frequency = 125000000) : base(machine)
+        public RP2040_DMA(IMachine machine, IRP2ClockSource clocks = null, ulong frequency = 125000000, bool rp2350 = false) : base(machine)
         {
+            this.rp2350 = rp2350;
+            channelCount = rp2350 ? 16 : 12;
+            channelMask = (1u << channelCount) - 1;
+            irqCount = rp2350 ? 4 : 2;
+            controlMask = rp2350 ? 0x3ffffffu : 0xffffffu;
+            busyBit = rp2350 ? 1u << 26 : 1u << 24;
+            quietBit = rp2350 ? 1u << 23 : 1u << 21;
+            byteSwapBit = rp2350 ? 1u << 24 : 1u << 22;
+            sniffBit = rp2350 ? 1u << 25 : 1u << 23;
+            treqShift = rp2350 ? 17 : 15;
+            chainShift = rp2350 ? 13 : 11;
+            ringShift = rp2350 ? 8 : 6;
+            ringSelectBit = rp2350 ? 1u << 12 : 1u << 10;
+            incrementWriteBit = rp2350 ? 1u << 6 : 1u << 5;
+            timerBase = rp2350 ? 0x440 : 0x420;
+            multiTriggerOffset = rp2350 ? 0x450 : 0x430;
+            fifoLevelsOffset = rp2350 ? 0x460 : 0x440;
+            channels = new Channel[channelCount];
+            irqEnable = new uint[irqCount];
+            irqForce = new uint[irqCount];
+            irqState = new bool[irqCount];
             this.clocks = clocks;
             this.frequency = clocks == null ? frequency : clocks.SystemFrequency;
             IRQ0 = new GPIO();
             IRQ1 = new GPIO();
+            IRQ2 = new GPIO();
+            IRQ3 = new GPIO();
+            irqOutputs = new[] { IRQ0, IRQ1, IRQ2, IRQ3 };
             cycleCounter = new PhasedTimer(machine.ClockSource, Math.Max(1ul, this.frequency), this, "cycles",
                 direction: Direction.Ascending, enabled: this.frequency != 0);
             timer = new PhasedTimer(machine.ClockSource, Math.Max(1ul, this.frequency), this, "bus",
                 limit: 1, workMode: WorkMode.OneShot, eventEnabled: true);
             timer.LimitReached += Tick;
-            for(var i = 0; i < ChannelCount; i++) channels[i] = new Channel(i);
+            for(var i = 0; i < channelCount; i++) channels[i] = new Channel(i);
             if(clocks != null) clocks.ClockChanged += OnClockChanged;
             Reset();
         }
 
         public GPIO IRQ0 { get; }
         public GPIO IRQ1 { get; }
+        // RP2350 only.
+        public GPIO IRQ2 { get; }
+        public GPIO IRQ3 { get; }
 
-        // Hardware request numbers match the RP2040 TREQ_SEL encoding. Inputs
+        // Hardware request numbers match the chip's TREQ_SEL encoding. Inputs
         // are FIFO-ready levels (as provided by RP2040_PIO), not pulse credits.
         public void OnGPIO(int number, bool value)
         {
@@ -79,52 +110,60 @@ namespace Antmicro.Renode.Peripherals.DMA
         protected override uint ReadRegister(long offset)
         {
             UpdatePacing();
-            if(offset < ChannelCount * 0x40)
+            if(offset < channelCount * 0x40)
             {
                 var channel = channels[offset / 0x40];
                 switch(RegisterKind(offset))
                 {
                 case 0: return channel.ReadAddress;
                 case 1: return channel.WriteAddress;
-                case 2: return channel.Remaining;
-                case 3: return channel.Control | (channel.Busy ? Busy : 0) | channel.Errors | (channel.Errors != 0 ? 0x80000000u : 0);
+                case 2: return rp2350 ? (channel.Reload & ModeMask) | channel.Remaining : channel.Remaining;
+                case 3: return channel.Control | (channel.Busy ? busyBit : 0) | channel.Errors | (channel.Errors != 0 ? 0x80000000u : 0);
                 }
             }
-            if(offset >= 0x800 && offset < 0x800 + ChannelCount * 0x40)
+            if(offset >= 0x800 && offset < 0x800 + channelCount * 0x40)
             {
                 var channel = channels[(offset - 0x800) / 0x40];
+                var treq = Treq(channel);
                 if((offset & 0x3f) == 4) return channel.Reload;
-                if((offset & 0x3f) == 0) return (uint)(channel.Treq >= 59 && channel.Treq < 63 ? channel.TimerCredit : RequestAvailable(channel) ? 1 : 0);
+                if((offset & 0x3f) == 0) return (uint)(treq >= 59 && treq < 63 ? channel.TimerCredit : RequestAvailable(channel) ? 1 : 0);
                 return 0;
             }
-            if(offset >= 0x420 && offset < 0x430) return pacing[(offset - 0x420) / 4];
-            switch(offset)
+            if(offset >= 0x400 && offset < 0x400 + 0x10 * irqCount)
             {
-            case 0x400: return rawInterrupts;
-            case 0x404: return irqEnable[0];
-            case 0x408: return irqForce[0];
-            case 0x40c: return InterruptStatus(0);
-            case 0x414: return irqEnable[1];
-            case 0x418: return irqForce[1];
-            case 0x41c: return InterruptStatus(1);
-            case 0x434: return sniffControl;
-            case 0x438:
+                var index = (int)((offset - 0x400) / 0x10);
+                switch(offset & 0xf)
+                {
+                // INTR; the RP2350's INTR1-3 alias it.
+                case 0: return index == 0 || rp2350 ? rawInterrupts : 0;
+                case 4: return irqEnable[index];
+                case 8: return irqForce[index];
+                default: return InterruptStatus(index);
+                }
+            }
+            if(offset >= timerBase && offset < timerBase + 0x10) return pacing[(offset - timerBase) / 4];
+            if(rp2350 && securityRegisters.TryGetValue(offset, out var security)) return security;
+            if(offset == multiTriggerOffset + 4) return sniffControl;
+            if(offset == multiTriggerOffset + 8)
+            {
                 var value = (sniffControl & (1u << 10)) != 0 ? Reverse(sniffData) : sniffData;
                 return (sniffControl & (1u << 11)) != 0 ? ~value : value;
-            case 0x440: return pending == null ? 0 : 0x101u;
-            case 0x444:
+            }
+            if(offset == fifoLevelsOffset) return pending == null ? 0 : 0x101u;
+            if(offset == fifoLevelsOffset + 4)
+            {
                 uint aborts = 0;
                 foreach(var channel in channels) if(channel.Aborting) aborts |= 1u << channel.Index;
                 return aborts;
-            case 0x448: return ChannelCount;
-            default: return 0;
             }
+            if(offset == fifoLevelsOffset + 8) return (uint)channelCount;
+            return 0;
         }
 
         protected override void WriteRegister(long offset, uint value, AtomicOperation operation)
         {
             UpdatePacing();
-            if(offset < ChannelCount * 0x40)
+            if(offset < channelCount * 0x40)
             {
                 var channel = channels[offset / 0x40];
                 switch(RegisterKind(offset))
@@ -133,7 +172,7 @@ namespace Antmicro.Renode.Peripherals.DMA
                 case 1: channel.WriteAddress = ApplyOperation(channel.WriteAddress, value, operation); break;
                 case 2: channel.Reload = ApplyOperation(channel.Reload, value, operation); break;
                 case 3:
-                    channel.Control = ApplyOperation(channel.Control, value, operation, ControlMask);
+                    channel.Control = ApplyOperation(channel.Control, value, operation, controlMask);
                     channel.Errors &= ~(value & ErrorMask);
                     break;
                 }
@@ -141,38 +180,47 @@ namespace Antmicro.Renode.Peripherals.DMA
                 {
                     if(value == 0)
                     {
-                        if((channel.Control & Quiet) != 0) rawInterrupts |= 1u << channel.Index;
+                        if((channel.Control & quietBit) != 0) rawInterrupts |= 1u << channel.Index;
                     }
                     else Trigger(channel);
                 }
             }
-            else if(offset >= 0x420 && offset < 0x430)
+            else if(offset >= timerBase && offset < timerBase + 0x10)
             {
-                var index = (int)((offset - 0x420) / 4);
+                var index = (int)((offset - timerBase) / 4);
                 pacing[index] = ApplyOperation(pacing[index], value, operation);
                 pacingPhase[index] = 0;
             }
-            else if(offset >= 0x800 && offset < 0x800 + ChannelCount * 0x40 && (offset & 0x3f) == 0)
+            else if(offset >= 0x800 && offset < 0x800 + channelCount * 0x40 && (offset & 0x3f) == 0)
             {
                 channels[(offset - 0x800) / 0x40].TimerCredit = 0;
             }
+            else if(offset >= 0x400 && offset < 0x400 + 0x10 * irqCount)
+            {
+                var index = (int)((offset - 0x400) / 0x10);
+                switch(offset & 0xf)
+                {
+                case 4: irqEnable[index] = ApplyOperation(irqEnable[index], value, operation, channelMask); break;
+                case 8: irqForce[index] = ApplyOperation(irqForce[index], value, operation, channelMask); break;
+                default:
+                    if((offset & 0xf) != 0 || index == 0 || rp2350) rawInterrupts &= ~(value & channelMask);
+                    break;
+                }
+            }
+            else if(rp2350 && securityRegisters.ContainsKey(offset))
+            {
+                securityRegisters[offset] = ApplyOperation(securityRegisters[offset], value, operation);
+            }
             else
             {
-                switch(offset)
+                if(offset == multiTriggerOffset)
                 {
-                case 0x400: rawInterrupts &= ~(value & ChannelMask); break;
-                case 0x404: irqEnable[0] = ApplyOperation(irqEnable[0], value, operation, ChannelMask); break;
-                case 0x408: irqForce[0] = ApplyOperation(irqForce[0], value, operation, ChannelMask); break;
-                case 0x40c: rawInterrupts &= ~(value & ChannelMask); break;
-                case 0x414: irqEnable[1] = ApplyOperation(irqEnable[1], value, operation, ChannelMask); break;
-                case 0x418: irqForce[1] = ApplyOperation(irqForce[1], value, operation, ChannelMask); break;
-                case 0x41c: rawInterrupts &= ~(value & ChannelMask); break;
-                case 0x430:
                     foreach(var channel in channels) if((value & (1u << channel.Index)) != 0) Trigger(channel);
-                    break;
-                case 0x434: sniffControl = ApplyOperation(sniffControl, value, operation, 0xfff); break;
-                case 0x438: sniffData = ApplyOperation(sniffData, value, operation); break;
-                case 0x444:
+                }
+                else if(offset == multiTriggerOffset + 4) sniffControl = ApplyOperation(sniffControl, value, operation, 0xfff);
+                else if(offset == multiTriggerOffset + 8) sniffData = ApplyOperation(sniffData, value, operation);
+                else if(offset == fifoLevelsOffset + 4)
+                {
                     foreach(var channel in channels)
                     {
                         if((value & (1u << channel.Index)) == 0) continue;
@@ -185,7 +233,6 @@ namespace Antmicro.Renode.Peripherals.DMA
                         channel.Busy = channel.Aborting;
                         if(!channel.Aborting) channel.Generation++;
                     }
-                    break;
                 }
             }
             UpdateInterrupts();
@@ -214,18 +261,37 @@ namespace Antmicro.Renode.Peripherals.DMA
                     channel.Busy = channel.Aborting = false;
                     channel.TimerCredit = 0;
                 }
+                if(rp2350) ResetSecurityRegisters();
                 UpdateInterrupts();
             }
+        }
+
+        // SECCFG_CH0-15, SECCFG_IRQ0-3 and SECCFG_MISC reset to secure and
+        // privileged; MPU_CTRL and the eight MPU region registers reset to 0.
+        private void ResetSecurityRegisters()
+        {
+            securityRegisters.Clear();
+            for(var i = 0; i < 16; i++) securityRegisters[0x480 + 4 * i] = 3;
+            for(var i = 0; i < 4; i++) securityRegisters[0x4c0 + 4 * i] = 3;
+            securityRegisters[0x4d0] = 0x3ff;
+            for(var i = 0; i <= 16; i++) securityRegisters[0x500 + 4 * i] = 0;
         }
 
         private void Trigger(Channel channel)
         {
             if(channel.Busy || (channel.Control & 1) == 0) return;
-            channel.Remaining = channel.Reload;
+            channel.Remaining = rp2350 ? channel.Reload & ~ModeMask : channel.Reload;
             channel.TimerCredit = 0;
-            channel.Busy = channel.Remaining != 0;
+            channel.Busy = channel.Remaining != 0 || Endless(channel);
             channel.Generation++;
         }
+
+        // RP2350 TRANS_COUNT.MODE: 1 re-triggers the channel when its count
+        // runs out; 15 never decrements the count.
+        private bool Endless(Channel channel) => rp2350 && (channel.Reload >> 28) == 0xf;
+        private bool TriggersSelf(Channel channel) => rp2350 && (channel.Reload >> 28) == 1;
+
+        private int Treq(Channel channel) => (int)((channel.Control >> treqShift) & 63);
 
         private void Tick()
         {
@@ -246,7 +312,8 @@ namespace Antmicro.Renode.Peripherals.DMA
                     transfer = new Transfer { Channel = channel, Generation = channel.Generation,
                         ReadAddress = channel.ReadAddress, WriteAddress = channel.WriteAddress,
                         Control = channel.Control, Bytes = size == 3 ? 0 : 1 << size };
-                    if(channel.Treq >= 59 && channel.Treq < 63) channel.TimerCredit--;
+                    var treq = Treq(channel);
+                    if(treq >= 59 && treq < 63) channel.TimerCredit--;
                     pending = transfer;
                 }
                 executing = true;
@@ -278,25 +345,26 @@ namespace Antmicro.Renode.Peripherals.DMA
                         else if(write)
                         {
                             channel.WriteAddress = Increment(transfer.WriteAddress, transfer.Control, transfer.Bytes, true);
-                            if(!channel.Aborting) channel.Remaining--;
+                            if(!channel.Aborting && !Endless(channel)) channel.Remaining--;
                             pending = null;
                             if(channel.Aborting)
                             {
                                 channel.Busy = channel.Aborting = false;
-                                if((channel.Control & Quiet) == 0) rawInterrupts |= 1u << channel.Index;
+                                if((channel.Control & quietBit) == 0) rawInterrupts |= 1u << channel.Index;
                             }
-                            else if(channel.Remaining == 0)
+                            else if(channel.Remaining == 0 && !Endless(channel))
                             {
                                 channel.Busy = false;
-                                if((channel.Control & Quiet) == 0) rawInterrupts |= 1u << channel.Index;
-                                var chain = (int)((channel.Control >> 11) & 15);
-                                if(chain < ChannelCount && chain != channel.Index) Trigger(channels[chain]);
+                                if((channel.Control & quietBit) == 0) rawInterrupts |= 1u << channel.Index;
+                                var chain = (int)((channel.Control >> chainShift) & 15);
+                                if(chain < channelCount && chain != channel.Index) Trigger(channels[chain]);
+                                if(TriggersSelf(channel)) Trigger(channel);
                             }
                         }
                         else
                         {
                             channel.ReadAddress = Increment(transfer.ReadAddress, transfer.Control, transfer.Bytes, false);
-                            if((transfer.Control & (1u << 22)) != 0) transfer.Data = ByteSwap(transfer.Data, transfer.Bytes);
+                            if((transfer.Control & byteSwapBit) != 0) transfer.Data = ByteSwap(transfer.Data, transfer.Bytes);
                             Sniff(transfer);
                         }
                     }
@@ -342,22 +410,22 @@ namespace Antmicro.Renode.Peripherals.DMA
             // priority channel gets a turn. Both groups rotate independently.
             for(var pass = 0; pass < 2; pass++)
             {
-                for(var i = 0; i < ChannelCount; i++)
+                for(var i = 0; i < channelCount; i++)
                 {
-                    var index = (highCursor + i) % ChannelCount;
+                    var index = (highCursor + i) % channelCount;
                     var channel = channels[index];
                     if((highServed & (1u << index)) != 0 || (channel.Control & 2) == 0 || !Ready(channel)) continue;
                     highServed |= 1u << index;
-                    highCursor = (index + 1) % ChannelCount;
+                    highCursor = (index + 1) % channelCount;
                     return channel;
                 }
                 highServed = 0;
-                for(var i = 0; i < ChannelCount; i++)
+                for(var i = 0; i < channelCount; i++)
                 {
-                    var index = (lowCursor + i) % ChannelCount;
+                    var index = (lowCursor + i) % channelCount;
                     var channel = channels[index];
                     if((channel.Control & 2) != 0 || !Ready(channel)) continue;
-                    lowCursor = (index + 1) % ChannelCount;
+                    lowCursor = (index + 1) % channelCount;
                     return channel;
                 }
             }
@@ -365,7 +433,11 @@ namespace Antmicro.Renode.Peripherals.DMA
         }
 
         private bool Ready(Channel channel) => channel.Busy && !channel.Aborting && (channel.Control & 1) != 0 && RequestAvailable(channel);
-        private bool RequestAvailable(Channel channel) => channel.Treq == 63 || (channel.Treq < 59 ? requests[channel.Treq] : channel.TimerCredit != 0);
+        private bool RequestAvailable(Channel channel)
+        {
+            var treq = Treq(channel);
+            return treq == 63 || (treq < 59 ? requests[treq] : channel.TimerCredit != 0);
+        }
 
         private void Schedule()
         {
@@ -376,8 +448,9 @@ namespace Antmicro.Renode.Peripherals.DMA
             {
                 if(!channel.Busy || (channel.Control & 1) == 0) continue;
                 if(RequestAvailable(channel)) { delay = 1; break; }
-                if(channel.Treq < 59 || channel.Treq >= 63) continue;
-                var index = channel.Treq - 59;
+                var treq = Treq(channel);
+                if(treq < 59 || treq >= 63) continue;
+                var index = treq - 59;
                 var x = pacing[index] >> 16;
                 var y = pacing[index] & 0xffff;
                 if(x == 0 || y == 0) continue;
@@ -419,7 +492,7 @@ namespace Antmicro.Renode.Peripherals.DMA
                 pacingPhase[index] = (ulong)(total % y);
                 foreach(var channel in channels)
                 {
-                    if(channel.Busy && (channel.Control & 1) != 0 && channel.Treq == index + 59)
+                    if(channel.Busy && (channel.Control & 1) != 0 && Treq(channel) == index + 59)
                         channel.TimerCredit = (int)BigInteger.Min(63, channel.TimerCredit + pulses);
                 }
             }
@@ -448,7 +521,7 @@ namespace Antmicro.Renode.Peripherals.DMA
 
         private void Sniff(Transfer transfer)
         {
-            if((sniffControl & 1) == 0 || ((sniffControl >> 1) & 15) != transfer.Channel.Index || (transfer.Control & (1u << 23)) == 0) return;
+            if((sniffControl & 1) == 0 || ((sniffControl >> 1) & 15) != transfer.Channel.Index || (transfer.Control & sniffBit) == 0) return;
             var data = (sniffControl & (1u << 9)) != 0 ? ByteSwap(transfer.Data, transfer.Bytes) : transfer.Data;
             var calculation = (sniffControl >> 5) & 15;
             if(calculation == 15) { sniffData = unchecked(sniffData + data); return; }
@@ -471,12 +544,16 @@ namespace Antmicro.Renode.Peripherals.DMA
             }
         }
 
-        private static uint Increment(uint address, uint control, int bytes, bool write)
+        // INCR_READ is CTRL bit 4 on both chips; INCR_WRITE follows it, after the
+        // RP2350's INCR_READ_REV. On the RP2350 the bit above each INCR bit
+        // makes it a decrement.
+        private uint Increment(uint address, uint control, int bytes, bool write)
         {
-            if((control & (write ? 0x20u : 0x10u)) == 0) return address;
-            var next = unchecked(address + (uint)bytes);
-            var ring = (int)((control >> 6) & 15);
-            if(ring == 0 || ((control & (1u << 10)) != 0) != write) return next;
+            var bit = write ? incrementWriteBit : 0x10u;
+            if((control & bit) == 0) return address;
+            var next = rp2350 && (control & (bit << 1)) != 0 ? unchecked(address - (uint)bytes) : unchecked(address + (uint)bytes);
+            var ring = (int)((control >> ringShift) & 15);
+            if(ring == 0 || ((control & ringSelectBit) != 0) != write) return next;
             var mask = (1u << ring) - 1;
             return (address & ~mask) | (next & mask);
         }
@@ -508,7 +585,7 @@ namespace Antmicro.Renode.Peripherals.DMA
 
         private void UpdateInterrupts()
         {
-            for(var i = 0; i < 2; i++)
+            for(var i = 0; i < irqCount; i++)
             {
                 var state = InterruptStatus(i) != 0;
                 if(state == irqState[i]) continue;
@@ -535,7 +612,7 @@ namespace Antmicro.Renode.Peripherals.DMA
                         if(notifications.Count == 0) { publishing = false; return; }
                         notification = notifications.Dequeue();
                     }
-                    (notification.Index == 0 ? IRQ0 : IRQ1).Set(notification.State);
+                    irqOutputs[notification.Index].Set(notification.State);
                 }
             }
             catch
@@ -571,7 +648,6 @@ namespace Antmicro.Renode.Peripherals.DMA
         private sealed class Channel
         {
             public Channel(int index) { Index = index; }
-            public int Treq => (int)((Control >> 15) & 63);
             public readonly int Index;
             public uint ReadAddress, WriteAddress, Reload, Remaining, Control, Errors;
             public ulong Generation;
@@ -589,11 +665,17 @@ namespace Antmicro.Renode.Peripherals.DMA
 
         private struct Notification { public int Index; public bool State; }
 
-        private readonly Channel[] channels = new Channel[ChannelCount];
+        private readonly Channel[] channels;
         private readonly bool[] requests = new bool[59];
-        private readonly uint[] irqEnable = new uint[2], irqForce = new uint[2], pacing = new uint[4];
+        private readonly uint[] irqEnable, irqForce, pacing = new uint[4];
         private readonly ulong[] pacingPhase = new ulong[4];
-        private readonly bool[] irqState = new bool[2];
+        private readonly bool[] irqState;
+        private readonly GPIO[] irqOutputs;
+        private readonly Dictionary<long, uint> securityRegisters = new Dictionary<long, uint>();
+        private readonly bool rp2350;
+        private readonly int channelCount, irqCount, treqShift, chainShift, ringShift;
+        private readonly uint channelMask, controlMask, busyBit, quietBit, byteSwapBit, sniffBit, ringSelectBit, incrementWriteBit;
+        private readonly long timerBase, multiTriggerOffset, fifoLevelsOffset;
         private readonly Queue<Notification> notifications = new Queue<Notification>();
         private readonly PhasedTimer timer, cycleCounter;
         private readonly IRP2ClockSource clocks;
@@ -603,11 +685,7 @@ namespace Antmicro.Renode.Peripherals.DMA
         private int lowCursor, highCursor;
         private bool scheduled, executing, publishing;
 
-        private const int ChannelCount = 12;
-        private const uint ChannelMask = (1u << ChannelCount) - 1;
-        private const uint ControlMask = 0xffffff;
         private const uint ErrorMask = 0x60000000;
-        private const uint Busy = 1u << 24;
-        private const uint Quiet = 1u << 21;
+        private const uint ModeMask = 0xf0000000;
     }
 }
