@@ -114,19 +114,19 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
             }
         }
 
-        // Whether a memory-mapped read sends mode bits that can change the
-        // flash's continuous read state: a quad I/O read (EBh) with an 8-bit
-        // suffix, either with its command prefix or, in continuous read, with
-        // a suffix other than Axh.
+        // Whether a memory-mapped read sends mode bits that change the flash's
+        // continuous read state: a quad I/O read (EBh) with an 8-bit suffix
+        // that enters continuous read (Axh after the command) or leaves it
+        // (anything else without the command).
         public bool ReadsChangeFlashMode
         {
             get
             {
                 var format = memoryConfiguration[1];
                 if(!FlashReadConfigured || ((format >> 14) & 3) != 2) return false;
-                var suffix = (memoryConfiguration[2] >> 8) & 0xff;
-                if((format & 0x1000) != 0) return (memoryConfiguration[2] & 0xff) == 0xeb;
-                return (suffix & 0xf0) != 0xa0;
+                var entersContinuousRead = ((memoryConfiguration[2] >> 8) & 0xf0) == 0xa0;
+                if((format & 0x1000) != 0) return (memoryConfiguration[2] & 0xff) == 0xeb && entersContinuousRead;
+                return !entersContinuousRead;
             }
         }
 
