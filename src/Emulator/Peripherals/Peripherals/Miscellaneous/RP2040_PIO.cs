@@ -19,13 +19,18 @@ using Antmicro.Renode.Time;
 namespace Antmicro.Renode.Peripherals.Miscellaneous
 {
     // RP2040 PIO v0. SMs execute the shared instruction memory; FIFOs and
-    // instruction stalls are independent for each machine.
+    // instruction stalls are independent for each machine. With rp2350 set it
+    // is an RP2350 PIO v1 block: GPIOBASE relocates the 32 PIO pins (WAIT GPIO
+    // included) to GPIO 16-47, and the v1 register map, IN_COUNT, STATUS_SEL,
+    // MOV PINDIRS and WAIT JMPPIN apply. IRQ PREV/NEXT and the RX FIFO
+    // random-access MOV and PUTGET registers are not modelled.
     public sealed class RP2040_PIO : RP2APBPeripheral, INumberedGPIOOutput
     {
         public RP2040_PIO(IMachine machine, RP2_GPIOBank0 gpio, IRP2ClockSource clocks = null,
-            int pioId = 0, ulong frequency = 125000000) : base(machine)
+            int pioId = 0, ulong frequency = 125000000, bool rp2350 = false) : base(machine)
         {
-            if(pioId < 0 || pioId > 1) throw new ConstructionException("RP2040 has two PIO blocks");
+            if(pioId < 0 || pioId > (rp2350 ? 2 : 1)) throw new ConstructionException(rp2350 ? "RP2350 has three PIO blocks" : "RP2040 has two PIO blocks");
+            this.rp2350 = rp2350;
             this.gpio = gpio;
             this.clocks = clocks;
             function = 6 + pioId;
@@ -78,6 +83,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 inputSyncBypass = 0;
                 output = 0;
                 outputEnable = 0;
+                Rebase(0);
                 Array.Clear(instructions, 0, instructions.Length);
                 Array.Clear(irqEnable, 0, irqEnable.Length);
                 Array.Clear(irqForce, 0, irqForce.Length);
@@ -115,6 +121,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         protected override uint ReadRegister(long offset)
         {
+            if(rp2350)
+            {
+                if(offset >= 0x128 && offset < 0x168) return 0;
+                if(offset == 0x168) return (uint)gpioBase;
+                if(offset >= 0x16c && offset < 0x188) offset -= V1InterruptOffset;
+            }
             if(offset >= 0x20 && offset < 0x30)
             {
                 var sm = stateMachines[(offset - 0x20) / 4];
@@ -174,7 +186,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             case 0x38: return inputSyncBypass;
             case 0x3c: return output;
             case 0x40: return outputEnable;
-            case 0x44: return 0x00200404;
+            case 0x44: return rp2350 ? 0x10200404u : 0x00200404u;
             case 0x128: return InterruptStatus;
             }
             // Instruction memory and TX FIFOs are write-only.
@@ -185,6 +197,21 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         protected override void WriteRegister(long offset, uint value, AtomicOperation operation)
         {
+            if(rp2350)
+            {
+                if(offset >= 0x128 && offset < 0x168)
+                {
+                    WarnOnce("RXF PUTGET registers are not modelled");
+                    return;
+                }
+                if(offset == 0x168)
+                {
+                    Rebase((int)(ApplyOperation((uint)gpioBase, value, operation) & 0x10));
+                    WakeAll();
+                    return;
+                }
+                if(offset >= 0x16c && offset < 0x188) offset -= V1InterruptOffset;
+            }
             if(offset >= 0x10 && offset < 0x20)
             {
                 var sm = stateMachines[(offset - 0x10) / 4];
@@ -215,7 +242,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     Reschedule(sm);
                     break;
                 case 4:
-                    sm.ExecControl = ApplyOperation(sm.ExecControl, value, operation, 0x7fffff9f);
+                    sm.ExecControl = ApplyOperation(sm.ExecControl, value, operation, rp2350 ? 0x7fffffffu : 0x7fffff9fu);
                     if(sm.JumpLoop) ClearExecution(sm);
                     Reschedule(sm);
                     BeginPinCycle();
@@ -223,7 +250,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     break;
                 case 8:
                     var previous = sm.ShiftControl;
-                    sm.ShiftControl = ApplyOperation(previous, value, operation, 0xffff0000);
+                    sm.ShiftControl = ApplyOperation(previous, value, operation, rp2350 ? 0xffffc01fu : 0xffff0000u);
                     if(((previous ^ sm.ShiftControl) & 0xc0000000) != 0)
                     {
                         sm.Tx.Clear();
@@ -256,8 +283,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 var index = (int)((offset - 0x12c) / 12);
                 switch((offset - 0x12c) % 12)
                 {
-                case 0: irqEnable[index] = ApplyOperation(irqEnable[index], value, operation, 0xfff); break;
-                case 4: irqForce[index] = ApplyOperation(irqForce[index], value, operation, 0xfff); break;
+                case 0: irqEnable[index] = ApplyOperation(irqEnable[index], value, operation, rp2350 ? 0xffffu : 0xfffu); break;
+                case 4: irqForce[index] = ApplyOperation(irqForce[index], value, operation, rp2350 ? 0xffffu : 0xfffu); break;
                 }
                 UpdateSignals();
                 return;
@@ -418,7 +445,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     input = (ReadIRQFlags() & mask) != 0;
                     if(input && polarity) ClearIRQ(mask);
                 }
-                else input = false;
+                else input = rp2350 && ReadInput(JumpPinWait(sm, index));
                 complete = input == polarity;
                 break;
             case 2: // IN
@@ -458,6 +485,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 if(AutoPull(sm) && sm.OutputCount >= PullThreshold(sm)) TryPull(sm);
                 break;
             case 4: // PUSH / PULL
+                if(rp2350 && (argument & 0x10) != 0)
+                {
+                    WarnOnce("MOV to or from RX FIFO entries is not modelled");
+                    break;
+                }
                 if((argument & 0x80) != 0)
                 {
                     if((AutoPull(sm) || (argument & 0x40) != 0) && sm.OutputCount < PullThreshold(sm)) break;
@@ -488,6 +520,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 case 0: SetPins(sm, OutBase(sm), OutCount(sm), moved, false); break;
                 case 1: sm.X = moved; break;
                 case 2: sm.Y = moved; break;
+                case 3: if(rp2350) SetPins(sm, OutBase(sm), OutCount(sm), moved, true); break;
                 case 4: sm.Exec = (ushort)moved; break;
                 case 5: nextPC = (int)(moved & 31); jump = true; break;
                 case 6: sm.ISR = moved; sm.InputCount = 0; break;
@@ -495,6 +528,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 }
                 break;
             case 6: // IRQ
+                if(rp2350 && (argument & 8) != 0) WarnOnce("IRQ PREV/NEXT targets other PIO blocks, which is not modelled; using this block's flag");
                 var irqMask = 1u << IrqIndex(sm, argument & 31);
                 if((argument & 0x40) != 0) ClearIRQ(irqMask);
                 else if((argument & 0x20) == 0) SetIRQ(irqMask);
@@ -560,12 +594,22 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             case 0:
                 uint pins = 0;
                 var now = cycleCounter.Value;
+                // RP2350 SHIFTCTRL.IN_COUNT masks the pins IN and MOV read (0 is 32).
+                if(rp2350) pinCount = Math.Min(pinCount, Threshold((int)(sm.ShiftControl & 31)));
                 for(var bit = 0; bit < pinCount; bit++) if(ReadInput((InBase(sm) + bit) & 31, now)) pins |= 1u << bit;
                 return pins;
             case 1: return sm.X;
             case 2: return sm.Y;
             case 3: return 0;
             case 5:
+                if(rp2350)
+                {
+                    // EXECCTRL.STATUS_SEL (6:5): TX level, RX level or IRQ flag STATUS_N (4:0).
+                    var selection = (sm.ExecControl >> 5) & 3;
+                    var n = (int)(sm.ExecControl & 31);
+                    if(selection == 2) return (ReadIRQFlags() & (1u << IrqIndex(sm, n))) != 0 ? uint.MaxValue : 0;
+                    return (selection == 1 ? sm.Rx.Count : sm.Tx.Count) < n ? uint.MaxValue : 0;
+                }
                 var level = (sm.ExecControl & (1u << 4)) != 0 ? sm.Rx.Count : sm.Tx.Count;
                 return level < (sm.ExecControl & 15) ? uint.MaxValue : 0;
             case 6: return sm.ISR;
@@ -737,7 +781,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private void QueuePin(int pin)
         {
-            notifications.Enqueue(new Notification { Pin = pin, Value = (output & (1u << pin)) != 0,
+            notifications.Enqueue(new Notification { Pin = pin + gpioBase, Value = (output & (1u << pin)) != 0,
                 Enabled = (outputEnable & (1u << pin)) != 0, IsPin = true });
         }
 
@@ -756,7 +800,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         {
             get
             {
-                uint result = (irqFlags & 15) << 8;
+                uint result = (irqFlags & (rp2350 ? 0xffu : 15u)) << 8;
                 foreach(var sm in stateMachines)
                 {
                     if(sm.Rx.Count != 0) result |= 1u << sm.Index;
@@ -808,13 +852,47 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         {
             var history = inputHistory[pin];
             while(history.Count != 0 && history.Peek().Tick <= now) synchronizedInput[pin] = history.Dequeue().Value;
-            return (inputSyncBypass & (1u << pin)) != 0 ? gpio.GetInput(pin) : synchronizedInput[pin];
+            return (inputSyncBypass & (1u << pin)) != 0 ? gpio.GetInput(pin + gpioBase) : synchronizedInput[pin];
         }
 
-        private void OnInputChanged(int pin, bool level)
+        private void OnInputChanged(int gpioPin, bool level)
         {
-            if(pin >= 32) return;
-            machine.ClockSource.ExecuteInLock(() => UpdateInput(pin, level));
+            machine.ClockSource.ExecuteInLock(() =>
+            {
+                // GPIOBASE is read under the clock lock, as Rebase changes it.
+                var pin = gpioPin - gpioBase;
+                if(pin >= 0 && pin < 32) UpdateInput(pin, level);
+            });
+        }
+
+        // GPIOBASE: PIO pin n is GPIO n + base. Moving the window releases the
+        // old pins and samples the new ones without input synchronizer delay.
+        private void Rebase(int newBase)
+        {
+            lock(SyncRoot)
+            {
+                if(newBase != gpioBase)
+                {
+                    for(var pin = 0; pin < 32; pin++)
+                    {
+                        notifications.Enqueue(new Notification { Pin = pin + gpioBase, IsPin = true });
+                    }
+                    gpioBase = newBase;
+                }
+                for(var pin = 0; pin < 32; pin++)
+                {
+                    inputHistory[pin].Clear();
+                    synchronizedInput[pin] = gpio.GetInput(pin + gpioBase);
+                    QueuePin(pin);
+                }
+            }
+        }
+
+        private static int JumpPinWait(StateMachine sm, int index) => ((int)((sm.ExecControl >> 24) & 31) + (index & 3)) & 31;
+
+        private void WarnOnce(string message)
+        {
+            if(warned.Add(message)) this.Log(LogLevel.Warning, message);
         }
 
         private void UpdateInput(int pin, bool level)
@@ -835,11 +913,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
         }
 
-        private static int InputDependency(StateMachine sm)
+        private int InputDependency(StateMachine sm)
         {
             if(sm.JumpLoop) return ((sm.Instruction >> 5) & 7) == 6 ? (int)((sm.ExecControl >> 24) & 31) : -1;
             if((sm.Instruction >> 13) != 1) return -1;
             var source = (sm.Instruction >> 5) & 3;
+            if(source == 3 && rp2350) return JumpPinWait(sm, sm.Instruction & 31);
             if(source > 1) return -1;
             return source == 0 ? sm.Instruction & 31 : (InBase(sm) + (sm.Instruction & 31)) & 31;
         }
@@ -1102,6 +1181,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private readonly IRP2ClockSource clocks;
         private readonly LimitTimer cycleCounter;
         private readonly int function;
+        private readonly bool rp2350;
+        private readonly HashSet<string> warned = new HashSet<string>();
+        private int gpioBase;
+        // RP2350 moves INTR and IRQ0/IRQ1 INTE/INTF/INTS from 0x128 to 0x16c.
+        private const long V1InterruptOffset = 0x44;
         private uint control, debug, irqFlags, inputSyncBypass, output, outputEnable;
         private ulong frequency;
         private bool publishing;
