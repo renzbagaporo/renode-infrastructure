@@ -39,7 +39,7 @@ namespace Antmicro.Renode.PeripheralsTests
             gpio.WriteDoubleWord(4, 6); // GPIO0 FUNCSEL = PIO0
             pio.WriteDoubleWord(0xdc, 1u << 26); // PINCTRL: SET_BASE 0, SET_COUNT 1
             Load(0xa042, 0xa042, 0xa042, 0x0000); // three nops, jmp 0
-            pio.WriteDoubleWord(0, 1);
+            pio.WriteDoubleWord(0, 3); // SM0 and SM1 run the loop
             Advance(10);
             using(var entered = new ManualResetEventSlim())
             using(var release = new ManualResetEventSlim())
@@ -56,8 +56,14 @@ namespace Antmicro.Renode.PeripheralsTests
                 var delivery = Task.Run(() => Force(0, 0xe081));
                 Assert.IsTrue(entered.Wait(TimeSpan.FromSeconds(5)), "The pin change was not delivered");
                 var pc = pio.ReadDoubleWord(0xd4);
-                Advance(20);
+                var otherPcs = new HashSet<uint>();
+                for(var i = 0; i < 8; i++)
+                {
+                    Advance(3);
+                    otherPcs.Add(pio.ReadDoubleWord(0xec));
+                }
                 Assert.AreEqual(pc, pio.ReadDoubleWord(0xd4), "The machine ran ahead of an undelivered pin change");
+                Assert.Greater(otherPcs.Count, 1, "A machine without undelivered pin changes was held");
                 release.Set();
                 Assert.IsTrue(delivery.Wait(TimeSpan.FromSeconds(5)));
                 var held = pio.ReadDoubleWord(0xd4);

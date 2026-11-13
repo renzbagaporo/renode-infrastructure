@@ -338,29 +338,24 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             lock(SyncRoot)
             {
                 var now = cycleCounter.Value;
-                if(undeliveredPinChanges != 0)
+                foreach(var sm in stateMachines)
                 {
-                    // Pin changes from an earlier cycle have not reached the GPIO
-                    // yet, typically because another thread is still delivering
-                    // them to a device that answers synchronously (an SWD target).
-                    // Running on would sample that device's inputs before it saw
-                    // them. Hold every due machine for one cycle instead, shifting
-                    // its clock phase so its own instruction timing is kept.
-                    foreach(var sm in stateMachines)
-                    {
-                        if(!sm.Scheduled || sm.DueTick > now) continue;
-                        sm.Edge256 += 256;
-                        sm.DueTick = now + 1;
-                        sm.Timer.Enabled = false;
-                        sm.Timer.Limit = 1;
-                        sm.Timer.ResetValue();
-                        sm.Timer.Enabled = true;
-                    }
+                    // A machine whose own pin changes from an earlier cycle have not
+                    // reached the GPIO yet, typically because another thread is still
+                    // delivering them to a device that answers synchronously (an SWD
+                    // target), would sample that device's inputs before it saw them.
+                    // Hold it for one cycle, shifting its clock phase so its own
+                    // instruction timing is kept. Other machines, which may be paced
+                    // by external inputs, keep running.
+                    if(sm.UndeliveredPinChanges == 0 || !sm.Scheduled || sm.DueTick > now) continue;
+                    sm.Edge256 += 256;
+                    sm.DueTick = now + 1;
+                    sm.Timer.Enabled = false;
+                    sm.Timer.Limit = 1;
+                    sm.Timer.ResetValue();
+                    sm.Timer.Enabled = true;
                 }
-                else
-                {
-                    ExecuteCycle(now);
-                }
+                ExecuteCycle(now);
             }
             PublishPending();
         }
@@ -753,7 +748,17 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 outputEnable = (outputEnable & ~sm.DirectionMask) | (sm.DirectionValue & sm.DirectionMask);
             }
             var changed = (previousOutput ^ output) | (previousEnable ^ outputEnable);
-            for(var pin = 0; pin < 32; pin++) if((changed & (1u << pin)) != 0) QueuePin(pin);
+            for(var pin = 0; pin < 32; pin++)
+            {
+                if((changed & (1u << pin)) == 0) continue;
+                var owners = 0u;
+                foreach(var sm in stateMachines)
+                {
+                    var stickyMask = (sm.ExecControl & (1u << 17)) != 0 ? sm.StickyMask : 0;
+                    if(((stickyMask | sm.WriteMask | sm.DirectionMask) & (1u << pin)) != 0) owners |= 1u << sm.Index;
+                }
+                QueuePin(pin, owners);
+            }
             foreach(var sm in stateMachines)
             {
                 if(!HasStalledSideSet(sm)) continue;
@@ -808,11 +813,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             return edge >= 0 && edge / 256 == tick;
         }
 
-        private void QueuePin(int pin)
+        // Owners are the state machines whose writes made the change; each is held
+        // until the change is delivered.
+        private void QueuePin(int pin, uint owners = 0)
         {
             notifications.Enqueue(new Notification { Pin = pin + gpioBase, Value = (output & (1u << pin)) != 0,
-                Enabled = (outputEnable & (1u << pin)) != 0, IsPin = true });
-            undeliveredPinChanges++;
+                Enabled = (outputEnable & (1u << pin)) != 0, IsPin = true, Owners = owners });
+            foreach(var sm in stateMachines) if((owners & (1u << sm.Index)) != 0) sm.UndeliveredPinChanges++;
         }
 
         private void UpdateSignals()
@@ -868,7 +875,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     if(notification.IsPin)
                     {
                         gpio.SetPeripheralOutput(function, notification.Pin, notification.Value, notification.Enabled);
-                        lock(SyncRoot) undeliveredPinChanges--;
+                        if(notification.Owners != 0)
+                        {
+                            lock(SyncRoot)
+                            {
+                                foreach(var sm in stateMachines) if((notification.Owners & (1u << sm.Index)) != 0) sm.UndeliveredPinChanges--;
+                            }
+                        }
                     }
                     else Connections[notification.Pin].Set(notification.Value);
                 }
@@ -910,7 +923,6 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     for(var pin = 0; pin < 32; pin++)
                     {
                         notifications.Enqueue(new Notification { Pin = pin + gpioBase, IsPin = true });
-                        undeliveredPinChanges++;
                     }
                     gpioBase = newBase;
                 }
@@ -1184,6 +1196,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             public uint X, Y, OSR, ISR, LastRx;
             public uint StickyMask, StickyValue, WriteMask, WriteValue, DirectionMask, DirectionValue;
             public ulong DueTick, ResumeCycles;
+            // Pin changes this machine made that are not delivered yet (under SyncRoot).
+            public int UndeliveredPinChanges;
             public bool Scheduled, PrefetchOnly;
             public int PC, InputCount, OutputCount, Delay, LoopCycles;
             public ushort Instruction;
@@ -1202,6 +1216,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         {
             public int Pin;
             public bool IsPin, Value, Enabled;
+            public uint Owners;
         }
 
         private readonly StateMachine[] stateMachines = new StateMachine[4];
@@ -1216,8 +1231,6 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private readonly IRP2ClockSource clocks;
         private readonly LimitTimer cycleCounter;
         private readonly int function;
-        // Pin changes queued for the GPIO and not yet delivered (under SyncRoot).
-        private int undeliveredPinChanges;
         private readonly bool rp2350;
         private readonly HashSet<string> warned = new HashSet<string>();
         private int gpioBase;
