@@ -34,6 +34,39 @@ namespace Antmicro.Renode.PeripheralsTests
         public void TearDown() => machine.Dispose();
 
         [Test]
+        public void ShouldHoldExecutionWhileAPinChangeIsStillBeingDelivered()
+        {
+            gpio.WriteDoubleWord(4, 6); // GPIO0 FUNCSEL = PIO0
+            pio.WriteDoubleWord(0xdc, 1u << 26); // PINCTRL: SET_BASE 0, SET_COUNT 1
+            Load(0xa042, 0xa042, 0xa042, 0x0000); // three nops, jmp 0
+            pio.WriteDoubleWord(0, 1);
+            Advance(10);
+            using(var entered = new ManualResetEventSlim())
+            using(var release = new ManualResetEventSlim())
+            {
+                var hold = true;
+                gpio.DriveChanged += (pin, value, enabled) =>
+                {
+                    if(pin != 0 || !hold) return;
+                    hold = false;
+                    entered.Set();
+                    Assert.IsTrue(release.Wait(TimeSpan.FromSeconds(5)), "The test did not release the delivery");
+                };
+                // Another thread's forced SET is delivered synchronously and held there.
+                var delivery = Task.Run(() => Force(0, 0xe081));
+                Assert.IsTrue(entered.Wait(TimeSpan.FromSeconds(5)), "The pin change was not delivered");
+                var pc = pio.ReadDoubleWord(0xd4);
+                Advance(20);
+                Assert.AreEqual(pc, pio.ReadDoubleWord(0xd4), "The machine ran ahead of an undelivered pin change");
+                release.Set();
+                Assert.IsTrue(delivery.Wait(TimeSpan.FromSeconds(5)));
+                var held = pio.ReadDoubleWord(0xd4);
+                Advance(3);
+                Assert.AreNotEqual(held, pio.ReadDoubleWord(0xd4), "The machine did not resume after the delivery");
+            }
+        }
+
+        [Test]
         public void ShouldExecuteUnmodifiedMetalclawSWDWriteProgram()
         {
             ConfigureMetalclawSWD();
