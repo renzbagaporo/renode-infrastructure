@@ -52,6 +52,7 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
             }
             for(var i = 0; i < addressTranslation.Length; i++) addressTranslation[i] = 0x04000000u | (uint)(i % 4) * 0x400;
             UpdateClock();
+            UpdateSelect();
             NotifyConfiguration();
         }
 
@@ -111,6 +112,28 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
                 if(command == 0x6b) return flash.QuadEnabled && dataWidth == 2 && addressWidth == 0;
                 return command == 0xeb && flash.QuadEnabled && dataWidth == 2 && addressWidth == 2;
             }
+        }
+
+        // Whether a memory-mapped read sends mode bits that can change the
+        // flash's continuous read state: a quad I/O read (EBh) with an 8-bit
+        // suffix, either with its command prefix or, in continuous read, with
+        // a suffix other than Axh.
+        public bool ReadsChangeFlashMode
+        {
+            get
+            {
+                var format = memoryConfiguration[1];
+                if(!FlashReadConfigured || ((format >> 14) & 3) != 2) return false;
+                var suffix = (memoryConfiguration[2] >> 8) & 0xff;
+                if((format & 0x1000) != 0) return (memoryConfiguration[2] & 0xff) == 0xeb;
+                return (suffix & 0xf0) != 0xa0;
+            }
+        }
+
+        // A memory-mapped flash read completed; the flash sees its mode bits.
+        public void CompleteMappedRead()
+        {
+            if(ReadsChangeFlashMode) flash.ObserveContinuousReadModeBits((byte)(memoryConfiguration[2] >> 8));
         }
 
         protected override void OnBeforeAccess()
@@ -209,9 +232,22 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
             NotifyConfiguration();
         }
 
+        // The XIP function's chip select 0 output, before the pad override:
+        // high (deasserted) except while direct mode asserts it. Memory-mapped
+        // transfers complete within one access, so they never hold it low.
+        public bool ChipSelect0Output => !((directControl & 4) != 0 || ((directControl & 0x40) != 0 && transferTimer.Enabled));
+
+        public event Action<bool> ChipSelect0OutputChanged;
+
         private void UpdateSelect()
         {
-            var selected = (directControl & 4) != 0 || ((directControl & 0x40) != 0 && transferTimer.Enabled);
+            var output = ChipSelect0Output;
+            if(output != lastChipSelect0Output)
+            {
+                lastChipSelect0Output = output;
+                ChipSelect0OutputChanged?.Invoke(output);
+            }
+            var selected = !output;
             if(chipSelectOverride == 1) selected = !selected;
             else if(chipSelectOverride == 2) selected = true;
             else if(chipSelectOverride == 3) selected = false;
@@ -241,6 +277,7 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
         private readonly uint[] memoryConfiguration = new uint[10];
         private readonly uint[] addressTranslation = new uint[8];
         private uint chipSelectOverride;
+        private bool lastChipSelect0Output = true;
         private uint directControl;
         private uint frame;
         private bool transactionActive;

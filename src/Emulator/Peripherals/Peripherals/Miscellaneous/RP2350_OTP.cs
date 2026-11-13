@@ -55,6 +55,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             return (architectureStatus & bit) != 0;
         }
 
+        // Factory configuration input: writes CHIPID0-3 (rows 0-3) as ECC rows,
+        // CHIPID0 holding bits 15:0. The boot ROM reports bits 31:0 as the
+        // device ID and bits 63:32 as the wafer ID.
+        public void SetChipId(ulong id)
+        {
+            for(var i = 0; i < 4; i++) rows[i] = EncodeECC((ushort)(id >> (16 * i)));
+        }
+
         public bool UserInterfaceEnabled => (userControl & 0x11) == 1;
 
         public bool Readable(int row, bool secure)
@@ -172,6 +180,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             if((critical & 0x10000) != 0) return 3;
             if((critical & 0x20001) != 0) return 0;
             return request & 3;
+        }
+
+        // 16 data bits, Hamming bits 20:16 and an even overall parity bit 21.
+        private static uint EncodeECC(ushort data)
+        {
+            uint value = data;
+            for(var i = 0; i < 5; i++) value |= Parity(data & ParityMasks[i]) << (16 + i);
+            return value | (Parity(value) << 21);
         }
 
         private static uint MajorityByte(uint value) => ((value & (value >> 8)) | ((value >> 8) & (value >> 16)) | (value & (value >> 16))) & 0xff;

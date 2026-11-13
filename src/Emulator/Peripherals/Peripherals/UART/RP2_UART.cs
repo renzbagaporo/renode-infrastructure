@@ -21,16 +21,20 @@ namespace Antmicro.Renode.Peripherals.UART
     // interposer. The IUART connection carries complete serial characters.
     // With a GPIO bank and instance index, the UART also drives its function 2
     // TX pins bit by bit and receives from its function 2 RX pins, sampling
-    // each bit at its centre; the IrDA encoder is not modeled.
+    // each bit at its centre; the IrDA encoder is not modeled. On the RP2350,
+    // function 11 (UART_AUX) also carries TX on the CTS pins and RX on the RTS
+    // pins.
     public sealed class RP2_UART : RP2APBPeripheral, IUART, IGPIOReceiver
     {
         public RP2_UART(IMachine machine, IRP2ClockSource clocks = null, ulong frequency = 125000000,
-            RP2_GPIOBank0 gpio = null, int index = -1) : base(machine)
+            RP2_GPIOBank0 gpio = null, int index = -1, bool rp2350 = false) : base(machine)
         {
             this.clocks = clocks;
             this.gpio = index >= 0 ? gpio : null;
             var txPins = new List<int>();
             var rxPins = new List<int>();
+            var txAuxPins = new List<int>();
+            var rxAuxPins = new List<int>();
             if(this.gpio != null)
             {
                 // GPIO function 2 repeats UART0/UART1 in blocks of eight pins
@@ -40,11 +44,15 @@ namespace Antmicro.Renode.Peripherals.UART
                     if((pin + 4) / 8 % 2 != index) continue;
                     if(pin % 4 == 0) txPins.Add(pin);
                     else if(pin % 4 == 1) rxPins.Add(pin);
+                    else if(rp2350 && pin % 4 == 2) txAuxPins.Add(pin);
+                    else if(rp2350) rxAuxPins.Add(pin);
                 }
                 this.gpio.InputChanged += OnPinInput;
             }
             this.txPins = txPins.ToArray();
             this.rxPins = rxPins.ToArray();
+            this.txAuxPins = txAuxPins.ToArray();
+            this.rxAuxPins = rxAuxPins.ToArray();
             rxLevels = new Dictionary<int, bool>();
             fallbackFrequency = frequency;
             tx = new Queue<byte>();
@@ -374,13 +382,14 @@ namespace Antmicro.Renode.Peripherals.UART
 
         private void OnPinInput(int pin, bool level)
         {
-            if(Array.IndexOf(rxPins, pin) < 0) return;
+            var function = Array.IndexOf(rxPins, pin) >= 0 ? UartFunction : Array.IndexOf(rxAuxPins, pin) >= 0 ? UartAuxFunction : -1;
+            if(function < 0) return;
             machine.ClockSource.ExecuteInLock(() =>
             {
                 lock(SyncRoot)
                 {
                     rxLevels[pin] = level;
-                    if(gpio.GetFunction(pin) != UartFunction || ResetHeld) return;
+                    if(gpio.GetFunction(pin) != function || ResetHeld) return;
                     if(level)
                     {
                         awaitingIdle = false;
@@ -600,6 +609,7 @@ namespace Antmicro.Renode.Peripherals.UART
                     case 3: TxDMA.Set(notification.Value != 0); break;
                     case TransmitLine:
                         foreach(var pin in txPins) gpio.SetPeripheralOutput(UartFunction, pin, notification.Value != 0, true);
+                        foreach(var pin in txAuxPins) gpio.SetPeripheralOutput(UartAuxFunction, pin, notification.Value != 0, true);
                         break;
                     default: CharReceived?.Invoke((byte)notification.Value); break;
                     }
@@ -656,6 +666,8 @@ namespace Antmicro.Renode.Peripherals.UART
         private readonly RP2_GPIOBank0 gpio;
         private readonly int[] txPins;
         private readonly int[] rxPins;
+        private readonly int[] txAuxPins;
+        private readonly int[] rxAuxPins;
         private readonly Dictionary<int, bool> rxLevels;
         private readonly LimitTimer bitTimer;
         private readonly LimitTimer sampleTimer;
@@ -683,6 +695,7 @@ namespace Antmicro.Renode.Peripherals.UART
         private const int TransmittedCharacter = 4;
         private const int TransmitLine = 5;
         private const int UartFunction = 2;
+        private const int UartAuxFunction = 11;
         private const int MaximumPins = 48;
         private const uint FramingError = 1u << 8;
         private const uint ParityError = 1u << 9;

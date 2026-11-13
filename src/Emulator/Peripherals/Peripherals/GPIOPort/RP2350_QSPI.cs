@@ -29,6 +29,10 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             }
             Connections = new ReadOnlyDictionary<int, IGPIO>(connections);
             Reset();
+            if(qmi != null)
+            {
+                qmi.ChipSelect0OutputChanged += level => SetPeripheralOutput(ChipSelectPin, level, true);
+            }
         }
 
         public void OnGPIO(int number, bool value) => bank.OnGPIO(number, value);
@@ -59,6 +63,8 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
         {
             bank.Reset();
             bank.WriteDoubleWord(0x230, 0xcccccccc);
+            // The XIP function drives SS (pin 3) from the QMI's chip select 0.
+            bank.SetPeripheralOutput(0, ChipSelectPin, qmi?.ChipSelect0Output ?? true, true);
             UpdateChipSelect();
         }
 
@@ -180,6 +186,7 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             return false;
         }
 
+        private const int ChipSelectPin = 3;
         private readonly RP2_GPIOBank0 bank;
         private readonly RP2350_QMI qmi;
         private readonly Queue<uint> pendingChipSelectOverrides = new Queue<uint>();

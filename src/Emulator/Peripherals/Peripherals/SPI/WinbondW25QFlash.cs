@@ -199,6 +199,18 @@ namespace Antmicro.Renode.Peripherals.SPI
 
         public bool ContinuousReadEnabled => continuousRead;
 
+        // A memory-mapped controller completed a fast read quad I/O (EBh)
+        // with these mode bits, outside the serial transaction path. As on the
+        // serial path, Axh keeps (or enters) continuous read and anything else
+        // leaves it.
+        public void ObserveContinuousReadModeBits(byte mode)
+        {
+            var enabled = (status2 & 2) != 0 && (mode & 0xf0) == 0xa0;
+            if(enabled == continuousRead) return;
+            continuousRead = enabled;
+            StateChanged?.Invoke();
+        }
+
         // Durations use the typical values in W25Q16JV Rev G, AC characteristics.
         private void BeginOperation(uint durationMicroseconds)
         {

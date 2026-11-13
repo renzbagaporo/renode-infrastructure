@@ -101,6 +101,9 @@ namespace Antmicro.Renode.Peripherals.Memory
                 hit &= byteHit;
             }
             xip?.RecordAccess(hit);
+            // A serial read's mode bits reach the flash once the whole
+            // transaction has used the read format they were sent with.
+            if(!hit && offset + windowOffset < 0x1000000) qmi.CompleteMappedRead();
             return result;
         }
 
@@ -310,6 +313,9 @@ namespace Antmicro.Renode.Peripherals.Memory
         private void EvaluateDirectAccess()
         {
             var readable = qmi.Available && qmi.FlashReadConfigured && flash.ReadAvailable;
+            // Reads whose mode bits change the flash's state must reach the
+            // QMI, so they never use direct mappings.
+            var mappable = readable && !qmi.ReadsChangeFlashMode;
             // Instructions translated from bus reads hold NOR data only while
             // the read path is readable, and translated data depends on ATRANS.
             // A fetch while the QMI is unavailable faults without translating,
@@ -325,7 +331,7 @@ namespace Antmicro.Renode.Peripherals.Memory
             for(var window = 0; window < DirectWindows; window++)
             {
                 var start = (long)DirectWindowSize * window;
-                var direct = readable && (untranslated || qmi.TranslatesIdentically(window))
+                var direct = mappable && (untranslated || qmi.TranslatesIdentically(window))
                     && (xip == null || xip.ReadsBypassCache(start, start + (long)DirectWindowSize, useCache, untranslated));
                 if(direct && !directAccess[window])
                 {
