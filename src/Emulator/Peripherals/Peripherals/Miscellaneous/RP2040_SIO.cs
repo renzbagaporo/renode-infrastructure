@@ -249,6 +249,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private void SynchronizeTime()
         {
+            // Debug port accesses carry a CPU context but run on the SWD wire's thread.
+            if(sysbus.TryGetCurrentContextState<CPU.CortexM.ContextState>(out var _, out var state) && state.DebugAccess) return;
             if(sysbus.TryGetCurrentCPU(out var cpu))
             {
                 cpu.SyncTime();

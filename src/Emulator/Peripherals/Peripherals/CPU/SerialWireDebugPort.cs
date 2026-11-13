@@ -21,12 +21,17 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         public void Reset()
         {
+            // A debug port in an always-on domain keeps its SWD session across
+            // system resets; only its own power-on (or RUN) resets the protocol.
+            if(KeepsSessionOnSystemReset) return;
             // A callback from an accepted bus transaction may request reset.
             // Invalidate framing/output immediately; reset backend state after
             // that transaction unwinds, before any new-generation input.
             lock(sync) ResetProtocol(false);
             ProcessPending();
         }
+
+        protected virtual bool KeepsSessionOnSystemReset => false;
 
         private void ResetProtocol(bool resetTarget)
         {

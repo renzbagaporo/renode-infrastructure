@@ -108,6 +108,19 @@ namespace Antmicro.Renode.PeripheralsTests
         }
 
         [Test]
+        public void ShouldKeepTheSessionAcrossSystemResets()
+        {
+            Assert.IsTrue(port.Target(0x11002927));
+            PowerUp();
+            port.WriteAP(0x04, 0x20000100);
+            port.Reset();
+            Assert.AreEqual(0xf0000000, port.ReadDP(4));
+            Assert.AreEqual(0x20000100, port.ReadAP(0x04));
+            port.WriteDP(8, 3);
+            Assert.AreEqual(0x10000001, port.ReadDP(4));
+        }
+
+        [Test]
         public void ShouldReadTheCortexM0PlusBreakpointUnitThroughTheCoreAP()
         {
             var nvic = new NVIC(machine);

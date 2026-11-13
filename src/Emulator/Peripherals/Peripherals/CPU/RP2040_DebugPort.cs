@@ -13,9 +13,11 @@ namespace Antmicro.Renode.Peripherals.CPU
     // RP2040 datasheet 2.3.4: SWD multidrop with three ADIv5 DPv2 debug ports on
     // one wire, chosen by TARGETSEL after a line reset: core 0 (0x01002927),
     // core 1 (0x11002927) and the rescue DP (0xf1002927). Each core DP has one
-    // AHB-AP at APSEL 0 that accesses memory as its core. The rescue DP's
-    // power-up request resets the chip; the boot ROM's rescue halt is not
-    // modelled. RUN low holds both cores in reset.
+    // AHB-AP at APSEL 0 that accesses memory as its core. The debug ports keep
+    // their SWD session across system resets (SYSRESETREQ, watchdog); RUN low
+    // resets the protocol and holds both cores in reset. Setting the rescue
+    // DP's CDBGPWRUPREQ resets the chip and the core DPs and holds the cores in
+    // reset until it is cleared; the boot ROM's rescue halt is not modelled.
     public class RP2040_DebugPort : SerialWireDebugPort
     {
         public RP2040_DebugPort(IMachine machine, CortexM cpu0, CortexM cpu1)
@@ -34,7 +36,10 @@ namespace Antmicro.Renode.Peripherals.CPU
             if(cpu0 != null) cpu0.EnableMemoryMappedDebug = true;
             if(cpu1 != null) cpu1.EnableMemoryMappedDebug = true;
             Reset();
+            initialized = true;
         }
+
+        protected override bool KeepsSessionOnSystemReset => initialized;
 
         protected override void ResetBackend()
         {
@@ -70,7 +75,7 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         private void ApplyRunHold()
         {
-            var hold = ResetPinAsserted;
+            var hold = ResetPinAsserted || rescueHold;
             foreach(var core in cores) core?.SetExternalResetHold(hold);
         }
 
@@ -132,15 +137,26 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         private void WriteControl(Port port, uint value)
         {
-            var powerUpRequested = (port.Control & 0x10000000) == 0 && (value & 0x10000000) != 0;
+            var wasRequested = (port.Control & 0x10000000) != 0;
             port.Control = (port.Control & 0xf2) | (value & 0x54000001);
             if((value & 0x10000000) != 0) port.Control |= 0x20000000;
             if((value & 0x40000000) != 0) port.Control |= 0x80000000;
             if((value & 0x04000000) != 0) port.Control |= 0x08000000;
-            if(powerUpRequested && port.AccessPort == null)
+            var requested = (value & 0x10000000) != 0;
+            if(port.AccessPort != null || requested == wasRequested) return;
+            rescueHold = requested;
+            if(requested)
             {
-                this.Log(LogLevel.Warning, "Rescue DP power-up request: resetting the chip; the boot ROM rescue halt is not modelled");
+                this.Log(LogLevel.Info, "Rescue reset asserted; the boot ROM rescue halt is not modelled");
+                ports[0].Reset();
+                ports[1].Reset();
+                ApplyRunHold();
                 machine.RequestReset();
+            }
+            else
+            {
+                this.Log(LogLevel.Info, "Rescue reset released");
+                machine.LocalTimeSource.ExecuteInNearestSyncedState(_ => ApplyRunHold());
             }
         }
 
@@ -313,5 +329,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         private readonly CortexM[] cores;
         private readonly Port[] ports;
         private Port selected;
+        private bool initialized;
+        private bool rescueHold;
     }
 }
