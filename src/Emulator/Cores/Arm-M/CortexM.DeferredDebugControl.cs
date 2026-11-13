@@ -1,6 +1,7 @@
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
 using System;
+using System.Threading;
 using System.Threading.Tasks;
 
 using Antmicro.Migrant;
@@ -29,7 +30,11 @@ namespace Antmicro.Renode.Peripherals.CPU
                 debugWorkerRevision++;
                 if(debugWorker == null)
                 {
-                    debugWorker = Task.Run((System.Action)ApplyExternalDebugControl);
+                    // A dedicated thread: on a host with few cores the shared
+                    // thread pool can delay the worker past a debugger's
+                    // halt and register-transfer timeouts.
+                    debugWorker = Task.Factory.StartNew(ApplyExternalDebugControl, CancellationToken.None,
+                        TaskCreationOptions.LongRunning, TaskScheduler.Default);
                 }
             }
         }
