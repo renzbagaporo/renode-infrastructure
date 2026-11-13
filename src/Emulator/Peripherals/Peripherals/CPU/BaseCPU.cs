@@ -810,6 +810,8 @@ namespace Antmicro.Renode.Peripherals.CPU
                 }
                 instructionsLeftThisRound = Math.Min(instructionsToExecuteThisRound - executedResiduum, singleStep ? 1 : ulong.MaxValue);
                 instructionsExecutedThisRound = executedResiduum;
+                wfiWaiting = false;
+                wfiWaitWatch.Reset();
 
                 var emulation = EmulationManager.Instance.CurrentEmulation;
                 if(skipThisRound)
@@ -862,6 +864,10 @@ namespace Antmicro.Renode.Peripherals.CPU
                         {
                             this.Trace();
                             var instructionsToSkip = Math.Min(InstructionsToNearestLimit(), instructionsLeftThisRound);
+                            if(WfiFollowsClock && FollowClockWhileWaiting(ref instructionsToSkip))
+                            {
+                                continue;
+                            }
 
                             virtualTimeAhead = machine.LocalTimeSource.ElapsedVirtualHostTimeDifference;
                             if(!machine.LocalTimeSource.AdvanceImmediately && virtualTimeAhead.Ticks > 0 && instructionsToSkip > 0)
@@ -987,6 +993,80 @@ namespace Antmicro.Renode.Peripherals.CPU
         protected readonly Synchronizer singleStepSynchronizer;
 
         protected readonly Sleeper sleeper = new Sleeper();
+
+        // A core waiting for an interrupt normally skips to the end of its time
+        // grant; one that other cores' clock events can wake then takes such an
+        // interrupt up to a quantum late. With WfiFollowsClock set, a waiting core
+        // skips at most to the next clock event (at least WfiStepNanoseconds) and
+        // waits there until the shared clock has run it, so an interrupt raised
+        // there is taken within WfiStepNanoseconds of its time.
+        public bool WfiFollowsClock { get; set; }
+
+        public ulong WfiStepNanoseconds { get; set; } = 2000;
+
+        // Returns true when the core must execute again (to take a pending
+        // interrupt or retry the wait) instead of skipping; otherwise limits
+        // instructionsToSkip to the next clock event.
+        private bool FollowClockWhileWaiting(ref ulong instructionsToSkip)
+        {
+            var timeSource = (TimeSourceBase)TimeHandle.TimeSource;
+            var limitAt = ((BaseClockSource)machine.ClockSource).NearestLimitAt;
+            var own = TimeHandle.TotalElapsedTime;
+            if(limitAt != TimeInterval.Maximal && own >= limitAt && machine.ClockSource.CurrentValue < limitAt
+                && timeSource.MinActiveElapsedTicks(TimeHandle) < own.Ticks
+                && wfiWaitWatch.ElapsedMilliseconds < MaxWfiWaitMilliseconds)
+            {
+                if(!wfiWaiting)
+                {
+                    wfiWaiting = true;
+                    wfiWaitWatch.Restart();
+                }
+                // Spin outside the translation library on the lock-free clock value
+                // until the clock reaches this core's time (so every event this core
+                // skipped past has run), an interrupt or pause request arrives, the
+                // other cores stop moving, or the wait times out.
+                var interrupts = sleeper.InterruptCount;
+                var spin = new SpinWait();
+                var polls = 0u;
+                while(!isPaused && sleeper.InterruptCount == interrupts && machine.ClockSource.CurrentValue < own)
+                {
+                    spin.SpinOnce(-1);
+                    if((++polls & 63) == 0
+                        && (timeSource.MinActiveElapsedTicks(TimeHandle) >= own.Ticks || wfiWaitWatch.ElapsedMilliseconds >= MaxWfiWaitMilliseconds))
+                    {
+                        break;
+                    }
+                }
+                return true;
+            }
+            if(wfiWaiting && wfiWaitWatch.ElapsedMilliseconds >= MaxWfiWaitMilliseconds && (wfiWaitTimeouts++ % 1000) == 0)
+            {
+                this.Log(LogLevel.Warning, "Waiting for interrupt: the shared clock did not reach {0} within {1} ms ({2} times); continuing",
+                    own, MaxWfiWaitMilliseconds, wfiWaitTimeouts);
+            }
+            wfiWaiting = false;
+            wfiWaitWatch.Reset();
+            if(limitAt != TimeInterval.Maximal && own < limitAt)
+            {
+                // Skip at least WfiStepNanoseconds, past any closer events.
+                var step = TimeInterval.FromNanoseconds(WfiStepNanoseconds);
+                var target = limitAt.Ticks - own.Ticks < step.Ticks ? own + step : limitAt;
+                var toTarget = (target - own).ToCPUCycles(PerformanceInMips, out var residuum);
+                // ToCPUCycles saturates at ulong.MaxValue for a far target; never
+                // round that up to 0, which would skip nothing.
+                if(toTarget != ulong.MaxValue && (residuum > 0 || toTarget == 0))
+                {
+                    toTarget++;
+                }
+                instructionsToSkip = Math.Min(toTarget, instructionsLeftThisRound);
+            }
+            return false;
+        }
+
+        private bool wfiWaiting;
+        private ulong wfiWaitTimeouts;
+        private readonly System.Diagnostics.Stopwatch wfiWaitWatch = new System.Diagnostics.Stopwatch();
+        private const long MaxWfiWaitMilliseconds = 50;
 
         private ulong InstructionsToNearestLimit()
         {

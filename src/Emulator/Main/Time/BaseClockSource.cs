@@ -249,6 +249,18 @@ namespace Antmicro.Renode.Time
             updateAlreadyInProgress.Dispose();
         }
 
+        // Absolute time of the nearest clock limit, or Maximal when nothing is scheduled.
+        public TimeInterval NearestLimitAt
+        {
+            get
+            {
+                lock(sync)
+                {
+                    return nearestLimitIn.Ticks > TimeInterval.Maximal.Ticks - totalElapsed.Ticks ? TimeInterval.Maximal : totalElapsed + nearestLimitIn;
+                }
+            }
+        }
+
         public TimeInterval NearestLimitIn
         {
             get

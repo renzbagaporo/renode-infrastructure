@@ -4,6 +4,7 @@
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
 //
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
@@ -181,6 +182,25 @@ namespace Antmicro.Renode.Time
                     list.Remove(node);
                     node.Value.Unlatch();
                 }
+            }
+        }
+
+        // Smallest elapsed ticks among handles whose sink is running, other than `exclude`;
+        // ulong.MaxValue when there is none.
+        public ulong MinActiveElapsedTicks(TimeHandle exclude)
+        {
+            lock(locker)
+            {
+                var min = ulong.MaxValue;
+                foreach(var handle in NotReady.Concat(Ready))
+                {
+                    if(handle == exclude || !handle.Enabled || !handle.SinkSideActive)
+                    {
+                        continue;
+                    }
+                    min = Math.Min(min, handle.TotalElapsedTime.Ticks);
+                }
+                return min;
             }
         }
 

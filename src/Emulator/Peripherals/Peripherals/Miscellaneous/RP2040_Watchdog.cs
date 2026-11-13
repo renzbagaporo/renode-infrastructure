@@ -20,7 +20,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             this.timer = timer;
             this.psm = psm;
             scratch = new uint[8];
-            tickTimer = new LimitTimer(machine.ClockSource, 1000000, this, "tick", limit: 512);
+            // A reference cycle counter that wraps only after many ticks: COUNT is
+            // derived from it, so the tick generator schedules no per-tick clock event.
+            tickTimer = new LimitTimer(machine.ClockSource, 1000000, this, "tick", limit: RP2350_Ticks.CounterLimit(512), direction: Direction.Ascending);
             watchdog = new LimitTimer(machine.ClockSource, 2000000, this, "watchdog", limit: CounterMask,
                 workMode: WorkMode.OneShot, eventEnabled: true);
             watchdog.LimitReached += () => RequestReset(false);
@@ -65,7 +67,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 return reason;
             case 0x2c:
                 return tickControl | (TickFrequency != 0 ? 0x400u : 0)
-                    | (tickTimer.Enabled ? ((uint)tickTimer.Value & 0x1ff) << 11 : 0);
+                    | (tickTimer.Enabled ? (RP2350_Ticks.Count(tickTimer.Value, TickCycles) & 0x1ff) << 11 : 0);
             default:
                 this.LogUnhandledRead(offset);
                 return 0;
@@ -105,7 +107,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             case 0x2c:
                 tickControl = ApplyOperation(tickControl, value, operation, 0x3ff);
                 tickTimer.Enabled = false;
-                tickTimer.Limit = TickCycles;
+                tickTimer.Limit = RP2350_Ticks.CounterLimit(TickCycles);
                 tickTimer.ResetValue();
                 UpdateClock();
                 break;

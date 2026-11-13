@@ -98,6 +98,7 @@ namespace Antmicro.Renode.Time
         /// </remarks>
         public void Interrupt()
         {
+            Interlocked.Increment(ref interruptCount);
             lock(locker)
             {
                 if(cancellationToken.IsCancellationRequested)
@@ -110,6 +111,12 @@ namespace Antmicro.Renode.Time
             }
         }
 
+        /// <summary>
+        /// Number of <see cref="Interrupt"> calls so far; lets a spinning waiter notice a wake request without sleeping.
+        /// </summary>
+        public int InterruptCount => Volatile.Read(ref interruptCount);
+
+        private int interruptCount;
         [Constructor]
         private CancellationTokenSource cancellationToken;
         private readonly Stopwatch stopwatch;

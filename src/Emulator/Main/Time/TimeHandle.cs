@@ -169,9 +169,27 @@ namespace Antmicro.Renode.Time
                     // we must make sure that the handle is not enabled before the next 'WaitUntilDone' because it could change its result
                     Latch();
                     deferredUnlatch = true;
+                    // Credit the interval now, so a disabled sink does not hold the
+                    // source's common elapsed time at the start of the interval while
+                    // enabled sinks run; WaitUntilDone then has nothing left to report.
+                    UpdateElapsedTime(interval, out grantCreditPrevious);
+                    grantCreditPending = true;
                 }
             }
             this.Trace();
+        }
+
+        // Returns true once after a grant to a disabled handle was credited, with the
+        // elapsed ticks before the credit, so the source can report the progress.
+        public bool TakeGrantCredit(out ulong previousElapsedTicks)
+        {
+            using(MonitorSmartLock.Lock(innerLock))
+            {
+                previousElapsedTicks = grantCreditPrevious;
+                var pending = grantCreditPending;
+                grantCreditPending = false;
+                return pending;
+            }
         }
 
         /// <summary>
@@ -762,6 +780,9 @@ namespace Antmicro.Renode.Time
         /// Gets the flag indicating if this time handle is disposed and ready to be removed from its time source.
         /// </summary>
         public bool DetachRequested { get; private set; }
+
+        private bool grantCreditPending;
+        private ulong grantCreditPrevious;
 
         /// <summary>
         /// Gets the reference to the time source associated with this handle.

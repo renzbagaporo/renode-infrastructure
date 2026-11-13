@@ -735,6 +735,10 @@ namespace Antmicro.Renode.Time
         {
             State = TimeSourceState.ReportingElapsedTime;
             handle.Value.GrantTimeInterval(quantum);
+            if(handle.Value.TakeGrantCredit(out var previousElapsedTicks))
+            {
+                ReportTimeProgress(previousElapsedTicks);
+            }
         }
 
         /// <summary>
@@ -836,6 +840,13 @@ namespace Antmicro.Renode.Time
         private int? executeThreadId;
         private ulong delayedTaskId;
         private uint virtualTimeProgressBlockers; // Executor-thread out-of-loop or inside `virtualTimeSyncLock` only
+
+        // Smallest elapsed ticks among handles whose sink is running, other than
+        // `exclude`; ulong.MaxValue when there is none.
+        public ulong MinActiveElapsedTicks(TimeHandle exclude)
+        {
+            return handles.MinActiveElapsedTicks(exclude);
+        }
         private TimeInterval quantum;
 
         [Antmicro.Migrant.Constructor(true)]

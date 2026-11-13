@@ -8,6 +8,7 @@ using System;
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.Timers;
+using Antmicro.Renode.Time;
 
 namespace Antmicro.Renode.Peripherals.Miscellaneous
 {
@@ -23,7 +24,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             timers = new LimitTimer[NumberOfTicks];
             for(var i = 0; i < NumberOfTicks; i++)
             {
-                timers[i] = new LimitTimer(machine.ClockSource, 1, this, $"tick{i}", limit: 1);
+                // Reference cycle counters that wrap only after many ticks: COUNT is
+                // derived from them, so a tick generator schedules no per-tick clock event.
+                timers[i] = new LimitTimer(machine.ClockSource, 1, this, $"tick{i}", limit: CounterLimit(0), direction: Direction.Ascending);
             }
             clocks.ClockChanged += UpdateClocks;
             Reset();
@@ -63,7 +66,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             case 4:
                 return cycles[index];
             case 8:
-                return (uint)timers[index].Value;
+                return timers[index].Enabled ? Count(timers[index].Value, cycles[index]) : 0;
             default:
                 this.LogUnhandledRead(offset);
                 return 0;
@@ -93,10 +96,29 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 return;
             }
             timers[index].Enabled = false;
-            timers[index].Limit = Math.Max(1u, cycles[index]);
+            timers[index].Limit = CounterLimit(cycles[index]);
             timers[index].ResetValue();
             UpdateClocks();
         }
+
+        // COUNT counts down from CYCLES to 1 and reloads as each tick is generated.
+        internal static uint Count(ulong elapsed, uint cycles)
+        {
+            var period = Math.Max(1u, cycles);
+            return (uint)(period - elapsed % period);
+        }
+
+        // The counter wraps at a whole number of tick periods, so Count stays exact
+        // across the wrap. The wrap is about 2^30 reference cycles away (seconds of
+        // virtual time); a counter limit near ulong.MaxValue overflows the clock
+        // source's fraction arithmetic and yields a bogus nearest limit.
+        internal static ulong CounterLimit(uint cycles)
+        {
+            var period = (ulong)Math.Max(1u, cycles);
+            return period * (CounterSpan / period);
+        }
+
+        private const ulong CounterSpan = 1UL << 30;
 
         private void UpdateClocks()
         {
