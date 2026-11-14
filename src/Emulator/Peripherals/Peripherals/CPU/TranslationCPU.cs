@@ -398,32 +398,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
         }
 
-        // tlib's translation blocks may change only while no other thread runs
-        // translated code on this CPU. Another thread (a debugger writing guest
-        // memory, DMA) that finds the CPU executing leaves the ranges queued and
-        // makes it return; the CPU drains them before it executes again.
         public void InvalidateTranslationBlocks()
-        {
-            if(Monitor.TryEnter(executionLock))
-            {
-                try
-                {
-                    DrainTranslationBlockInvalidations();
-                }
-                finally
-                {
-                    Monitor.Exit(executionLock);
-                }
-                return;
-            }
-            lock(addressesToInvalidate)
-            {
-                if(addressesToInvalidate.Count == 0) return;
-            }
-            TlibSetReturnRequest();
-        }
-
-        private void DrainTranslationBlockInvalidations()
         {
             lock(addressesToInvalidate)
             {
@@ -829,7 +804,6 @@ namespace Antmicro.Renode.Peripherals.CPU
                 pauseGuard.Enter();
                 lock(executionLock)
                 {
-                    DrainTranslationBlockInvalidations();
                     insideTranslatedCode = true;
                     try
                     {
@@ -838,7 +812,6 @@ namespace Antmicro.Renode.Peripherals.CPU
                     finally
                     {
                         insideTranslatedCode = false;
-                        DrainTranslationBlockInvalidations();
                     }
                 }
                 pauseGuard.Leave();
