@@ -1,0 +1,118 @@
+//
+// This file is licensed under the MIT License.
+// Full license text is available in 'licenses/MIT.txt'.
+//
+
+using Antmicro.Renode.Core;
+using Antmicro.Renode.Peripherals.GPIOPort;
+using Antmicro.Renode.Peripherals.SPI;
+
+using NUnit.Framework;
+
+namespace Antmicro.Renode.PeripheralsTests
+{
+    [TestFixture]
+    public class RP2_SPITests
+    {
+        [SetUp]
+        public void SetUp()
+        {
+            machine = new Machine();
+            gpio = new RP2_GPIOBank0(machine);
+            spi = new RP2_SPI(machine, gpio: gpio, index: 0);
+            for(var pin = Rx; pin <= Tx; pin++) gpio.WriteDoubleWord(pin * 8 + 4, 1); // FUNCSEL SPI
+            gpio.DriveChanged += (pin, value, enabled) =>
+            {
+                if(pin != Tx) return;
+                txLevel = value;
+                txDriven = enabled;
+            };
+            gpio.OnGPIO(Select, true);
+            gpio.OnGPIO(Clock, false);
+        }
+
+        [TearDown]
+        public void TearDown() => machine.Dispose();
+
+        [TestCase(false)]
+        [TestCase(true)]
+        public void ShouldExchangeAFrameAsASlave(bool secondEdge)
+        {
+            spi.WriteDoubleWord(0x00, 7 | (secondEdge ? 0x80u : 0)); // 8 bits, SPO 0
+            spi.WriteDoubleWord(0x10, 2);
+            spi.WriteDoubleWord(0x04, 2 | 4); // SSE, MS
+            spi.WriteDoubleWord(0x08, 0xa5);
+            Assert.IsFalse(txDriven, "An unselected slave leaves TX undriven");
+            gpio.OnGPIO(Select, false);
+            Assert.IsTrue(txDriven);
+            var sent = 0;
+            const int received = 0x3c;
+            for(var bit = 7; bit >= 0; bit--)
+            {
+                gpio.OnGPIO(Rx, ((received >> bit) & 1) != 0);
+                if(!secondEdge)
+                {
+                    // SPH=0: the slave's bit is valid before the sampling (rising) edge.
+                    sent = (sent << 1) | (txLevel ? 1 : 0);
+                    gpio.OnGPIO(Clock, true);
+                    gpio.OnGPIO(Clock, false);
+                }
+                else
+                {
+                    // SPH=1: the slave shifts on the rising edge; both sample on the falling one.
+                    gpio.OnGPIO(Clock, true);
+                    sent = (sent << 1) | (txLevel ? 1 : 0);
+                    gpio.OnGPIO(Clock, false);
+                }
+            }
+            Assert.AreEqual(0xa5, sent, "MISO carried the transmit FIFO frame");
+            Assert.AreEqual(4u, spi.ReadDoubleWord(0x0c) & 4, "RNE");
+            Assert.AreEqual((uint)received, spi.ReadDoubleWord(0x08));
+            gpio.OnGPIO(Select, true);
+            Assert.IsFalse(txDriven);
+        }
+
+        [TestCase(false)]
+        [TestCase(true)]
+        public void ShouldSendEachFrameOnceAcrossChipSelectPulses(bool pulse)
+        {
+            spi.WriteDoubleWord(0x00, 7);
+            spi.WriteDoubleWord(0x10, 2);
+            spi.WriteDoubleWord(0x04, 2 | 4);
+            spi.WriteDoubleWord(0x08, 0x81);
+            spi.WriteDoubleWord(0x08, 0x42);
+            gpio.OnGPIO(Select, false);
+            var first = Exchange();
+            if(pulse)
+            {
+                gpio.OnGPIO(Select, true);
+                gpio.OnGPIO(Select, false);
+            }
+            var second = Exchange();
+            gpio.OnGPIO(Select, true);
+            Assert.AreEqual(0x81, first);
+            Assert.AreEqual(0x42, second);
+            Assert.AreEqual(1u, spi.ReadDoubleWord(0x0c) & 1, "Both frames left the transmit FIFO");
+        }
+
+        // One SPH=0 frame from the master's side: returns the bits on MISO.
+        private int Exchange()
+        {
+            var sent = 0;
+            for(var bit = 0; bit < 8; bit++)
+            {
+                sent = (sent << 1) | (txLevel ? 1 : 0);
+                gpio.OnGPIO(Clock, true);
+                gpio.OnGPIO(Clock, false);
+            }
+            return sent;
+        }
+
+        private Machine machine;
+        private RP2_GPIOBank0 gpio;
+        private RP2_SPI spi;
+        private bool txLevel, txDriven;
+
+        private const int Rx = 16, Select = 17, Clock = 18, Tx = 19;
+    }
+}

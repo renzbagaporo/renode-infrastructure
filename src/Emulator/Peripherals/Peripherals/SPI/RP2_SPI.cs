@@ -17,13 +17,15 @@ using Antmicro.Renode.Time;
 namespace Antmicro.Renode.Peripherals.SPI
 {
     // RP2040/RP2350 SPI is an ARM PL022 SSP with 8-entry FIFOs. This model
-    // implements the Motorola frame format as a master: it drives SCK, TX and
+    // implements the Motorola frame format. As a master it drives SCK, TX and
     // FSS on its GPIO function 1 pins with the configured polarity, phase,
     // frame size and bit rate (clk_peri / (CPSDVSR * (1 + SCR))), and samples
     // RX at each sampling edge. When the target is reached through delayed
     // wires, InputDelayNanoseconds moves each sample by the round trip so the
-    // target's response to that edge is read. Slave mode and the TI and
-    // Microwire formats are not modeled.
+    // target's response to that edge is read. As a slave it follows CSn and
+    // SCK on its input pins, samples RX on the sampling edges, and drives TX
+    // while selected (unless SOD is set) from its transmit FIFO, sending zeros
+    // when that is empty. The TI and Microwire formats are not modeled.
     public sealed class RP2_SPI : RP2APBPeripheral
     {
         public RP2_SPI(IMachine machine, IRP2ClockSource clocks = null, ulong frequency = 125000000,
@@ -91,6 +93,9 @@ namespace Antmicro.Renode.Peripherals.SPI
                     notifications.Clear();
                     generation++;
                     shifting = false;
+                    slaveSelected = slaveLoaded = false;
+                    slaveBits = 0;
+                    slaveIn = slaveOut = 0;
                     control0 = control1 = prescale = interruptMask = rawInterrupts = dmaControl = 0;
                     UpdateClock();
                     UpdatePins();
@@ -164,7 +169,7 @@ namespace Antmicro.Renode.Peripherals.SPI
                 break;
             case 0x04:
                 control1 = value & 0xf;
-                if((control1 & 4) != 0) this.Log(LogLevel.Warning, "SPI slave mode is not modeled");
+                if(!SlaveMode) slaveSelected = false;
                 UpdatePins();
                 TryStartFrame();
                 break;
@@ -318,15 +323,76 @@ namespace Antmicro.Renode.Peripherals.SPI
 
         private void OnPinInput(int pin, bool level)
         {
-            if(Array.IndexOf(rxPins, pin) < 0) return;
+            var rxPin = Array.IndexOf(rxPins, pin) >= 0;
+            var selectPin = Array.IndexOf(outputPins[FssLine], pin) >= 0;
+            var clockPin = Array.IndexOf(outputPins[ClockLine], pin) >= 0;
+            if(!rxPin && !selectPin && !clockPin) return;
             machine.ClockSource.ExecuteInLock(() =>
             {
                 lock(SyncRoot)
                 {
-                    if(gpio.GetFunction(pin) == SpiFunction) rxLevel = level;
+                    if(gpio.GetFunction(pin) != SpiFunction) return;
+                    if(rxPin) rxLevel = level;
+                    else if(SlaveMode && selectPin) OnSlaveSelect(!level);
+                    else if(SlaveMode && clockPin) OnSlaveClock(level);
+                    UpdateSignals();
                 }
             });
+            PublishPending();
         }
+
+        // Slave ----------------------------------------------------------
+
+        private void OnSlaveSelect(bool selected)
+        {
+            if(slaveSelected == selected) return;
+            slaveSelected = selected;
+            slaveBits = 0;
+            slaveIn = 0;
+            if(selected)
+            {
+                LoadSlaveFrame();
+                // With SPH=0 the first bit is valid as soon as CSn falls.
+                if(!SecondEdgeSamples) DriveSlaveBit(0);
+            }
+            // A frame loaded but not started stays loaded across CSn rising.
+            UpdatePins();
+        }
+
+        private void OnSlaveClock(bool level)
+        {
+            if(!slaveSelected) return;
+            var leading = level != IdleHigh;
+            if(leading == !SecondEdgeSamples)
+            {
+                slaveIn = (ushort)((slaveIn << 1) | (rxLevel ? 1 : 0));
+                if(++slaveBits < FrameBits) return;
+                if(rx.Count >= Capacity) rawInterrupts |= OverrunInterrupt;
+                else rx.Enqueue((ushort)(slaveIn & FrameMask));
+                RestartTimeout();
+                slaveBits = 0;
+                slaveIn = 0;
+                slaveLoaded = false;
+            }
+            else
+            {
+                // SPH=0 shifts the next bit out on the trailing edge, SPH=1 the
+                // bit about to be sampled on the leading edge. A back-to-back
+                // frame starts on this edge with its first bit.
+                if(slaveBits == 0) LoadSlaveFrame();
+                DriveSlaveBit(slaveBits);
+            }
+        }
+
+        // Takes the next transmit frame when a frame starts, once per frame.
+        private void LoadSlaveFrame()
+        {
+            if(slaveLoaded) return;
+            slaveLoaded = true;
+            slaveOut = tx.Count != 0 ? tx.Dequeue() : (ushort)0;
+        }
+
+        private void DriveSlaveBit(int bit) => SetLine(DataLine, ((slaveOut >> (FrameBits - 1 - bit)) & 1) != 0);
 
         private void OnClockChanged()
         {
@@ -347,11 +413,14 @@ namespace Antmicro.Renode.Peripherals.SPI
         }
 
         // A master drives its outputs while enabled; loopback keeps them idle.
+        // A selected slave drives TX only, unless SOD disables its output.
         private void UpdatePins()
         {
-            var drive = Enabled && (control1 & 4) == 0 && !Loopback;
+            var master = Enabled && !SlaveMode && !Loopback;
+            var slave = Enabled && SlaveMode && !Loopback && slaveSelected && (control1 & 8) == 0;
             for(var line = 0; line < 3; line++)
             {
+                var drive = master || (slave && line == DataLine);
                 if(lineEnabled[line] == drive) continue;
                 lineEnabled[line] = drive;
                 notifications.Enqueue(new Notification(line, lineLevels[line], drive, generation));
@@ -432,7 +501,8 @@ namespace Antmicro.Renode.Peripherals.SPI
 
         private uint RawInterrupts => rawInterrupts | (rx.Count >= Capacity / 2 ? ReceiveInterrupt : 0)
             | (tx.Count <= Capacity / 2 ? TransmitInterrupt : 0);
-        private bool Busy => shifting || tx.Count != 0 || samples.Count != 0;
+        private bool Busy => shifting || tx.Count != 0 || samples.Count != 0 || (slaveSelected && slaveBits != 0);
+        private bool SlaveMode => (control1 & 4) != 0;
         private bool Enabled => !ResetHeld && (control1 & 2) != 0;
         private bool Loopback => (control1 & 1) != 0;
         private bool IdleHigh => (control0 & 0x40) != 0;
@@ -510,7 +580,9 @@ namespace Antmicro.Renode.Peripherals.SPI
         private Frame frame;
         private ulong frameId;
         private int edge;
-        private bool shifting, publishing, rxLevel;
+        private bool shifting, publishing, rxLevel, slaveSelected, slaveLoaded;
+        private int slaveBits;
+        private ushort slaveIn, slaveOut;
         private uint generation;
         private uint control0, control1, prescale, interruptMask, rawInterrupts, dmaControl;
 
