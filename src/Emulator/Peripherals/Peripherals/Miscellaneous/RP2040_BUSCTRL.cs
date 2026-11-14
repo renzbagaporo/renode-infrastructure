@@ -22,11 +22,15 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
     // can supply those through NotifyBusAccess when an access actually completes.
     public sealed class RP2040_BUSCTRL : RP2APBPeripheral, IDisposable
     {
-        public RP2040_BUSCTRL(IMachine machine, CortexM core0 = null, CortexM core1 = null, RP2040_DMA dma = null)
+        // With rp2350 set the block has the RP2350 layout (PERFCTR_EN at 0x8, the
+        // counter/selector pairs from 0xc); its event selections are not decoded,
+        // so the counters stay at zero.
+        public RP2040_BUSCTRL(IMachine machine, CortexM core0 = null, CortexM core1 = null, RP2040_DMA dma = null, bool rp2350 = false)
             : base(machine)
         {
             if(core0 != null && core0 == core1) throw new ArgumentException("Bus masters must be distinct CPUs");
-            cores = new[] { core0, core1 }.Where(core => core != null).ToArray();
+            this.rp2350 = rp2350;
+            cores = rp2350 ? new CortexM[0] : new[] { core0, core1 }.Where(core => core != null).ToArray();
             this.dma = dma;
             Reset();
         }
@@ -38,6 +42,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
                 priority = 0;
                 priorityAcknowledged = false;
+                counterEnable = 0;
                 Array.Clear(counters, 0, counters.Length);
                 for(var i = 0; i < selectors.Length; i++) selectors[i] = 31;
                 observationUpdateRequested = 1;
@@ -79,10 +84,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             case 0x0: return priority;
             case 0x4: return priorityAcknowledged ? 1u : 0u;
             }
-            if(offset >= 0x8 && offset <= 0x24 && (offset & 3) == 0)
+            if(rp2350 && offset == 0x8) return counterEnable;
+            var first = rp2350 ? 0xcL : 0x8L;
+            if(offset >= first && offset < first + 0x20 && (offset & 3) == 0)
             {
-                var index = (int)((offset - 8) / 8);
-                return (offset & 4) == 0 ? counters[index] : selectors[index];
+                var index = (int)((offset - first) / 8);
+                return ((offset - first) & 4) == 0 ? counters[index] : selectors[index];
             }
             this.LogUnhandledRead(offset);
             return 0;
@@ -101,10 +108,17 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             case 0x4:
                 return;
             }
-            if(offset >= 0x8 && offset <= 0x24 && (offset & 3) == 0)
+            if(rp2350 && offset == 0x8)
             {
-                var index = (int)((offset - 8) / 8);
-                if((offset & 4) == 0) counters[index] = 0;
+                counterEnable = ApplyOperation(counterEnable, value, operation, 1);
+                if(counterEnable != 0) this.Log(LogLevel.Warning, "RP2350 bus performance counters are not modelled; they stay at zero");
+                return;
+            }
+            var first = rp2350 ? 0xcL : 0x8L;
+            if(offset >= first && offset < first + 0x20 && (offset & 3) == 0)
+            {
+                var index = (int)((offset - first) / 8);
+                if(((offset - first) & 4) == 0) counters[index] = 0;
                 else
                 {
                     selectors[index] = ApplyOperation(selectors[index], value, operation, 0x1f);
@@ -130,7 +144,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             lock(observationSync)
             {
                 bool enabled;
-                lock(SyncRoot) enabled = !disposed && !ResetHeld && selectors.Any(selector => selector < 20);
+                lock(SyncRoot) enabled = !rp2350 && !disposed && !ResetHeld && selectors.Any(selector => selector < 20);
                 SetObservation(enabled);
             }
         }
@@ -182,6 +196,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         }
 
         private uint priority;
+        private uint counterEnable;
         private bool priorityAcknowledged;
         private bool observing;
         private bool disposed;
@@ -190,6 +205,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private readonly uint[] counters = new uint[4];
         private readonly uint[] selectors = new uint[4];
         private readonly CortexM[] cores;
+        private readonly bool rp2350;
         private readonly RP2040_DMA dma;
         private const ulong CounterMask = 0xffffff;
     }
