@@ -3,6 +3,7 @@
 // Full license text is available in 'licenses/MIT.txt'.
 //
 using System;
+using System.Linq;
 
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Logging;
@@ -64,13 +65,24 @@ namespace Antmicro.Renode.Peripherals.CPU
             return false;
         }
 
-        protected override void ResetTarget() => machine.RequestReset();
+        protected override void ResetTarget() => RequestReset();
 
         protected override void ReleaseTarget()
         {
             // A release can overtake a queued reset, or be followed by another
             // assertion. Reconcile the current physical level at the boundary.
             machine.LocalTimeSource.ExecuteInNearestSyncedState(_ => ApplyRunHold());
+        }
+
+        // The request comes from the debugger's SWD thread, which may belong to
+        // another machine: reset once every processor has stopped, holding the
+        // cores at the current RUN/rescue level before and after. External flash
+        // keeps its state, as on a RUN reset.
+        private void RequestReset()
+        {
+            var retained = machine.GetRegisteredPeripherals().Select(entry => entry.Peripheral)
+                .Where(peripheral => peripheral is SPI.WinbondW25QFlash).ToList();
+            machine.RequestResetInSafeState(postReset: ApplyRunHold, unresetable: retained, runRegisteredResetEvents: true, preReset: ApplyRunHold);
         }
 
         private void ApplyRunHold()
@@ -150,8 +162,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                 this.Log(LogLevel.Info, "Rescue reset asserted; the boot ROM rescue halt is not modelled");
                 ports[0].Reset();
                 ports[1].Reset();
-                ApplyRunHold();
-                machine.RequestReset();
+                RequestReset();
             }
             else
             {

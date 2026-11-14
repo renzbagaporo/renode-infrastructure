@@ -62,7 +62,12 @@ namespace Antmicro.Renode.Peripherals.CPU
                     if(debugWorkerDisposed) { debugWorker = null; return; }
                     revision = debugWorkerRevision;
                 }
+                // The return request in RequestExternalDebugControl makes the
+                // CPU leave translated code soon; wait for that before touching
+                // native state. The lock is taken outside reset, which a native
+                // callback inside translated code may need.
                 if(nvic.GetExternalDebugControlRequest(out var generation, out var halt))
+                lock(ExecutionLock)
                 {
                     if(halt)
                     {

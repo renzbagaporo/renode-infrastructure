@@ -2540,6 +2540,11 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         private readonly object gpioLock = new object();
         private readonly object executionLock = new object();
+
+        // Held around TlibExecute. Another thread that changes native CPU
+        // state (an external debugger's halt or register transfer) takes it
+        // first, so the change never lands inside running translated code.
+        protected object ExecutionLock => executionLock;
         private readonly MinimalRangesCollection mappedMemory = new MinimalRangesCollection();
         private readonly CpuThreadPauseGuard pauseGuard;
 
