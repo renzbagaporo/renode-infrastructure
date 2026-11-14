@@ -25,6 +25,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             this.sio = sio;
             control = new uint[NumberOfClocks];
             divider = new uint[NumberOfClocks];
+            monitor = new RP2_ClockMonitor(IRQ, CounterSourceFrequency);
             xosc.ClockChanged += UpdateClocks;
             rosc.ClockChanged += UpdateClocks;
             pllSys.ClockChanged += UpdateClocks;
@@ -55,7 +56,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             control[SystemClock] = 0;
             selectedReferenceSource = 0;
             selectedSystemSource = 0;
-            resuscitationControl = 0xff;
+            monitor.Reset();
             UpdateClocks();
         }
 
@@ -70,7 +71,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 return 0;
             }
             var source = clock == ReferenceClock ? ReferenceSourceFrequency(selectedReferenceSource)
-                : clock == SystemClock ? SystemSourceFrequency(selectedSystemSource)
+                : clock == SystemClock ? (monitor.Resussed ? GetFrequency(ReferenceClock) : SystemSourceFrequency(selectedSystemSource))
                 : AuxiliarySourceFrequency(clock, (control[clock] >> 5) & 0xf);
             if(clock == PeripheralClock)
             {
@@ -92,6 +93,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         public event Action ClockChanged;
 
+        public GPIO IRQ { get; } = new GPIO();
+
         protected override uint ReadRegister(long offset)
         {
             if(offset >= 0 && offset < NumberOfClocks * 12)
@@ -105,19 +108,15 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     return divider[index];
                 case 8:
                     return index == ReferenceClock ? 1u << (int)selectedReferenceSource
-                        : index == SystemClock ? 1u << (int)selectedSystemSource : 1;
+                        : index == SystemClock ? 1u << (int)(monitor.Resussed ? 0 : selectedSystemSource) : 1;
                 }
             }
-            switch(offset)
+            if(monitor.TryRead(offset - MonitorOffset, out var value))
             {
-            case 0x78:
-                return resuscitationControl;
-            case 0x7c:
-                return 0;
-            default:
-                this.LogUnhandledRead(offset);
-                return 0;
+                return value;
             }
+            this.LogUnhandledRead(offset);
+            return 0;
         }
 
         protected override void WriteRegister(long offset, uint value, AtomicOperation operation)
@@ -139,9 +138,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     return;
                 }
             }
-            if(offset == 0x78)
+            if(monitor.TryRead(offset - MonitorOffset, out var current)
+                && monitor.TryWrite(offset - MonitorOffset, ApplyOperation(current, value, operation), out var clocksChanged))
             {
-                resuscitationControl = ApplyOperation(resuscitationControl, value, operation, 0x111ff);
+                if(clocksChanged) UpdateClocks();
                 return;
             }
             this.LogUnhandledWrite(offset, value);
@@ -159,6 +159,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
                 selectedSystemSource = requestedSystem;
             }
+            // A stopped clk_sys source is resuscitated onto clk_ref when enabled.
+            monitor.CheckResus(GetFrequency(SystemClock), GetFrequency(ReferenceClock));
             var systemFrequency = GetFrequency(SystemClock);
             if(sio != null && systemFrequency != 0)
             {
@@ -238,9 +240,28 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
         }
 
+        // FC0_SRC selections.
+        private ulong CounterSourceFrequency(uint source)
+        {
+            switch(source)
+            {
+            case 1: return pllSys.Frequency;
+            case 2: return pllUsb.Frequency;
+            case 3: case 4: return rosc.Frequency;
+            case 5: return xosc.Frequency;
+            case 8: return GetFrequency(ReferenceClock);
+            case 9: return GetFrequency(SystemClock);
+            case 0xa: return GetFrequency(PeripheralClock);
+            case 0xb: return GetFrequency(7);
+            case 0xc: return GetFrequency(8);
+            case 0xd: return GetFrequency(9);
+            default: return 0;
+            }
+        }
+
         private uint selectedReferenceSource;
         private uint selectedSystemSource;
-        private uint resuscitationControl;
+        private readonly RP2_ClockMonitor monitor;
 
         private readonly uint[] control;
         private readonly uint[] divider;
@@ -259,5 +280,6 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private const int SystemClock = 5;
         private const int PeripheralClock = 6;
         private const int NumberOfClocks = 10;
+        private const long MonitorOffset = 0x78;
     }
 }
