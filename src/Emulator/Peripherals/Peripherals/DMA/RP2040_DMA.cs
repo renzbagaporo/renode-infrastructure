@@ -73,14 +73,20 @@ namespace Antmicro.Renode.Peripherals.DMA
 
         // Hardware request numbers match the chip's TREQ_SEL encoding. Inputs
         // are FIFO-ready levels (as provided by RP2040_PIO), not pulse credits.
+        // Inputs 0-58 are level DREQs. Input PulseRequestBase + n counts the
+        // rising edges of a pulsed DREQ n (a PWM wrap), each of which allows
+        // one transfer of a channel paced by it.
         public void OnGPIO(int number, bool value)
         {
-            if(number < 0 || number >= requests.Length) return;
+            var pulsed = number >= PulseRequestBase;
+            var request = pulsed ? number - PulseRequestBase : number;
+            if(request < 0 || request >= requests.Length || (pulsed && !value)) return;
             machine.ClockSource.ExecuteInLock(() =>
             {
                 lock(SyncRoot)
                 {
-                    requests[number] = value;
+                    if(pulsed) pulseCredits[request]++;
+                    else requests[request] = value;
                     Schedule();
                 }
             });
@@ -253,6 +259,7 @@ namespace Antmicro.Renode.Peripherals.DMA
                 Array.Clear(irqForce, 0, irqForce.Length);
                 Array.Clear(pacing, 0, pacing.Length);
                 Array.Clear(pacingPhase, 0, pacingPhase.Length);
+                Array.Clear(pulseCredits, 0, pulseCredits.Length);
                 lastTimerCycle = cycleCounter.Value;
                 foreach(var channel in channels)
                 {
@@ -314,6 +321,7 @@ namespace Antmicro.Renode.Peripherals.DMA
                         Control = channel.Control, Bytes = size == 3 ? 0 : 1 << size };
                     var treq = Treq(channel);
                     if(treq >= 59 && treq < 63) channel.TimerCredit--;
+                    else if(treq < 59 && !requests[treq] && pulseCredits[treq] != 0) pulseCredits[treq]--;
                     pending = transfer;
                 }
                 executing = true;
@@ -436,7 +444,7 @@ namespace Antmicro.Renode.Peripherals.DMA
         private bool RequestAvailable(Channel channel)
         {
             var treq = Treq(channel);
-            return treq == 63 || (treq < 59 ? requests[treq] : channel.TimerCredit != 0);
+            return treq == 63 || (treq < 59 ? requests[treq] || pulseCredits[treq] != 0 : channel.TimerCredit != 0);
         }
 
         private void Schedule()
@@ -667,6 +675,8 @@ namespace Antmicro.Renode.Peripherals.DMA
 
         private readonly Channel[] channels;
         private readonly bool[] requests = new bool[59];
+        private readonly uint[] pulseCredits = new uint[59];
+        private const int PulseRequestBase = 64;
         private readonly uint[] irqEnable, irqForce, pacing = new uint[4];
         private readonly ulong[] pacingPhase = new ulong[4];
         private readonly bool[] irqState;

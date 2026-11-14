@@ -20,7 +20,7 @@ namespace Antmicro.Renode.Peripherals.Timers
     // (0..TOP..0). Channel outputs are high while the counter is below CC and
     // drive every GPIO mapped to the slice through the PWM function. A slice's
     // timer fires only when an output changes, the counter wraps or turns.
-    public sealed class RP2_PWM : RP2APBPeripheral
+    public sealed class RP2_PWM : RP2APBPeripheral, INumberedGPIOOutput
     {
         public RP2_PWM(IMachine machine, IRP2ClockSource clocks = null, RP2_GPIOBank0 gpio = null,
             ulong frequency = 125000000, bool rp2350 = false) : base(machine)
@@ -30,6 +30,9 @@ namespace Antmicro.Renode.Peripherals.Timers
             this.rp2350 = rp2350;
             fallbackFrequency = frequency;
             slices = new Slice[rp2350 ? 12 : 8];
+            var connections = new Dictionary<int, IGPIO>();
+            for(var i = 0; i < slices.Length; i++) connections.Add(i, new GPIO());
+            Connections = connections;
             for(var i = 0; i < slices.Length; i++)
             {
                 var slice = new Slice { Index = i };
@@ -77,6 +80,10 @@ namespace Antmicro.Renode.Peripherals.Timers
         }
 
         public GPIO IRQ { get; } = new GPIO();
+
+        // Slice n's DREQ pulses once per counter wrap; connect it to a pulsed
+        // DMA request input.
+        public IReadOnlyDictionary<int, IGPIO> Connections { get; }
 
         // The RP2350's second wrap interrupt; unused on the RP2040.
         public GPIO IRQ1 { get; } = new GPIO();
@@ -301,6 +308,7 @@ namespace Antmicro.Renode.Peripherals.Timers
                 {
                     slice.Counter = 0;
                     rawInterrupts |= 1u << slice.Index;
+                    slice.Wraps++;
                     QueueInterrupts();
                 }
                 else slice.Counter = (ushort)next;
@@ -313,6 +321,7 @@ namespace Antmicro.Renode.Peripherals.Timers
                     slice.Counter = 0;
                     slice.CountingDown = false;
                     rawInterrupts |= 1u << slice.Index;
+                    slice.Wraps++;
                     QueueInterrupts();
                 }
                 else slice.Counter = (ushort)(slice.Counter - ticks);
@@ -438,9 +447,15 @@ namespace Antmicro.Renode.Peripherals.Timers
             List<Tuple<int, int>> outputs;
             bool interrupts;
             uint state0, state1;
+            var wraps = new int[slices.Length];
             lock(SyncRoot)
             {
-                if(pending.Count == 0 && !interruptsPending) return;
+                for(var i = 0; i < slices.Length; i++)
+                {
+                    wraps[i] = slices[i].Wraps;
+                    slices[i].Wraps = 0;
+                }
+                if(pending.Count == 0 && !interruptsPending && Array.TrueForAll(wraps, count => count == 0)) return;
                 outputs = new List<Tuple<int, int>>(pending);
                 pending.Clear();
                 interrupts = interruptsPending;
@@ -464,6 +479,14 @@ namespace Antmicro.Renode.Peripherals.Timers
             {
                 IRQ.Set(state0 != 0);
                 IRQ1.Set(state1 != 0);
+            }
+            for(var i = 0; i < wraps.Length; i++)
+            {
+                for(var pulse = 0; pulse < wraps[i]; pulse++)
+                {
+                    Connections[i].Set(true);
+                    Connections[i].Set(false);
+                }
             }
         }
 
@@ -501,6 +524,8 @@ namespace Antmicro.Renode.Peripherals.Timers
             public uint Control, Divider, Compare;
             public ushort Counter, Top;
             public bool CountingDown, Published, BHigh;
+            // Wraps whose DREQ pulses are still to be published.
+            public int Wraps;
             public int Outputs;
             // clk_sys/16 units since the last whole counter tick.
             public ulong Elapsed16;

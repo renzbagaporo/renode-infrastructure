@@ -7,7 +7,10 @@ using System.Collections.Generic;
 using System.Linq;
 
 using Antmicro.Renode.Core;
+using Antmicro.Renode.Peripherals.Bus;
+using Antmicro.Renode.Peripherals.DMA;
 using Antmicro.Renode.Peripherals.GPIOPort;
+using Antmicro.Renode.Peripherals.Memory;
 using Antmicro.Renode.Peripherals.Timers;
 using Antmicro.Renode.Time;
 
@@ -167,6 +170,31 @@ namespace Antmicro.Renode.PeripheralsTests
             gpio.OnGPIO(1, true);
             gpio.OnGPIO(1, false);
             Assert.AreEqual(3u, pwm.ReadDoubleWord(0x08), rising ? "The sixth rising edge" : "The sixth falling edge");
+        }
+
+        [Test]
+        public void ShouldPaceADMAChannelWithOneTransferPerWrap()
+        {
+            var memory = new MappedMemory(machine, 0x1000);
+            var dma = new RP2040_DMA(machine, frequency: 1000000);
+            machine.SystemBus.Register(memory, new BusRangeRegistration(0x20000000, 0x1000));
+            machine.SystemBus.Register(dma, new BusRangeRegistration(0x50000000, 0x1000));
+            pwm.Connections[0].Connect(dma, 64 + 24); // DREQ_PWM_WRAP0, pulsed
+            for(uint i = 0; i < 4; i++) memory.WriteDoubleWord(4 * i, 0x100 + i);
+            // RP2040 CTRL_TRIG: EN, word size, INCR_READ, INCR_WRITE, CHAIN_TO itself, TREQ 24.
+            dma.WriteDoubleWord(0x00, 0x20000000);
+            dma.WriteDoubleWord(0x04, 0x20000100);
+            dma.WriteDoubleWord(0x08, 4);
+            dma.WriteDoubleWord(0x0c, 1u | (2u << 2) | 0x10u | 0x20u | (24u << 15));
+            pwm.WriteDoubleWord(0x10, 9); // TOP 9: a wrap every 10 us
+            pwm.WriteDoubleWord(0x00, 1);
+            Advance(25);
+            Assert.AreEqual(2u, dma.ReadDoubleWord(0x08), "Two wraps, two transfers");
+            Assert.AreEqual(0x101u, memory.ReadDoubleWord(0x104));
+            Assert.AreEqual(0u, memory.ReadDoubleWord(0x108));
+            Advance(20);
+            Assert.AreEqual(0u, dma.ReadDoubleWord(0x08));
+            Assert.AreEqual(0x103u, memory.ReadDoubleWord(0x10c));
         }
 
         private List<bool> Sample(int pin, int microseconds)
