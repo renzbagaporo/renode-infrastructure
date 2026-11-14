@@ -341,6 +341,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             lock(SyncRoot)
             {
                 var now = cycleCounter.Value;
+                // A machine's one-shot timer fires on its due cycle. When a cycle is
+                // not a whole number of nanoseconds (150 MHz), the cycle counter,
+                // started at another phase, can still read the cycle before it. A
+                // timer restarted since it fired is not due yet.
+                if(triggeringMachine.Scheduled && triggeringMachine.DueTick == now + 1 && !triggeringMachine.Timer.Enabled)
+                {
+                    now = triggeringMachine.DueTick;
+                }
                 foreach(var sm in stateMachines)
                 {
                     // A machine whose own pin changes from an earlier cycle have not

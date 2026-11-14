@@ -662,6 +662,30 @@ namespace Antmicro.Renode.PeripheralsTests
         }
 
         [Test]
+        public void ShouldRunEveryDueCycleWhenACycleIsNotAWholeNanosecond()
+        {
+            // At 150 MHz a cycle is 6.67 ns; the machines' timers and the cycle
+            // counter round to nanoseconds at different phases.
+            machine.Dispose();
+            machine = new Machine();
+            gpio = new RP2_GPIOBank0(machine);
+            pio = new RP2040_PIO(machine, gpio, frequency: 150000000);
+            gpio.WriteDoubleWord(4, 6);
+            pio.WriteDoubleWord(0xdc, 1u << 26);
+            Force(0, 0xe081); // set pindirs, 1
+            Load(0xe201, 0xe200); // set pins,1 [2]; set pins,0 [2] (wrapping)
+            pio.WriteDoubleWord(0xcc, 1u << 12); // EXECCTRL: WRAP_TOP 1, WRAP_BOTTOM 0
+            var transitions = 0;
+            gpio.DriveChanged += (pin, value, enabled) => { if(pin == 0) transitions++; };
+            pio.WriteDoubleWord(0, 1);
+            ((BaseClockSource)machine.ClockSource).Advance(TimeInterval.FromNanoseconds(40));
+            transitions = 0;
+            // 600 cycles: one pin change every 3 cycles, give or take the window's ends.
+            ((BaseClockSource)machine.ClockSource).Advance(TimeInterval.FromNanoseconds(4000));
+            Assert.That(transitions, Is.InRange(199, 201));
+        }
+
+        [Test]
         public void ShouldFastForwardACountingJMPLoopWithExactTiming()
         {
             var rise = RunCountingLoops(pauseAt: -1, pauseCycles: 0);
