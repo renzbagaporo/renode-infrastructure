@@ -28,8 +28,16 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         // Input 0 is the physical active-low RUN pin. SRAM retains its contents
         // across RUN on RP2040; externally powered NOR retains its own state.
+        // Inputs 1 and 2 are the cores' NVIC SYSRESETREQ outputs; the request
+        // may come from a debugger on another machine's thread, so the reset
+        // waits for every processor to stop at a safe point.
         public void OnGPIO(int number, bool value)
         {
+            if(number == 1 || number == 2)
+            {
+                if(value) RequestSystemReset();
+                return;
+            }
             if(number != 0 || runHeld == !value) return;
             runHeld = !value;
             if(value)
@@ -45,6 +53,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
                 ApplyRunHold();
             }, unresetable: retained, runRegisteredResetEvents: true, preReset: ApplyRunHold);
+        }
+
+        private void RequestSystemReset()
+        {
+            var retained = machine.GetRegisteredPeripherals().Select(entry => entry.Peripheral)
+                .Where(peripheral => peripheral is WinbondW25QFlash).ToList();
+            machine.RequestResetInSafeState(postReset: ApplyRunHold, unresetable: retained, runRegisteredResetEvents: true, preReset: ApplyRunHold);
         }
 
         private void ApplyRunHold()
