@@ -228,6 +228,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 instructions[address] = (ushort)ApplyOperation(0, value, operation, 0xffff);
                 foreach(var sm in stateMachines)
                 {
+                    if(sm.CountLoop && sm.PC == address) { MaterializeCountLoop(sm); Schedule(sm, advance: false); }
                     if(sm.JumpLoop && sm.PC == address) { ClearExecution(sm); Schedule(sm); }
                 }
                 return;
@@ -235,6 +236,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             if(offset >= 0xc8 && offset < 0x128)
             {
                 var sm = stateMachines[(offset - 0xc8) / 0x18];
+                MaterializeCountLoop(sm);
                 switch((offset - 0xc8) % 0x18)
                 {
                 case 0:
@@ -292,6 +294,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             switch(offset)
             {
             case 0:
+                foreach(var sm in stateMachines) MaterializeCountLoop(sm);
                 var previousControl = control;
                 control = ApplyOperation(control, value, operation, 0xf);
                 var strobes = ApplyOperation(0, value, operation);
@@ -371,6 +374,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 {
                     if(!sm.Scheduled || sm.DueTick > now) continue;
                     sm.Scheduled = false;
+                    sm.CountLoop = false;
                     sm.Timer.Enabled = false;
                     if(ResetHeld || frequency == 0 || (!Enabled(sm) && !sm.Forced)) continue;
                     if(sm.PrefetchOnly)
@@ -403,6 +407,25 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                             sm.Pending = sm.Stalled = sm.JumpLoop = true;
                             sm.Instruction = instruction;
                             sm.LoopCycles = 1 + sm.Delay;
+                        }
+                        else if(fetched && !forced && SideCount(sm) == 0 && sm.PC == pc && (instruction & 31) == pc
+                            && (instruction >> 13) == 0 && (condition == 2 || condition == 4))
+                        {
+                            // A counting delay loop has no effect outside its own
+                            // counter until it falls through: run straight to the
+                            // last iteration, which executes normally.
+                            var usesX = condition == 2;
+                            var counter = usesX ? sm.X : sm.Y;
+                            if(counter > 1)
+                            {
+                                sm.CountLoop = true;
+                                sm.CountLoopUsesX = usesX;
+                                sm.CountLoopStart = sm.Edge256;
+                                sm.CountLoopValue = counter;
+                                sm.CountLoopCycles = 1 + sm.Delay;
+                                sm.Edge256 += (BigInteger)Divider256(sm) * (ulong)sm.CountLoopCycles * counter;
+                                if(usesX) sm.X = 0; else sm.Y = 0;
+                            }
                         }
                         Schedule(sm, advance: false);
                     }
@@ -1133,6 +1156,22 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             sm.StickyMask = 0;
         }
 
+        // Restores the exact counter and next edge of a skipped counting loop at the
+        // current cycle, before anything outside the machine changes or reads it.
+        private void MaterializeCountLoop(StateMachine sm)
+        {
+            if(!sm.CountLoop) return;
+            sm.CountLoop = false;
+            var period = (BigInteger)Divider256(sm) * (ulong)sm.CountLoopCycles;
+            // Iterations due up to and including the current cycle have run.
+            var now = (BigInteger)cycleCounter.Value * 256 + 255;
+            BigInteger done = 0;
+            if(now >= sm.CountLoopStart) done = BigInteger.Min(sm.CountLoopValue, (now - sm.CountLoopStart) / period + 1);
+            var remaining = (uint)(sm.CountLoopValue - done);
+            if(sm.CountLoopUsesX) sm.X = remaining; else sm.Y = remaining;
+            sm.Edge256 = sm.CountLoopStart + done * period;
+        }
+
         private static void ClearExecution(StateMachine sm)
         {
             sm.Pending = sm.Forced = sm.Injected = sm.Started = sm.Shifted = sm.IrqSet = sm.Stalled = sm.RetryNextCycle = sm.JumpLoop = false;
@@ -1200,6 +1239,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             public ushort? Exec;
             public bool Pending, Forced, Injected, Started, Shifted, IrqSet, Stalled, RetryNextCycle, JumpLoop;
             public BigInteger Edge256;
+            // A JMP X--/Y-- to itself skipped to its last iteration; see MaterializeCountLoop.
+            public bool CountLoop, CountLoopUsesX;
+            public BigInteger CountLoopStart;
+            public uint CountLoopValue;
+            public int CountLoopCycles;
         }
 
         private struct InputTransition

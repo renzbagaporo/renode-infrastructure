@@ -662,6 +662,74 @@ namespace Antmicro.Renode.PeripheralsTests
         }
 
         [Test]
+        public void ShouldFastForwardACountingJMPLoopWithExactTiming()
+        {
+            var rise = RunCountingLoops(pauseAt: -1, pauseCycles: 0);
+            // SM0 counts 20, SM1 counts 1: 19 more two-cycle iterations.
+            Assert.AreEqual(38, rise[0] - rise[1]);
+        }
+
+        [Test]
+        public void ShouldResumeAFastForwardedLoopAtItsIterationAfterADisable()
+        {
+            var rise = RunCountingLoops(pauseAt: 15, pauseCycles: 30);
+            Assert.AreEqual(38 + 30, rise[0] - rise[1]);
+        }
+
+        [Test]
+        public void ShouldExposeTheExactCounterOfAFastForwardedLoopToAnExecutedInstruction()
+        {
+            gpio.WriteDoubleWord(4, 6);
+            pio.WriteDoubleWord(0xdc, 1u << 26);
+            Load(0xe034, 0x0141, 0xe001, 0x0003); // set x,20; jmp x-- 1 [1]; set pins,1; jmp 3
+            pio.WriteDoubleWord(0, 1);
+            Advance(2);
+            var first = ExecutedCounter();
+            Advance(10);
+            var second = ExecutedCounter();
+            // Five more two-cycle iterations, each decrementing X once.
+            Assert.AreEqual(first - 5, second);
+            Assert.Less(second, 20u);
+        }
+
+        private uint ExecutedCounter()
+        {
+            Force(0, 0xa0c1); // mov isr, x
+            Force(0, 0x8020); // push block
+            return pio.ReadDoubleWord(0x20);
+        }
+
+        private int[] RunCountingLoops(int pauseAt, int pauseCycles)
+        {
+            gpio.WriteDoubleWord(4, 6); // GPIO0 FUNCSEL = PIO0
+            gpio.WriteDoubleWord(12, 6); // GPIO1 FUNCSEL = PIO0
+            pio.WriteDoubleWord(0xdc, 1u << 26); // SM0 SET_BASE 0
+            pio.WriteDoubleWord(0xdc + 0x18, (1u << 26) | (1u << 5)); // SM1 SET_BASE 1
+            Force(0, 0xe081);
+            Force(1, 0xe081); // set pindirs, 1
+            // SM0 at 0: set x,20; jmp x-- 1 [1]; set pins,1; jmp 3
+            // SM1 at 4: set x,1;  jmp x-- 5 [1]; set pins,1; jmp 7
+            Load(0xe034, 0x0141, 0xe001, 0x0003, 0xe021, 0x0145, 0xe001, 0x0007);
+            Force(1, 0x0004);
+            pio.WriteDoubleWord(0, 3);
+            var rise = new[] { -1, -1 };
+            for(var t = 1; t <= 120; t++)
+            {
+                if(t == pauseAt) pio.WriteDoubleWord(0, 2);
+                if(pauseAt >= 0 && t == pauseAt + pauseCycles) pio.WriteDoubleWord(0, 3);
+                Advance(1);
+                for(var pin = 0; pin < 2; pin++)
+                {
+                    GetOutputState(pin, out var value, out _);
+                    if(value && rise[pin] < 0) rise[pin] = t;
+                }
+            }
+            Assert.Greater(rise[0], 0, "SM0 did not leave its loop");
+            Assert.Greater(rise[1], 0, "SM1 did not leave its loop");
+            return rise;
+        }
+
+        [Test]
         public void ShouldExecuteForcedMOVEXECWhileStateMachineIsDisabled()
         {
             pio.WriteDoubleWord(0xc8, 100u << 16);
