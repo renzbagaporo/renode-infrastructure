@@ -216,7 +216,7 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
                 this.Log(LogLevel.Warning, "Opposing active drivers on a delayed digital wire; resolving low");
             }
             else if(!(low && high)) view.Contended = false;
-            return !low && (high || pullUp || (pullUps && !pullDowns));
+            return !low && (high || pullUp || (pullUps && (!pullDowns || view.Level)));
         }
 
         // Receivers may change their own drive in response; deliver without

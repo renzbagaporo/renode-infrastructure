@@ -189,9 +189,16 @@ namespace Antmicro.Renode.PeripheralsTests
                 left.SetPull(true);
                 Assert.IsTrue(right.Input, "A pull-up raises it");
                 right.SetPull(false);
-                Assert.IsFalse(left.Input, "Opposing pulls resolve low");
-                right.Drive(true, true);
-                Assert.IsTrue(left.Input, "A strong driver wins");
+                Assert.IsTrue(left.Input, "Opposing pulls keep the net high");
+                right.Drive(false, true);
+                Assert.IsFalse(left.Input, "A strong driver wins");
+                right.Drive(false, false);
+                Assert.IsFalse(left.Input, "Released between opposing pulls, the net keeps the driven low");
+                left.SetPull(null);
+                Assert.IsFalse(left.Input, "A pull-down alone holds it low");
+                left.SetPull(true);
+                right.SetPull(null);
+                Assert.IsTrue(left.Input, "A pull-up alone raises it");
             }
         }
 

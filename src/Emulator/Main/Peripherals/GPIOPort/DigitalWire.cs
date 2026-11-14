@@ -23,8 +23,10 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
 
     // A shared digital net with explicit strong drivers, an optional external
     // pull-up and the endpoints' weak pad pulls. With no strong driver the net
-    // is high when pulled up externally, or when some pad pulls it up and none
-    // pulls it down; otherwise it is low. Opposing strong drivers are
+    // is high when pulled up externally or when only pull-ups act on it, and
+    // low when only pull-downs or no pulls act on it. Opposing pad pulls of
+    // similar strength leave it near mid-rail, inside the Schmitt-trigger
+    // inputs' hysteresis, so it keeps its level. Opposing strong drivers are
     // diagnosed; their undefined electrical voltage is represented by a
     // deterministic low level in this model.
     public sealed class DigitalWire : IExternal, IDisposable
@@ -145,7 +147,7 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             var newContention = nextContention && !contended;
             if(newContention) contentionCount++;
             contended = nextContention;
-            var next = !low && (high || pullUp || (pullUps && !pullDowns));
+            var next = !low && (high || pullUp || (pullUps && (!pullDowns || level)));
             if(next != level || newContention)
             {
                 var receivers = next == level ? Array.Empty<Connection>() : topology;
