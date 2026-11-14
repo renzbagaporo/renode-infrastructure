@@ -116,10 +116,14 @@ namespace Antmicro.Renode.UI
 
         private void RedirectedHandling()
         {
-            // For cases in which input has been redirected from a file
+            // For cases in which input has been redirected from a file. At the
+            // end of the input Console.Read returns -1 at once on every call:
+            // pass the end on once and stop reading.
             while(true)
             {
-                ByteRead?.Invoke(Console.Read());
+                var value = Console.Read();
+                ByteRead?.Invoke(value);
+                if(value == -1) return;
             }
         }
 
