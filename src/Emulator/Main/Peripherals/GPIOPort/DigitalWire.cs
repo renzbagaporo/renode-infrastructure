@@ -21,9 +21,12 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
         }
     }
 
-    // A shared digital net with explicit strong drivers and a configurable weak
-    // bias. Opposing strong drivers are diagnosed; their undefined electrical
-    // voltage is represented by a deterministic low level in this model.
+    // A shared digital net with explicit strong drivers, an optional external
+    // pull-up and the endpoints' weak pad pulls. With no strong driver the net
+    // is high when pulled up externally, or when some pad pulls it up and none
+    // pulls it down; otherwise it is low. Opposing strong drivers are
+    // diagnosed; their undefined electrical voltage is represented by a
+    // deterministic low level in this model.
     public sealed class DigitalWire : IExternal, IDisposable
     {
         public DigitalWire(bool pullUp = true)
@@ -37,12 +40,21 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
         public void Connect(IThreeStateGPIO endpoint, int pin)
         {
             endpoint.GetOutputState(pin, out var initialLevel, out var initialEnable);
+            var pulled = endpoint as IPulledThreeStateGPIO;
             var connection = new Connection(endpoint, pin, initialLevel, initialEnable);
+            connection.Pull = pulled?.GetPull(pin);
             connection.Handler = (number, value, enabled) =>
             {
                 if(number == pin)
                 {
                     UpdateDriver(connection, value, enabled);
+                }
+            };
+            connection.PullHandler = (number, pull) =>
+            {
+                if(number == pin)
+                {
+                    UpdatePull(connection, pull);
                 }
             };
             lock(sync)
@@ -58,9 +70,11 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
                 pending.Enqueue(new Notification(new[] { connection }, level, false));
             }
             endpoint.DriveChanged += connection.Handler;
+            if(pulled != null) pulled.PullChanged += connection.PullHandler;
             // Refresh after subscribing so a setup-time transition is not lost.
             endpoint.GetOutputState(pin, out initialLevel, out initialEnable);
             UpdateDriver(connection, initialLevel, initialEnable);
+            if(pulled != null) UpdatePull(connection, pulled.GetPull(pin));
         }
 
         public void Dispose()
@@ -78,6 +92,7 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             foreach(var connection in oldConnections)
             {
                 connection.Endpoint.DriveChanged -= connection.Handler;
+                if(connection.Endpoint is IPulledThreeStateGPIO pulled) pulled.PullChanged -= connection.PullHandler;
             }
         }
 
@@ -99,10 +114,23 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             Publish();
         }
 
+        private void UpdatePull(Connection connection, bool? pull)
+        {
+            lock(sync)
+            {
+                if(disposed) return;
+                connection.Pull = pull;
+                Resolve();
+            }
+            Publish();
+        }
+
         private void Resolve()
         {
             var low = false;
             var high = false;
+            var pullUps = false;
+            var pullDowns = false;
             foreach(var connection in connections)
             {
                 if(connection.Enabled)
@@ -110,12 +138,14 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
                     high |= connection.Level;
                     low |= !connection.Level;
                 }
+                pullUps |= connection.Pull == true;
+                pullDowns |= connection.Pull == false;
             }
             var nextContention = low && high;
             var newContention = nextContention && !contended;
             if(newContention) contentionCount++;
             contended = nextContention;
-            var next = !low && (high || pullUp);
+            var next = !low && (high || pullUp || (pullUps && !pullDowns));
             if(next != level || newContention)
             {
                 var receivers = next == level ? Array.Empty<Connection>() : topology;
@@ -178,7 +208,9 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             public readonly int Pin;
             public bool Level;
             public bool Enabled;
+            public bool? Pull;
             public Action<int, bool, bool> Handler;
+            public Action<int, bool?> PullHandler;
         }
 
         private readonly struct Notification

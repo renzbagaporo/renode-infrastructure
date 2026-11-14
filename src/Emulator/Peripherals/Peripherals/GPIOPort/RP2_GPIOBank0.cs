@@ -16,7 +16,7 @@ using Antmicro.Renode.Peripherals.Miscellaneous;
 namespace Antmicro.Renode.Peripherals.GPIOPort
 {
     [GPIO(NumberOfInputs = 48)]
-    public sealed class RP2_GPIOBank0 : RP2APBPeripheral, IThreeStateGPIO, INumberedGPIOOutput
+    public sealed class RP2_GPIOBank0 : RP2APBPeripheral, IPulledThreeStateGPIO, INumberedGPIOOutput
     {
         public RP2_GPIOBank0(IMachine machine, IRP2GPIO sio = null, bool rp2350 = false, int numberOfPins = 0,
             RP2350_AccessControl accessControl = null, int securityPinOffset = 0) : base(machine)
@@ -39,6 +39,7 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             rawInterruptOffset = rp2350 ? 0x230 : 0xf0;
             control = new uint[registerCount];
             pads = new uint[registerCount];
+            publishedPull = new bool?[registerCount];
             isolated = new bool[registerCount];
             isolatedOutput = new bool[registerCount];
             isolatedEnable = new bool[registerCount];
@@ -197,6 +198,20 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             }
         }
 
+        // The pad's pull resistor: PUE up, PDE down. Both together form a bus
+        // keeper, which holds a level instead of pulling to one.
+        public bool? GetPull(int number)
+        {
+            lock(SyncRoot)
+            {
+                if(!IsBondedPin(number))
+                {
+                    throw new RecoverableException($"GPIO {number} is not bonded on this model");
+                }
+                return PadPull(number);
+            }
+        }
+
         public override void Reset()
         {
             lock(SyncRoot)
@@ -259,6 +274,9 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
                     case NotificationKind.Interrupt:
                         interruptOutputs[notification.Pin].Set(notification.Value);
                         break;
+                    case NotificationKind.Pull:
+                        PullChanged?.Invoke(notification.Pin, notification.Enabled ? notification.Value : (bool?)null);
+                        break;
                     }
                 }
             }
@@ -289,6 +307,8 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
 
         // Consumers resolving a shared wire need both the driven level and OE.
         public event Action<int, bool, bool> DriveChanged;
+
+        public event Action<int, bool?> PullChanged;
 
         protected override uint ReadRegister(long offset)
         {
@@ -555,6 +575,18 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             {
                 notifications.Enqueue(new Notification(NotificationKind.Drive, pin, value, enabled));
             }
+            var pull = PadPull(pin);
+            if(pull != publishedPull[pin])
+            {
+                publishedPull[pin] = pull;
+                notifications.Enqueue(new Notification(NotificationKind.Pull, pin, pull == true, pull.HasValue));
+            }
+        }
+
+        private bool? PadPull(int pin)
+        {
+            var pulls = pads[pin] & 0xc;
+            return pulls == 8 ? true : pulls == 4 ? false : (bool?)null;
         }
 
         private bool ReadPadInput(int pin)
@@ -642,6 +674,7 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             Wire,
             Drive,
             Interrupt,
+            Pull,
         }
 
         private bool resetting;
@@ -663,6 +696,7 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
         private readonly long rawInterruptOffset;
         private readonly uint[] control;
         private readonly uint[] pads;
+        private readonly bool?[] publishedPull;
         private readonly bool?[] external;
         private readonly bool[] sampled;
         private readonly bool[] interruptInput;

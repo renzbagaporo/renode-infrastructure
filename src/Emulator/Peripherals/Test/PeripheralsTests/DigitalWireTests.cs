@@ -176,6 +176,104 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.IsTrue(wire.Level);
         }
 
+        [Test]
+        public void ShouldResolveAnUndrivenNetFromPadPulls()
+        {
+            using(var wire = new DigitalWire(false))
+            {
+                var left = new PulledPin(false);
+                var right = new PulledPin(null);
+                wire.Connect(left, 0);
+                wire.Connect(right, 0);
+                Assert.IsFalse(right.Input, "A pull-down holds the net low");
+                left.SetPull(true);
+                Assert.IsTrue(right.Input, "A pull-up raises it");
+                right.SetPull(false);
+                Assert.IsFalse(left.Input, "Opposing pulls resolve low");
+                right.Drive(true, true);
+                Assert.IsTrue(left.Input, "A strong driver wins");
+            }
+        }
+
+        [Test]
+        public void ShouldLetAnExternalPullUpOverridePadPullDowns()
+        {
+            using(var wire = new DigitalWire(true))
+            {
+                var pad = new PulledPin(false);
+                var other = new Pin();
+                wire.Connect(pad, 0);
+                wire.Connect(other, 0);
+                Assert.IsTrue(other.Input);
+            }
+        }
+
+        [Test]
+        public void ShouldFollowAnRP2PadPull()
+        {
+            var machine = new Machine();
+            try
+            {
+                var bank = new RP2_GPIOBank0(machine);
+                using(var wire = new DigitalWire(false))
+                {
+                    var other = new Pin();
+                    wire.Connect(bank, 6);
+                    wire.Connect(other, 0);
+                    Assert.IsFalse(other.Input, "The reset pad pull-down holds an undriven net low");
+                    bank.SetPadConfiguration(6, 0x5a); // IE, PUE
+                    Assert.IsTrue(other.Input);
+                    bank.SetPadConfiguration(6, 0x52); // IE, no pulls
+                    Assert.IsFalse(other.Input);
+                }
+            }
+            finally
+            {
+                machine.Dispose();
+            }
+        }
+
+        private sealed class PulledPin : IPulledThreeStateGPIO
+        {
+            public PulledPin(bool? pull)
+            {
+                this.pull = pull;
+            }
+
+            public void Reset() { }
+
+            public void GetOutputState(int number, out bool value, out bool enabled)
+            {
+                value = output;
+                enabled = outputEnabled;
+            }
+
+            public bool? GetPull(int number) => pull;
+
+            public void SetPull(bool? value)
+            {
+                pull = value;
+                PullChanged?.Invoke(0, value);
+            }
+
+            public void Drive(bool value, bool enabled)
+            {
+                output = value;
+                outputEnabled = enabled;
+                DriveChanged?.Invoke(0, value, enabled);
+            }
+
+            public void OnGPIO(int number, bool value) => Input = value;
+
+            public bool Input { get; private set; }
+            public event Action<int, bool, bool> DriveChanged;
+            public event Action<int, bool?> PullChanged;
+
+            private bool output;
+            private bool outputEnabled;
+            private bool? pull;
+        }
+
         private sealed class Pin : IThreeStateGPIO
         {
             public void Reset()

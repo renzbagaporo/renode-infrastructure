@@ -29,8 +29,9 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
     // timing. A change reaches the receiving machine at its next
     // synchronization point, where that machine schedules it on its own
     // clock, so the latency must exceed two global quanta. Endpoints on the driving
-    // machine see a change at once. Each machine resolves its strong drivers
-    // and the weak bias as DigitalWire does.
+    // machine see a change at once. Pad pull changes travel the same way. Each
+    // machine resolves its strong drivers, the external pull-up and the pad
+    // pulls as DigitalWire does.
     public sealed class DelayedDigitalWire : IExternal, IDisposable
     {
         public DelayedDigitalWire(bool pullUp = true, TimeInterval latency = default(TimeInterval))
@@ -47,10 +48,16 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
                 throw new RecoverableException("The endpoint does not belong to a machine");
             }
             endpoint.GetOutputState(pin, out var level, out var enabled);
+            var pulled = endpoint as IPulledThreeStateGPIO;
             var connection = new Connection(endpoint, pin, machine, level, enabled);
+            connection.Pull = pulled?.GetPull(pin);
             connection.Handler = (number, value, drive) =>
             {
-                if(number == pin) UpdateDriver(connection, value, drive);
+                if(number == pin) UpdateDriver(connection, value, drive, connection.Pull);
+            };
+            connection.PullHandler = (number, pull) =>
+            {
+                if(number == pin) UpdateDriver(connection, connection.Level, connection.Enabled, pull);
             };
             lock(sync)
             {
@@ -64,18 +71,19 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
                 if(!views.TryGetValue(machine, out var own))
                 {
                     own = new MachineView(machine);
-                    foreach(var other in connections.Where(c => c.Machine != machine)) own.Remote[other] = new Driver(other.Level, other.Enabled);
+                    foreach(var other in connections.Where(c => c.Machine != machine)) own.Remote[other] = new Driver(other.Level, other.Enabled, other.Pull);
                     views.Add(machine, own);
                 }
                 // Setup-time driver states apply to every machine immediately.
-                foreach(var view in views.Values.Where(v => v.Machine != machine)) view.Remote[connection] = new Driver(level, enabled);
+                foreach(var view in views.Values.Where(v => v.Machine != machine)) view.Remote[connection] = new Driver(level, enabled, connection.Pull);
                 own.Level = Resolve(own);
                 own.Pending.Enqueue(new Delivery(connection, own.Level));
                 foreach(var view in views.Values) Refresh(view);
             }
             endpoint.DriveChanged += connection.Handler;
+            if(pulled != null) pulled.PullChanged += connection.PullHandler;
             endpoint.GetOutputState(pin, out level, out enabled);
-            UpdateDriver(connection, level, enabled);
+            UpdateDriver(connection, level, enabled, pulled?.GetPull(pin));
             foreach(var view in views.Values.ToArray()) Publish(view);
         }
 
@@ -90,7 +98,11 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
                 connections.Clear();
                 views.Clear();
             }
-            foreach(var connection in old) connection.Endpoint.DriveChanged -= connection.Handler;
+            foreach(var connection in old)
+            {
+                connection.Endpoint.DriveChanged -= connection.Handler;
+                if(connection.Endpoint is IPulledThreeStateGPIO pulled) pulled.PullChanged -= connection.PullHandler;
+            }
         }
 
         public TimeInterval Latency => latency;
@@ -99,21 +111,22 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
         // machine was further ahead than the latency.
         public ulong LateDeliveries { get { lock(sync) return lateDeliveries; } }
 
-        private void UpdateDriver(Connection connection, bool value, bool enabled)
+        private void UpdateDriver(Connection connection, bool value, bool enabled, bool? pull)
         {
             MachineView own;
             var changes = new List<Tuple<MachineView, RemoteChange, TimeInterval>>();
             lock(sync)
             {
-                if(disposed || (connection.Level == value && connection.Enabled == enabled)) return;
+                if(disposed || (connection.Level == value && connection.Enabled == enabled && connection.Pull == pull)) return;
                 connection.Level = value;
                 connection.Enabled = enabled;
+                connection.Pull = pull;
                 own = views[connection.Machine];
                 Refresh(own);
                 var at = connection.Machine.ClockSource.CurrentValue + latency;
                 foreach(var view in views.Values.Where(v => v.Machine != connection.Machine))
                 {
-                    var change = new RemoteChange(++sequence, connection, new Driver(value, enabled));
+                    var change = new RemoteChange(++sequence, connection, new Driver(value, enabled, pull));
                     view.Scheduled.Enqueue(change);
                     changes.Add(Tuple.Create(view, change, at));
                 }
@@ -184,11 +197,15 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
         {
             var low = false;
             var high = false;
+            var pullUps = false;
+            var pullDowns = false;
             foreach(var connection in connections)
             {
                 var driver = connection.Machine == view.Machine
-                    ? new Driver(connection.Level, connection.Enabled)
+                    ? new Driver(connection.Level, connection.Enabled, connection.Pull)
                     : view.Remote.TryGetValue(connection, out var remote) ? remote : Driver.Released;
+                pullUps |= driver.Pull == true;
+                pullDowns |= driver.Pull == false;
                 if(!driver.Enabled) continue;
                 high |= driver.Level;
                 low |= !driver.Level;
@@ -199,7 +216,7 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
                 this.Log(LogLevel.Warning, "Opposing active drivers on a delayed digital wire; resolving low");
             }
             else if(!(low && high)) view.Contended = false;
-            return !low && (high || pullUp);
+            return !low && (high || pullUp || (pullUps && !pullDowns));
         }
 
         // Receivers may change their own drive in response; deliver without
@@ -251,7 +268,9 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             public readonly IMachine Machine;
             public bool Level;
             public bool Enabled;
+            public bool? Pull;
             public Action<int, bool, bool> Handler;
+            public Action<int, bool?> PullHandler;
         }
 
         private sealed class MachineView
@@ -272,16 +291,18 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
 
         private readonly struct Driver
         {
-            public Driver(bool level, bool enabled)
+            public Driver(bool level, bool enabled, bool? pull)
             {
                 Level = level;
                 Enabled = enabled;
+                Pull = pull;
             }
 
-            public static Driver Released => new Driver(false, false);
+            public static Driver Released => new Driver(false, false, null);
 
             public readonly bool Level;
             public readonly bool Enabled;
+            public readonly bool? Pull;
         }
 
         private readonly struct RemoteChange
