@@ -33,12 +33,16 @@ namespace Antmicro.Renode.Peripherals.Timers
             for(var i = 0; i < slices.Length; i++)
             {
                 var slice = new Slice { Index = i };
-                slice.Timer = new LimitTimer(machine.ClockSource, Math.Max(1ul, CounterFrequency), this, $"slice{i}",
+                // Slice timers count virtual-time ticks, so each event fires on
+                // the first tick of its due cycle; see CycleStart.
+                slice.Timer = new LimitTimer(machine.ClockSource, TimeInterval.TicksPerSecond, this, $"slice{i}",
                     limit: 1, direction: Direction.Ascending, workMode: WorkMode.OneShot, eventEnabled: true);
                 slice.Timer.LimitReached += () => OnEvent(slice);
                 slices[i] = slice;
             }
             if(clocks != null) clocks.ClockChanged += OnClockChanged;
+            cycleAnchorTime = machine.ClockSource.CurrentValue.Ticks;
+            cycleFrequency = CounterFrequency;
             Reset();
         }
 
@@ -48,10 +52,10 @@ namespace Antmicro.Renode.Peripherals.Timers
             {
                 lock(SyncRoot)
                 {
+                    Reanchor();
                     foreach(var slice in slices)
                     {
                         slice.Timer.Reset();
-                        slice.Timer.Frequency = Math.Max(1ul, CounterFrequency);
                         slice.Control = 0;
                         slice.Divider = 1 << 4;
                         slice.Counter = 0;
@@ -189,7 +193,7 @@ namespace Antmicro.Renode.Peripherals.Timers
         private void Settle(Slice slice)
         {
             if(!slice.Timer.Enabled) return;
-            var units = slice.Elapsed16 + slice.Timer.Value * 16;
+            var units = slice.Elapsed16 + (CurrentCycle - slice.StartCycle) * 16;
             slice.Timer.Enabled = false;
             var period = TickPeriod(slice);
             var ticks = (long)(units / period);
@@ -306,14 +310,18 @@ namespace Antmicro.Renode.Peripherals.Timers
             // spaces them unevenly, as the hardware's accumulator does.
             var units = ticks * TickPeriod(slice);
             var cycles = units > slice.Elapsed16 ? (units - slice.Elapsed16 + 15) / 16 : 1;
-            slice.Timer.Restart(Math.Max(1ul, cycles));
+            slice.StartCycle = CurrentCycle;
+            slice.DueCycle = slice.StartCycle + Math.Max(1ul, cycles);
+            var now = machine.ClockSource.CurrentValue.Ticks;
+            var start = CycleStart(slice.DueCycle);
+            slice.Timer.Restart(start > now ? start - now : 1);
         }
 
         private void OnEvent(Slice slice)
         {
             lock(SyncRoot)
             {
-                var units = slice.Elapsed16 + slice.Timer.Limit * 16;
+                var units = slice.Elapsed16 + (slice.DueCycle - slice.StartCycle) * 16;
                 var period = TickPeriod(slice);
                 slice.Elapsed16 = units % period;
                 Advance(slice, (long)(units / period));
@@ -329,17 +337,34 @@ namespace Antmicro.Renode.Peripherals.Timers
                 lock(SyncRoot)
                 {
                     foreach(var slice in slices) Settle(slice);
-                    foreach(var slice in slices)
-                    {
-                        slice.Timer.Frequency = Math.Max(1ul, CounterFrequency);
-                        Schedule(slice);
-                    }
+                    Reanchor();
+                    foreach(var slice in slices) Schedule(slice);
                 }
             });
             PublishPending();
         }
 
         private ulong CounterFrequency => clocks?.SystemFrequency ?? fallbackFrequency;
+
+        // clk_sys cycles elapsed: cycleAnchor at virtual time cycleAnchorTime,
+        // counted at cycleFrequency since then. Cycle c starts at the first
+        // virtual-time tick at which CurrentCycle reads c.
+        private ulong CurrentCycle => cycleAnchor + (ulong)((System.Numerics.BigInteger)(machine.ClockSource.CurrentValue.Ticks - cycleAnchorTime) * cycleFrequency / TimeInterval.TicksPerSecond);
+
+        private ulong CycleStart(ulong cycle)
+        {
+            if(cycleFrequency == 0) return ulong.MaxValue;
+            var cycles = (System.Numerics.BigInteger)cycle - cycleAnchor;
+            return cycleAnchorTime + (ulong)((cycles * TimeInterval.TicksPerSecond + cycleFrequency - 1) / cycleFrequency);
+        }
+
+        // Cycles counted at the old frequency up to now stay counted.
+        private void Reanchor()
+        {
+            cycleAnchor = CurrentCycle;
+            cycleAnchorTime = machine.ClockSource.CurrentValue.Ticks;
+            cycleFrequency = CounterFrequency;
+        }
 
         private uint Interrupts(int bank) => (rawInterrupts & interruptEnable[bank]) | interruptForce[bank];
 
@@ -398,6 +423,9 @@ namespace Antmicro.Renode.Peripherals.Timers
 
         private uint rawInterrupts;
         private bool interruptsPending;
+        private ulong cycleAnchor;
+        private ulong cycleAnchorTime;
+        private ulong cycleFrequency;
 
         private readonly uint[] interruptEnable = new uint[2];
         private readonly uint[] interruptForce = new uint[2];
@@ -428,6 +456,8 @@ namespace Antmicro.Renode.Peripherals.Timers
             public ulong Elapsed16;
             // A negative count is a retarded tick still to be skipped.
             public long PendingTicks;
+            // The clk_sys cycles the running timer started at and fires at.
+            public ulong StartCycle, DueCycle;
         }
     }
 }

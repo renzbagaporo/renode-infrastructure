@@ -108,6 +108,30 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.AreEqual(5u, pwm.ReadDoubleWord(0x08), "The counter wrapped at TOP from the written value");
         }
 
+        [Test]
+        public void ShouldKeepTheCounterOnTheSystemClockWhenACycleIsNotAWholeNanosecond()
+        {
+            // At 150 MHz a cycle is 6.67 ns. Over 1000 periods of 16 cycles
+            // (divider 4, TOP 3) the counter must read each cycle's value.
+            machine.Dispose();
+            machine = new Machine();
+            gpio = new RP2_GPIOBank0(machine);
+            pwm = new RP2_PWM(machine, gpio: gpio, frequency: 150000000);
+            pwm.WriteDoubleWord(0x04, 4 << 4);
+            pwm.WriteDoubleWord(0x10, 3);
+            pwm.WriteDoubleWord(0x0c, 1);
+            pwm.WriteDoubleWord(0x00, 1);
+            ulong now = 0;
+            for(ulong cycle = 0; cycle < 16000; cycle++)
+            {
+                // The middle of the cycle, clear of either rounding of its edges.
+                var middle = (cycle * 20 + 10 + 2) / 3;
+                ((BaseClockSource)machine.ClockSource).Advance(TimeInterval.FromNanoseconds(middle - now));
+                now = middle;
+                Assert.AreEqual((uint)((cycle / 4) % 4), pwm.ReadDoubleWord(0x08), $"Counter at cycle {cycle}");
+            }
+        }
+
         private List<bool> Sample(int pin, int microseconds)
         {
             var samples = new List<bool>();
