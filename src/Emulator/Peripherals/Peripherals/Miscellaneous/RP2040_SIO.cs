@@ -25,6 +25,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             receiveFifos = new[] { new Queue<uint>(), new Queue<uint>() };
             fifoErrors = new uint[CoreCount];
             dividers = new Divider[CoreCount];
+            for(var core = 0; core < CoreCount; core++) for(var i = 0; i < 2; i++) interpolators[core, i] = new RP2_Interpolator(i);
             for(var core = 0; core < CoreCount; core++)
             {
                 dividers[core] = new Divider(this, machine, core);
@@ -56,6 +57,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     }
                     spinlocks |= mask;
                     return mask;
+                }
+                if(offset >= InterpolatorBase && offset < InterpolatorBase + 0x80 && (offset & 3) == 0)
+                {
+                    return interpolators[CurrentCore, (offset - InterpolatorBase) / 0x40].Read((offset - InterpolatorBase) % 0x40);
                 }
 
                 switch((Registers)offset)
@@ -112,6 +117,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 if(IsSpinlockOffset(offset))
                 {
                     spinlocks &= ~(1u << (int)((offset - (long)Registers.Spinlock0) / sizeof(uint)));
+                    return;
+                }
+                if(offset >= InterpolatorBase && offset < InterpolatorBase + 0x80 && (offset & 3) == 0)
+                {
+                    interpolators[CurrentCore, (offset - InterpolatorBase) / 0x40].Write((offset - InterpolatorBase) % 0x40, value);
                     return;
                 }
 
@@ -194,6 +204,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     receiveFifos[core].Clear();
                     fifoErrors[core] = 0;
                     dividers[core].Reset();
+                    for(var i = 0; i < 2; i++) interpolators[core, i].Reset();
                 }
                 UpdateInterrupts();
                 GPIOChanged?.Invoke();
@@ -333,6 +344,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private uint qspiOutputEnable;
 
         private const int CoreCount = 2;
+        private const long InterpolatorBase = 0x80;
+        private readonly RP2_Interpolator[,] interpolators = new RP2_Interpolator[CoreCount, 2];
         private const int FifoCapacity = 8;
         private const int GPIOCount = 30;
         private const int QSPICount = 6;

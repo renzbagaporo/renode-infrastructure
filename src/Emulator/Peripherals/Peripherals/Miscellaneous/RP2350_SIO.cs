@@ -60,7 +60,15 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 Array.Clear(errors, 0, errors.Length);
                 Array.Clear(doorbells, 0, doorbells.Length);
                 Array.Clear(peripheralNonSecure, 0, peripheralNonSecure.Length);
-                for(var bank = 0; bank < 2; bank++) for(var core = 0; core < 2; core++) receive[bank, core].Clear();
+                for(var bank = 0; bank < 2; bank++) for(var core = 0; core < 2; core++)
+                {
+                    receive[bank, core].Clear();
+                    for(var i = 0; i < 2; i++)
+                    {
+                        if(interpolators[bank, core, i] == null) interpolators[bank, core, i] = new RP2_Interpolator(i);
+                        interpolators[bank, core, i].Reset();
+                    }
+                }
                 pending = gpioChanged = true;
             }
             Publish();
@@ -132,6 +140,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                         spinlocks[bank] |= mask;
                         return mask;
                     }
+                    if(offset >= 0x80 && offset < 0x100 && offset % 4 == 0)
+                    {
+                        return interpolators[bank, core, (offset - 0x80) / 0x40].Read((offset - 0x80) % 0x40);
+                    }
                     var gpioMask = GPIOMask(bank);
                     switch(offset)
                     {
@@ -175,6 +187,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     if(offset >= 0x100 && offset < 0x180 && offset % 4 == 0)
                     {
                         spinlocks[bank] &= ~(1u << (int)((offset - 0x100) / 4));
+                        return;
+                    }
+                    if(offset >= 0x80 && offset < 0x100 && offset % 4 == 0)
+                    {
+                        interpolators[bank, core, (offset - 0x80) / 0x40].Write((offset - 0x80) % 0x40, value);
                         return;
                     }
                     if(emulateErratumE2 && offset >= 0x180 && offset < 0x200 && offset % 4 == 0)
@@ -298,6 +315,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private readonly bool emulateErratumE2;
         private readonly object sync = new object();
         private readonly Queue<uint>[,] receive = new Queue<uint>[2, 2];
+        // Interpolators per SIO bank (secure, non-secure) and core.
+        private readonly RP2_Interpolator[,,] interpolators = new RP2_Interpolator[2, 2, 2];
         private readonly uint[,] errors = new uint[2, 2];
         private readonly uint[,] doorbells = new uint[2, 2];
         private readonly uint[] spinlocks = new uint[2];
