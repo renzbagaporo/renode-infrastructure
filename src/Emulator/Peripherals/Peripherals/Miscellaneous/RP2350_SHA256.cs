@@ -20,8 +20,18 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             this.clocks = clocks;
             timer = new LimitTimer(machine.ClockSource, frequency, this, "compression", limit: 57,
                 workMode: WorkMode.OneShot, eventEnabled: true);
-            timer.LimitReached += () => { Compress(); count = 0; sumValid = true; };
-            if(clocks != null) clocks.ClockChanged += UpdateClock;
+            // Timer callbacks run with the clock lock held, as register accesses do.
+            timer.LimitReached += () =>
+            {
+                lock(SyncRoot)
+                {
+                    Compress();
+                    count = 0;
+                    sumValid = true;
+                    UpdateRequest();
+                }
+            };
+            if(clocks != null) clocks.ClockChanged += () => machine.ClockSource.ExecuteInLock(() => { lock(SyncRoot) UpdateClock(); });
             Reset();
         }
 
@@ -37,19 +47,29 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             Array.Clear(sum, 0, sum.Length);
             Array.Clear(words, 0, words.Length);
             UpdateClock();
+            UpdateRequest();
         }
+
+        // DMA request: the core asks for data while it can take the next word of
+        // a block. The DMA issues a read only after its previous write landed,
+        // so the 16th word stops the requests before any word past the block.
+        public GPIO DREQ { get; } = new GPIO();
 
         public new void WriteByte(long offset, byte value)
         {
-            if((offset & 0xffc) == 4) WriteData(value, 1);
+            if((offset & 0xffc) == 4) WriteNarrowData(value, 1);
             else base.WriteByte(offset, value);
         }
 
         public new void WriteWord(long offset, ushort value)
         {
-            if((offset & 0xffc) == 4) WriteData(value, 2);
+            if((offset & 0xffc) == 4) WriteNarrowData(value, 2);
             else base.WriteWord(offset, value);
         }
+
+        // Register accesses take the clock lock before the state lock, the order
+        // the compression timer's callback holds them in.
+        protected override IClockSource AccessClock => machine.ClockSource;
 
         protected override void OnBeforeAccess()
         {
@@ -79,12 +99,24 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 partialBytes = 0;
                 Array.Copy(Initial, sum, sum.Length);
                 sumValid = true;
+                UpdateRequest();
             }
+        }
+
+        protected override void OnResetHeldChanged() => UpdateRequest();
+
+        // Byte and halfword WDATA writes take the same path as word accesses.
+        private void WriteNarrowData(uint value, int bytes)
+        {
+            OnBeforeAccess();
+            machine.ClockSource.ExecuteInLock(() =>
+            {
+                lock(SyncRoot) WriteData(value, bytes);
+            });
         }
 
         private void WriteData(uint value, int bytes)
         {
-            OnBeforeAccess();
             if(ResetHeld) return;
             if(timer.Enabled) { error = true; return; }
             sumValid = false;
@@ -99,6 +131,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 {
                     timer.ResetValue();
                     timer.Enabled = clocks == null || clocks.SystemFrequency != 0;
+                    UpdateRequest();
                 }
             }
         }
@@ -131,7 +164,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             if(clocks == null) return;
             if(clocks.SystemFrequency != 0) timer.Frequency = clocks.SystemFrequency;
             timer.Enabled = count == 16 && clocks.SystemFrequency != 0;
+            UpdateRequest();
         }
+
+        private void UpdateRequest() => DREQ.Set(!ResetHeld && !timer.Enabled && count < 16);
 
         private static uint Ror(uint x, int n) => (x >> n) | (x << (32 - n));
         private static uint Swap(uint x) => (x >> 24) | ((x >> 8) & 0xff00) | ((x << 8) & 0xff0000) | (x << 24);
