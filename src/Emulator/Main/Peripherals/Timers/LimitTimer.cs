@@ -92,6 +92,16 @@ namespace Antmicro.Renode.Peripherals.Timers
             RequestReturnOnCurrentCpu();
         }
 
+        // Sets the limit, restarts the count and enables the timer in one clock
+        // source update, as setting Limit, ResetValue() and Enabled would.
+        public void Restart(ulong limit)
+        {
+            clockSource.ExchangeClockEntryWith(OnLimitReached, oldEntry => oldEntry.With(period: limit,
+                    value: oldEntry.Direction == Direction.Ascending ? 0 : limit, enabled: true),
+                () => { throw new InvalidOperationException("Should not reach here."); });
+            RequestReturnOnCurrentCpu();
+        }
+
         public void ClearInterrupt()
         {
             lock(irqSync)

@@ -449,6 +449,8 @@ namespace Antmicro.Renode.Peripherals.CPU
         // change and when Resume is called as part of a machine reset.
         protected virtual bool IsHeldInReset => false;
 
+        protected bool OnCpuThread => Thread.CurrentThread == cpuThread;
+
         protected virtual void UpdateRequestedHaltedState()
         {
             lock(pauseLock)

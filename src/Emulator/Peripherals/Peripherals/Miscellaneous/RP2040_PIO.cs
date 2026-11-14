@@ -351,9 +351,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     sm.Edge256 += 256;
                     sm.DueTick = now + 1;
                     sm.Timer.Enabled = false;
-                    sm.Timer.Limit = 1;
-                    sm.Timer.ResetValue();
-                    sm.Timer.Enabled = true;
+                    sm.Timer.Restart(1);
                 }
                 ExecuteCycle(now);
             }
@@ -1069,6 +1067,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private void Schedule(StateMachine sm, bool advance = true, bool wake = false, ulong earliestTick = 0)
         {
+            // Disabling first brings the clock up to date before the due tick is
+            // computed; other machines due at this tick run in that update.
             sm.Timer.Enabled = false;
             sm.Scheduled = false;
             sm.PrefetchOnly = false;
@@ -1079,9 +1079,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
                 sm.DueTick = (ulong)earliest;
                 sm.Scheduled = true;
-                sm.Timer.Limit = (ulong)(earliest - now);
-                sm.Timer.ResetValue();
-                sm.Timer.Enabled = true;
+                sm.Timer.Restart((ulong)(earliest - now));
                 return;
             }
             if(advance || sm.Edge256 / 256 < earliest)
@@ -1103,9 +1101,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             var ticks = due - now;
             sm.DueTick = (ulong)due;
             sm.Scheduled = true;
-            sm.Timer.Limit = (ulong)BigInteger.Min(ulong.MaxValue, BigInteger.Max(1, ticks));
-            sm.Timer.ResetValue();
-            sm.Timer.Enabled = true;
+            sm.Timer.Restart((ulong)BigInteger.Min(ulong.MaxValue, BigInteger.Max(1, ticks)));
         }
 
         private ulong CyclesUntilExecution(StateMachine sm)

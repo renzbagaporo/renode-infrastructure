@@ -734,8 +734,16 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         public void RequestReturn()
         {
+            // Between translated-code runs the CPU loop recomputes its next limit
+            // anyway; a request made then would only cut the next run short.
+            if(!insideTranslatedCode && OnCpuThread)
+            {
+                return;
+            }
             TlibSetReturnRequest();
         }
+
+        private volatile bool insideTranslatedCode;
 
         public override void SyncTime()
         {
@@ -796,7 +804,15 @@ namespace Antmicro.Renode.Peripherals.CPU
                 pauseGuard.Enter();
                 lock(executionLock)
                 {
-                    lastTlibResult = (TlibExecutionResult)TlibExecute(checked((int)numberOfInstructionsToExecute));
+                    insideTranslatedCode = true;
+                    try
+                    {
+                        lastTlibResult = (TlibExecutionResult)TlibExecute(checked((int)numberOfInstructionsToExecute));
+                    }
+                    finally
+                    {
+                        insideTranslatedCode = false;
+                    }
                 }
                 pauseGuard.Leave();
             }
