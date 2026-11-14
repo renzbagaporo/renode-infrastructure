@@ -35,15 +35,16 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             this.clocks = clocks;
             function = 6 + pioId;
             this.frequency = clocks == null ? frequency : clocks.SystemFrequency;
-            cycleCounter = new LimitTimer(machine.ClockSource, Math.Max(1ul, this.frequency), this, "cycles",
-                direction: Direction.Ascending, enabled: this.frequency != 0);
+            cycleAnchorTime = machine.ClockSource.CurrentValue.Ticks;
             var connections = new Dictionary<int, IGPIO>();
             for(var index = 0; index < 10; index++) connections.Add(index, new GPIO());
             Connections = new ReadOnlyDictionary<int, IGPIO>(connections);
             for(var index = 0; index < 4; index++)
             {
                 var sm = new StateMachine(index);
-                sm.Timer = new LimitTimer(machine.ClockSource, Math.Max(1ul, this.frequency), this, $"sm{index}",
+                // Machine timers count virtual-time ticks, so each fires on the
+                // first tick of its due cycle; see CycleStart.
+                sm.Timer = new LimitTimer(machine.ClockSource, TimeInterval.TicksPerSecond, this, $"sm{index}",
                     limit: 1, workMode: WorkMode.OneShot, eventEnabled: true);
                 sm.Timer.LimitReached += () => Tick(sm);
                 stateMachines[index] = sm;
@@ -103,7 +104,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     sm.InputCount = 0;
                     sm.Tx.Clear();
                     sm.Rx.Clear();
-                    sm.Edge256 = (BigInteger)cycleCounter.Value * 256;
+                    sm.Edge256 = (BigInteger)CurrentCycle * 256;
                     ClearExecution(sm);
                 }
                 for(var pin = 0; pin < 32; pin++) QueuePin(pin);
@@ -311,7 +312,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     if((strobes & (1u << (8 + sm.Index))) != 0)
                     {
                         var remaining = sm.Scheduled ? CyclesUntilExecution(sm) : 1ul;
-                        sm.Edge256 = (BigInteger)cycleCounter.Value * 256 + Divider256(sm) * remaining;
+                        sm.Edge256 = (BigInteger)CurrentCycle * 256 + Divider256(sm) * remaining;
                     }
                     Reschedule(sm);
                 }
@@ -340,15 +341,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         {
             lock(SyncRoot)
             {
-                var now = cycleCounter.Value;
-                // A machine's one-shot timer fires on its due cycle. When a cycle is
-                // not a whole number of nanoseconds (150 MHz), the cycle counter,
-                // started at another phase, can still read the cycle before it. A
-                // timer restarted since it fired is not due yet.
-                if(triggeringMachine.Scheduled && triggeringMachine.DueTick == now + 1 && !triggeringMachine.Timer.Enabled)
-                {
-                    now = triggeringMachine.DueTick;
-                }
+                var now = CurrentCycle;
                 foreach(var sm in stateMachines)
                 {
                     // A machine whose own pin changes from an earlier cycle have not
@@ -362,7 +355,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     sm.Edge256 += 256;
                     sm.DueTick = now + 1;
                     sm.Timer.Enabled = false;
-                    sm.Timer.Restart(1);
+                    StartTimer(sm, sm.DueTick);
                 }
                 ExecuteCycle(now);
             }
@@ -646,7 +639,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
             case 0:
                 uint pins = 0;
-                var now = cycleCounter.Value;
+                var now = CurrentCycle;
                 // RP2350 SHIFTCTRL.IN_COUNT masks the pins IN and MOV read (0 is 32).
                 if(rp2350) pinCount = Math.Min(pinCount, Threshold((int)(sm.ShiftControl & 31)));
                 for(var bit = 0; bit < pinCount; bit++) if(ReadInput((InBase(sm) + bit) & 31, now)) pins |= 1u << bit;
@@ -758,7 +751,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private void ResolvePinWrites()
         {
-            var now = cycleCounter.Value;
+            var now = CurrentCycle;
             foreach(var sm in stateMachines)
             {
                 if(!HasStalledSideSet(sm) || !ClockEnableAt(sm, now)) continue;
@@ -922,7 +915,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
         }
 
-        private bool ReadInput(int pin) => ReadInput(pin, cycleCounter.Value);
+        private bool ReadInput(int pin) => ReadInput(pin, CurrentCycle);
 
         private bool ReadInput(int pin, ulong now)
         {
@@ -976,7 +969,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             lock(SyncRoot)
             {
                 ReadInput(pin);
-                var now = cycleCounter.Value;
+                var now = CurrentCycle;
                 inputHistory[pin].Enqueue(new InputTransition { Tick = now + 2, Value = level });
                 var visibleTick = now + ((inputSyncBypass & (1u << pin)) != 0 ? 1ul : 2ul);
                 foreach(var sm in stateMachines)
@@ -1043,14 +1036,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         {
             lock(SyncRoot)
             {
+                // Cycles counted at the old frequency up to now stay counted.
+                cycleAnchor = CurrentCycle;
+                cycleAnchorTime = machine.ClockSource.CurrentValue.Ticks;
                 frequency = clocks.SystemFrequency;
-                cycleCounter.Frequency = Math.Max(1ul, frequency);
-                cycleCounter.Enabled = frequency != 0;
-                foreach(var sm in stateMachines)
-                {
-                    sm.Timer.Frequency = Math.Max(1ul, frequency);
-                    Reschedule(sm);
-                }
+                foreach(var sm in stateMachines) Reschedule(sm);
                 BeginPinCycle();
                 ResolvePinWrites();
             }
@@ -1104,13 +1094,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             sm.Scheduled = false;
             sm.PrefetchOnly = false;
             if(ResetHeld || frequency == 0 || (!Enabled(sm) && !sm.Forced) || (sm.Stalled && !wake)) return;
-            var now = (BigInteger)cycleCounter.Value;
+            var now = (BigInteger)CurrentCycle;
             var earliest = BigInteger.Max(now + 1, earliestTick);
             if(sm.Forced)
             {
                 sm.DueTick = (ulong)earliest;
                 sm.Scheduled = true;
-                sm.Timer.Restart((ulong)(earliest - now));
+                StartTimer(sm, sm.DueTick);
                 return;
             }
             if(advance || sm.Edge256 / 256 < earliest)
@@ -1129,21 +1119,20 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     sm.PrefetchOnly = true;
                 }
             }
-            var ticks = due - now;
-            sm.DueTick = (ulong)due;
+            sm.DueTick = (ulong)BigInteger.Min(ulong.MaxValue, due);
             sm.Scheduled = true;
-            sm.Timer.Restart((ulong)BigInteger.Min(ulong.MaxValue, BigInteger.Max(1, ticks)));
+            StartTimer(sm, sm.DueTick);
         }
 
         private ulong CyclesUntilExecution(StateMachine sm)
         {
-            var remaining = sm.Edge256 - ((BigInteger)cycleCounter.Value + 1) * 256;
+            var remaining = sm.Edge256 - ((BigInteger)CurrentCycle + 1) * 256;
             return remaining < 0 ? 1 : (ulong)(remaining / Divider256(sm) + 1);
         }
 
         private BigInteger NextClockEdge(StateMachine sm, ulong divider = 0)
         {
-            var earliest = ((BigInteger)cycleCounter.Value + 1) * 256;
+            var earliest = ((BigInteger)CurrentCycle + 1) * 256;
             if(divider == 0) divider = Divider256(sm);
             var remaining = sm.Edge256 - earliest;
             return remaining >= 0 ? sm.Edge256 - (remaining / divider) * divider
@@ -1172,7 +1161,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             sm.CountLoop = false;
             var period = (BigInteger)Divider256(sm) * (ulong)sm.CountLoopCycles;
             // Iterations due up to and including the current cycle have run.
-            var now = (BigInteger)cycleCounter.Value * 256 + 255;
+            var now = (BigInteger)CurrentCycle * 256 + 255;
             BigInteger done = 0;
             if(now >= sm.CountLoopStart) done = BigInteger.Min(sm.CountLoopValue, (now - sm.CountLoopStart) / period + 1);
             var remaining = (uint)(sm.CountLoopValue - done);
@@ -1277,7 +1266,28 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private readonly Queue<Notification> notifications = new Queue<Notification>();
         private readonly RP2_GPIOBank0 gpio;
         private readonly IRP2ClockSource clocks;
-        private readonly LimitTimer cycleCounter;
+        // clk_sys cycles elapsed: cycleAnchor at virtual time cycleAnchorTime,
+        // counted at the current frequency since then. Cycle c starts at the
+        // first virtual-time tick at which CurrentCycle reads c.
+        private ulong CurrentCycle => cycleAnchor + (ulong)((BigInteger)(machine.ClockSource.CurrentValue.Ticks - cycleAnchorTime) * frequency / TimeInterval.TicksPerSecond);
+
+        private ulong CycleStart(ulong cycle)
+        {
+            var cycles = (BigInteger)cycle - cycleAnchor;
+            return cycleAnchorTime + (ulong)((cycles * TimeInterval.TicksPerSecond + frequency - 1) / frequency);
+        }
+
+        // Fires the machine's timer on the first tick of its due cycle.
+        private void StartTimer(StateMachine sm, ulong due)
+        {
+            if(frequency == 0) return;
+            var now = machine.ClockSource.CurrentValue.Ticks;
+            var start = CycleStart(due);
+            sm.Timer.Restart(start > now ? start - now : 1);
+        }
+
+        private ulong cycleAnchor;
+        private ulong cycleAnchorTime;
         private readonly int function;
         private readonly bool rp2350;
         private readonly HashSet<string> warned = new HashSet<string>();

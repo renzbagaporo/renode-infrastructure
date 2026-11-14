@@ -685,6 +685,40 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.That(transitions, Is.InRange(199, 201));
         }
 
+        [TestCase(125000000ul)]
+        [TestCase(150000000ul)]
+        public void ShouldSampleAPinOnEveryCycleAcrossAutopushes(ulong frequency)
+        {
+            // SM0 drives GPIO0 with a 16-cycle square wave; SM1 samples it with
+            // "in pins, 1" on every cycle into the joined RX FIFO, as the
+            // logic_analyser example does: each period must span 16 samples.
+            machine.Dispose();
+            machine = new Machine();
+            gpio = new RP2_GPIOBank0(machine);
+            pio = new RP2040_PIO(machine, gpio, frequency: frequency);
+            gpio.WriteDoubleWord(4, 6);
+            pio.WriteDoubleWord(0xdc, 1u << 26); // SM0 PINCTRL: SET_COUNT 1, SET_BASE 0
+            Force(0, 0xe081); // set pindirs, 1
+            Load(0xe701, 0xe700, 0x4001); // set pins,1 [7]; set pins,0 [7]; in pins,1
+            pio.WriteDoubleWord(0xcc, 1u << 12); // SM0 EXECCTRL: wrap 0..1
+            pio.WriteDoubleWord(0xcc + 0x18, (2u << 12) | (2u << 7)); // SM1 EXECCTRL: wrap 2..2
+            pio.WriteDoubleWord(0xd0 + 0x18, (1u << 31) | (1u << 18) | (1u << 16)); // SM1 SHIFTCTRL: join RX, shift right, autopush at 32
+            Force(1, 0x0002); // SM1: jmp 2
+            pio.WriteDoubleWord(0, 3);
+            ((BaseClockSource)machine.ClockSource).Advance(TimeInterval.FromNanoseconds(8 * 32 * 1000000000ul / frequency + 100));
+            var samples = new List<bool>();
+            for(var word = 0; word < 8; word++)
+            {
+                Assert.AreEqual(0u, pio.ReadDoubleWord(0x04) & (1u << 9), $"RX FIFO holds word {word}");
+                var value = pio.ReadDoubleWord(0x24);
+                for(var bit = 0; bit < 32; bit++) samples.Add((value & (1u << bit)) != 0);
+            }
+            var rises = new List<int>();
+            for(var i = 1; i < samples.Count; i++) if(samples[i] && !samples[i - 1]) rises.Add(i);
+            Assert.That(rises.Count, Is.GreaterThanOrEqualTo(14));
+            for(var i = 1; i < rises.Count; i++) Assert.AreEqual(16, rises[i] - rises[i - 1], $"Period {i} ends at sample {rises[i]}; rises at {string.Join(", ", rises)}");
+        }
+
         [Test]
         public void ShouldFastForwardACountingJMPLoopWithExactTiming()
         {
