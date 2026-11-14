@@ -41,6 +41,7 @@ namespace Antmicro.Renode.Peripherals.Timers
                 slices[i] = slice;
             }
             if(clocks != null) clocks.ClockChanged += OnClockChanged;
+            if(gpio != null) gpio.InputChanged += OnPinInput;
             cycleAnchorTime = machine.ClockSource.CurrentValue.Ticks;
             cycleFrequency = CounterFrequency;
             Reset();
@@ -140,15 +141,12 @@ namespace Antmicro.Renode.Peripherals.Timers
                 {
                 case 0x0:
                     var control = ApplyOperation(slice.Control, value, operation, 0xff);
-                    if((control & 0x30) != 0 && (control & 0x30) != (slice.Control & 0x30))
-                    {
-                        this.Log(LogLevel.Warning, "Slice {0}: B-input divider modes are not implemented; counting clk_sys", slice.Index);
-                    }
                     if((control & PhaseAdvance) != 0) Step(slice);
                     // Retarding skips the next counter tick.
                     if((control & PhaseRetard) != 0) slice.PendingTicks = -1;
                     if((control & 2) != (slice.Control & 2)) slice.CountingDown = false;
                     slice.Control = control & ~(PhaseRetard | PhaseAdvance);
+                    slice.BHigh = ReadB(slice);
                     break;
                 case 0x4: slice.Divider = ApplyOperation(slice.Divider, value, operation, 0xfff); break;
                 case 0x8: slice.Counter = (ushort)ApplyOperation(slice.Counter, value, operation, 0xffff); slice.Elapsed16 = 0; break;
@@ -170,6 +168,7 @@ namespace Antmicro.Renode.Peripherals.Timers
                     Settle(slice);
                     var bit = (mask & (1u << slice.Index)) != 0;
                     slice.Control = bit ? slice.Control | Enable : slice.Control & ~Enable;
+                    slice.BHigh = ReadB(slice);
                     Schedule(slice);
                 }
                 return;
@@ -184,7 +183,54 @@ namespace Antmicro.Renode.Peripherals.Timers
             QueueInterrupts();
         }
 
-        private bool Running(Slice slice) => !ResetHeld && (slice.Control & Enable) != 0 && CounterFrequency != 0;
+        // The slice's timer runs on clk_sys: always when free-running, while B
+        // is high when gated by B, and never when B's edges clock the divider.
+        private bool Running(Slice slice) => !ResetHeld && (slice.Control & Enable) != 0 && CounterFrequency != 0
+            && (DivMode(slice) == 0 || (DivMode(slice) == GatedByB && slice.BHigh));
+
+        private static uint DivMode(Slice slice) => (slice.Control >> 4) & 3;
+
+        // B pins are inputs in the B-driven divider modes. A level change settles
+        // a gated count; a selected edge advances the divider by one clk_sys cycle.
+        private void OnPinInput(int pin, bool level)
+        {
+            if((pin & 1) == 0 || pin >= (rp2350 ? 48 : 30) || SliceOfPin(pin) >= slices.Length) return;
+            if(gpio.GetFunction(pin) != PwmFunction) return;
+            var slice = slices[SliceOfPin(pin)];
+            machine.ClockSource.ExecuteInLock(() =>
+            {
+                lock(SyncRoot)
+                {
+                    var previous = slice.BHigh;
+                    slice.BHigh = level;
+                    var mode = DivMode(slice);
+                    if(mode == GatedByB && previous != level)
+                    {
+                        Settle(slice);
+                        Schedule(slice);
+                    }
+                    else if(!ResetHeld && (slice.Control & Enable) != 0
+                        && ((mode == RisingEdgesOfB && !previous && level) || (mode == FallingEdgesOfB && previous && !level)))
+                    {
+                        var units = slice.Elapsed16 + 16;
+                        var period = TickPeriod(slice);
+                        slice.Elapsed16 = units % period;
+                        Advance(slice, (long)(units / period));
+                    }
+                }
+            });
+            PublishPending();
+        }
+
+        private bool ReadB(Slice slice)
+        {
+            if(gpio == null) return false;
+            for(var pin = 1; pin < (rp2350 ? 48 : 30); pin += 2)
+            {
+                if(SliceOfPin(pin) == slice.Index && gpio.GetFunction(pin) == PwmFunction && gpio.GetInput(pin)) return true;
+            }
+            return false;
+        }
 
         // Counter ticks are slice.Divider (8.4 fixed point) clk_sys/16 units apart.
         private ulong TickPeriod(Slice slice) => (slice.Divider >> 4) == 0 ? (256u << 4) | (slice.Divider & 0xf) : slice.Divider;
@@ -378,6 +424,7 @@ namespace Antmicro.Renode.Peripherals.Timers
                 if((slice.Control & (4u << channel)) != 0) high = !high;
                 if(high) outputs |= 1 << channel;
             }
+            if(DivMode(slice) != 0) outputs |= BInput;
             if(outputs == slice.Outputs && slice.Published) return;
             slice.Outputs = outputs;
             slice.Published = true;
@@ -408,7 +455,8 @@ namespace Antmicro.Renode.Peripherals.Timers
                     for(var pin = 0; pin < (rp2350 ? 48 : 30); pin++)
                     {
                         if(SliceOfPin(pin) != output.Item1) continue;
-                        gpio.SetPeripheralOutput(PwmFunction, pin, (output.Item2 & (1 << (pin & 1))) != 0, true);
+                        var input = (pin & 1) != 0 && (output.Item2 & BInput) != 0;
+                        gpio.SetPeripheralOutput(PwmFunction, pin, (output.Item2 & (1 << (pin & 1))) != 0, !input);
                     }
                 }
             }
@@ -443,6 +491,8 @@ namespace Antmicro.Renode.Peripherals.Timers
         private const uint PhaseRetard = 1 << 6;
         private const uint PhaseAdvance = 1 << 7;
         private const int PwmFunction = 4;
+        private const int BInput = 4;
+        private const uint GatedByB = 1, RisingEdgesOfB = 2, FallingEdgesOfB = 3;
 
         private sealed class Slice
         {
@@ -450,7 +500,7 @@ namespace Antmicro.Renode.Peripherals.Timers
             public LimitTimer Timer;
             public uint Control, Divider, Compare;
             public ushort Counter, Top;
-            public bool CountingDown, Published;
+            public bool CountingDown, Published, BHigh;
             public int Outputs;
             // clk_sys/16 units since the last whole counter tick.
             public ulong Elapsed16;

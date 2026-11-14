@@ -132,6 +132,43 @@ namespace Antmicro.Renode.PeripheralsTests
             }
         }
 
+        [Test]
+        public void ShouldCountOnlyWhileBIsHighInGatedMode()
+        {
+            var bDriven = true;
+            gpio.DriveChanged += (pin, value, enabled) => { if(pin == 1) bDriven = enabled; };
+            pwm.WriteDoubleWord(0x00, 1 | (1u << 4)); // enable, DIVMODE level-gated by B
+            Assert.IsFalse(bDriven, "B is an input");
+            Advance(10);
+            Assert.AreEqual(0u, pwm.ReadDoubleWord(0x08), "B low: no counting");
+            gpio.OnGPIO(1, true);
+            Advance(30);
+            gpio.OnGPIO(1, false);
+            Advance(20);
+            gpio.OnGPIO(1, true);
+            Advance(10);
+            Assert.AreEqual(40u, pwm.ReadDoubleWord(0x08));
+        }
+
+        [TestCase(2u, true)]
+        [TestCase(3u, false)]
+        public void ShouldClockTheDividerOnBEdges(uint mode, bool rising)
+        {
+            pwm.WriteDoubleWord(0x04, 2u << 4); // divide by 2
+            pwm.WriteDoubleWord(0x00, 1 | (mode << 4));
+            for(var i = 0; i < 5; i++)
+            {
+                gpio.OnGPIO(1, true);
+                Advance(1);
+                gpio.OnGPIO(1, false);
+                Advance(1);
+            }
+            Assert.AreEqual(2u, pwm.ReadDoubleWord(0x08), "5 edges through a divider of 2");
+            gpio.OnGPIO(1, true);
+            gpio.OnGPIO(1, false);
+            Assert.AreEqual(3u, pwm.ReadDoubleWord(0x08), rising ? "The sixth rising edge" : "The sixth falling edge");
+        }
+
         private List<bool> Sample(int pin, int microseconds)
         {
             var samples = new List<bool>();
