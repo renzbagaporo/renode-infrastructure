@@ -138,7 +138,16 @@ namespace Antmicro.Renode.Peripherals.I2C
             UpdateSignals();
         }
 
+        // Reads clear interrupts (CLR_*) and pop the RX FIFO, so the IRQ and DMA
+        // request levels follow every read as they follow every write.
         protected override uint ReadRegister(long offset)
+        {
+            var value = ReadState(offset);
+            UpdateSignals();
+            return value;
+        }
+
+        private uint ReadState(long offset)
         {
             switch(offset)
             {
