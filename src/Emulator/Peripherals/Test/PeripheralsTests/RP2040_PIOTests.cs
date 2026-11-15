@@ -818,6 +818,37 @@ namespace Antmicro.Renode.PeripheralsTests
         }
 
         [Test]
+        public void ShouldKeepTheSpacingOfInputChangesMadeAtCyclesAlreadyRun()
+        {
+            // A delayed wire delivers its edges on the machine clock, while a CPU
+            // access may have run the block ahead of it. Here a whole clocked
+            // word arrives at once with each edge made in the past; the capture
+            // (metalclaw clocked_in: wait 0 / wait 1 on CLK GPIO2, `in pins, 1`
+            // on DIN GPIO3, autopush 32) must still read it.
+            Load(0x203f, 0x20bf, 0x4001);
+            pio.WriteDoubleWord(0xcc, 2u << 12); // wrap 0 to 2
+            pio.WriteDoubleWord(0xd0, 1u << 16); // autopush, 32, left
+            pio.WriteDoubleWord(0xdc, 3u << 15); // IN_BASE DIN
+            pio.WriteDoubleWord(0, 1);
+            Advance(1000);
+            const uint word = 0xf05a3c96;
+            var start = machine.ClockSource.CurrentValue - TimeInterval.FromMicroseconds(300);
+            for(var bit = 0; bit < 32; bit++)
+            {
+                var falling = start + TimeInterval.FromMicroseconds((ulong)bit * 8);
+                using(SignalTime.At(machine, falling))
+                {
+                    gpio.OnGPIO(2, false);
+                    gpio.OnGPIO(3, (word & (0x80000000u >> bit)) != 0);
+                }
+                using(SignalTime.At(machine, falling + TimeInterval.FromMicroseconds(4))) gpio.OnGPIO(2, true);
+            }
+            Advance(400);
+            Assert.AreEqual(1u, (pio.ReadDoubleWord(0x0c) >> 4) & 0xf, "The capture did not push one word");
+            Assert.AreEqual(word, pio.ReadDoubleWord(0x20));
+        }
+
+        [Test]
         public void ShouldNotParkALoopThatPollsItsFIFO()
         {
             // pull noblock; mov x, osr; jmp 0: a loop which takes TX data as it

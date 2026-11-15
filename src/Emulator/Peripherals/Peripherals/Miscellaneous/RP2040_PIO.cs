@@ -1107,7 +1107,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             lock(SyncRoot)
             {
                 ReadInput(pin);
-                var now = CurrentCycle;
+                var now = ArrivalCycle();
                 inputHistory[pin].Enqueue(new InputTransition { Tick = now + 2, Value = level });
                 var visibleTick = now + ((inputSyncBypass & (1u << pin)) != 0 ? 1ul : 2ul);
                 foreach(var sm in stateMachines)
@@ -1125,6 +1125,29 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                         Schedule(sm, wake: true, earliestTick: visibleTick);
                 }
             }
+        }
+
+        // The cycle an input change reaches the synchronizers at. A change made
+        // at a cycle the block has already run, because a CPU access brought it
+        // ahead of the machine clock (CatchUpToAccessor), arrives now; a burst
+        // of such changes on any pins keeps its spacing from there, so a fast
+        // signal (a clock and its data) is delayed whole instead of having its
+        // edges land on one cycle, where they would cancel.
+        private ulong ArrivalCycle()
+        {
+            var now = CurrentCycle;
+            var made = CycleAt(SignalTime.Of(machine));
+            if(made >= now) return now;
+            if(lateArrival < now || made < lateMade) lateArrival = now;
+            else lateArrival += made - lateMade;
+            lateMade = made;
+            return lateArrival;
+        }
+
+        private ulong CycleAt(TimeInterval time)
+        {
+            if(time.Ticks <= cycleAnchorTime) return cycleAnchor;
+            return cycleAnchor + (ulong)((BigInteger)(time.Ticks - cycleAnchorTime) * frequency / TimeInterval.TicksPerSecond);
         }
 
         private int InputDependency(StateMachine sm)
@@ -1638,6 +1661,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private ulong cycleAnchor;
         private ulong cycleAnchorTime;
         private ulong aheadCycle;
+        // The latest late input change: the cycle it was made at, and the one it arrived at.
+        private ulong lateMade, lateArrival;
         private readonly int function;
         private readonly bool rp2350;
         private readonly HashSet<string> warned = new HashSet<string>();
