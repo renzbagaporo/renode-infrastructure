@@ -46,6 +46,39 @@ namespace Antmicro.Renode.PeripheralsTests
             }
         }
 
+        [Test]
+        public void ShouldCountAonTimeAndWakeDormantCrystalOnAlarm()
+        {
+            using(var standalone = new Machine())
+            {
+                var xosc = new RP2_XOSC(standalone, rp2350: true);
+                var power = new RP2350_POWMAN(standalone, null, null, null, null, new TestPort(standalone, null, null, null), xosc: xosc);
+                Action<ulong> advanceMilliseconds = ms => ((BaseClockSource)standalone.ClockSource).Advance(TimeInterval.FromMilliseconds(ms));
+
+                power.WriteDoubleWord(0x6c, 0x5afe03e8); // SET_TIME_15TO0 = 1000 ms
+                power.WriteDoubleWord(0x88, 0x5afe0002); // TIMER.RUN
+                advanceMilliseconds(5);
+                Assert.AreEqual(1005u, power.ReadDoubleWord(0x74));
+
+                power.WriteDoubleWord(0x84, 0x5afe03f2); // ALARM_15TO0 = 1010 ms
+                power.WriteDoubleWord(0x88, 0x5afe0012); // RUN | ALARM_ENAB
+                power.WriteDoubleWord(0xe4, 0x2);        // INTE.TIMER
+                xosc.WriteDoubleWord(0x0, 0xfabaa0);
+                xosc.WriteDoubleWord(0x8, 0x636f6d61);   // DORMANT
+                Assert.AreEqual(0ul, xosc.Frequency);
+                advanceMilliseconds(4);
+                Assert.IsFalse(power.TimerIRQ.IsSet);
+                advanceMilliseconds(2);
+                Assert.IsTrue(power.TimerIRQ.IsSet);
+                Assert.AreEqual(0x40u, power.ReadDoubleWord(0x88) & 0x40);
+                Assert.AreEqual(0x77616b65u, xosc.ReadDoubleWord(0x8));
+
+                power.WriteDoubleWord(0x88, 0x5afe0042); // RUN, clear ALARM
+                Assert.IsFalse(power.TimerIRQ.IsSet);
+                Assert.AreEqual(0u, power.ReadDoubleWord(0x88) & 0x40);
+            }
+        }
+
         [TestCase(false)]
         [TestCase(true)]
         public void ShouldRunAnActualArmAircrWriteAndExecuteTheRequestedRiscVEngine(bool alreadyRunning)

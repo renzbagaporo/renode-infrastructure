@@ -35,6 +35,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public override void Reset()
         {
             control = 0;
+            enabled = false;
             startup = 0;
             dormant = false;
             stable = false;
@@ -91,17 +92,23 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 var next = ApplyOperation(control, value, operation, 0xffffff);
                 var enable = (next >> 12) & 0xfff;
                 var range = next & 0xfff;
-                if(enable != EnableValue && enable != DisableValue)
+                // CTRL keeps the written ENABLE bits, so an atomic set of ENABLE
+                // after a plain FREQ_RANGE write decodes; an invalid code
+                // leaves the oscillator in its previous state.
+                var wasEnabled = IsEnabled;
+                if(enable == EnableValue || enable == DisableValue)
+                {
+                    enabled = enable == EnableValue;
+                }
+                else
                 {
                     badWrite = true;
-                    next = (next & 0xfff) | (control & 0xfff000);
                 }
                 if(range < 0xaa0 || range > maximumRange)
                 {
                     badWrite = true;
                     next = (next & 0xfff000) | (control & 0xfff);
                 }
-                var wasEnabled = IsEnabled;
                 control = next;
                 if(wasEnabled != IsEnabled)
                 {
@@ -155,9 +162,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             ClockChanged?.Invoke();
         }
 
-        private bool IsEnabled => ((control >> 12) & 0xfff) == EnableValue;
+        private bool IsEnabled => enabled;
 
         private uint control;
+        private bool enabled;
         private uint startup;
         private bool dormant;
         private bool stable;

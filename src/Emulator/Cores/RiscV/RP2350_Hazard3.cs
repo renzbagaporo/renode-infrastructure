@@ -17,7 +17,7 @@ namespace Antmicro.Renode.Peripherals.CPU
     // the SystemBus engine registration slots are independent identifiers.
     public sealed class RP2350_Hazard3 : RiscV32, ISystemEventReceiver, IPeripheralWithTransactionState
     {
-        public RP2350_Hazard3(IMachine machine, uint hartId = 0, RP2350_Clocks clocks = null, bool architectureEnabled = false)
+        public RP2350_Hazard3(IMachine machine, uint hartId = 0, bool architectureEnabled = false)
             : base(machine, "rv32imac_zicsr_zifencei_zba_zbb_zbs_zbkb_zcb_zcmp", hartId: hartId,
                 privilegedArchitecture: PrivilegedArchitecture.Priv1_11,
                 interruptMode: InterruptMode.Direct, privilegeLevels: PrivilegeLevels.MachineUser,
@@ -27,11 +27,6 @@ namespace Antmicro.Renode.Peripherals.CPU
             ResetVector = 0x7dfc;
             architectureHeld = !architectureEnabled;
             UpdateRequestedHaltedState();
-            if(clocks != null)
-            {
-                clocks.ClockChanged += () => machine.LocalTimeSource.ExecuteInNearestSyncedState(_ =>
-                    Clocked = clocks.SystemFrequency != 0);
-            }
         }
 
         public override void OnGPIO(int number, bool value)

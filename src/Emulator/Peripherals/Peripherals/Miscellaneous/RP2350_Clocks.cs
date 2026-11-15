@@ -160,7 +160,27 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 }
                 nvic.Clocked = systemFrequency != 0;
             }
+            GateCores(systemFrequency != 0);
             ClockChanged?.Invoke();
+        }
+
+        // Every core stops while clk_sys is stopped. The core that stopped it
+        // halts after its current instruction; the other cores at their next
+        // synchronization point, which keeps this core's locks out of theirs.
+        private void GateCores(bool clocked)
+        {
+            machine.SystemBus.TryGetCurrentCPU(out var current);
+            foreach(var cpu in machine.SystemBus.GetCPUs())
+            {
+                if(cpu == current)
+                {
+                    cpu.Clocked = clocked;
+                }
+                else if(cpu.Clocked != clocked)
+                {
+                    machine.LocalTimeSource.ExecuteInNearestSyncedState(_ => cpu.Clocked = GetFrequency(SystemClock) != 0);
+                }
+            }
         }
 
         private ulong ReferenceSourceFrequency(uint source)

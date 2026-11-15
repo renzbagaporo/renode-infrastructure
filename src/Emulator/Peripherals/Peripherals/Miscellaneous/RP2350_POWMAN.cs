@@ -15,6 +15,8 @@ using Antmicro.Renode.Peripherals.IRQControllers;
 using Antmicro.Renode.Peripherals.Memory;
 using Antmicro.Renode.Peripherals.MemoryControllers;
 using Antmicro.Renode.Peripherals.SPI;
+using Antmicro.Renode.Peripherals.Timers;
+using Antmicro.Renode.Time;
 
 namespace Antmicro.Renode.Peripherals.Miscellaneous
 {
@@ -23,8 +25,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public RP2350_POWMAN(IMachine machine, CortexM core0, CortexM core1, NVIC nvic0, NVIC nvic1,
             RP2350_DebugPort debugPort, RP2350_BootRAM bootRAM = null, RP2350_XIP xip = null,
             MappedMemory sramLow = null, MappedMemory sramHigh = null,
-            RP2350_ArchitectureSelector architectureSelector = null) : base(machine)
+            RP2350_ArchitectureSelector architectureSelector = null, RP2_XOSC xosc = null, RP2350_ROSC rosc = null) : base(machine)
         {
+            this.xosc = xosc;
+            this.rosc = rosc;
+            alarmTimer = new LimitTimer(machine.ClockSource, TimeInterval.TicksPerSecond, this, "aon alarm",
+                limit: 1, direction: Direction.Ascending, workMode: WorkMode.OneShot, eventEnabled: true);
+            alarmTimer.LimitReached += OnAlarmTime;
             cores = new[] { core0, core1 };
             nvics = new[] { nvic0, nvic1 };
             this.debugPort = debugPort;
@@ -49,6 +56,16 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             debugConfiguration = 0;
             watchdogSelect = 0;
             powerState = timerControl = 0;
+            alarmTimer?.Reset();
+            timerBase = 0;
+            timerStart = 0;
+            alarmTime = 0;
+            timerSource = TimerSource.LowPowerOscillator;
+            interruptRaw = interruptEnable = interruptForce = 0;
+            sequencerConfiguration = 0x001000f0;
+            tickFrequency = new uint[] { 0x20, 0xc49c, 0x2ee0, 0 };
+            lastPowerUp = 0;
+            UpdateInterrupt();
             Array.Clear(powerUp, 0, powerUp.Length);
             Array.Clear(scratch, 0, scratch.Length);
             bootRAM?.SetPowerPresent(true);
@@ -138,7 +155,26 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             case 0x2c: return chipReset;
             case 0x30: return watchdogSelect;
             case 0x38: return powerState;
-            case 0x88: return timerControl;
+            case 0x34: return sequencerConfiguration;
+            case 0x50: case 0x54: case 0x58: case 0x5c: return tickFrequency[(offset - 0x50) / 4];
+            case 0x60: return (uint)(timerBase >> 48) & 0xffff;
+            case 0x64: return (uint)(timerBase >> 32) & 0xffff;
+            case 0x68: return (uint)(timerBase >> 16) & 0xffff;
+            case 0x6c: return (uint)timerBase & 0xffff;
+            case 0x70: return (uint)(CurrentTime >> 32);
+            case 0x74: return (uint)CurrentTime;
+            case 0x78: return (uint)(alarmTime >> 48) & 0xffff;
+            case 0x7c: return (uint)(alarmTime >> 32) & 0xffff;
+            case 0x80: return (uint)(alarmTime >> 16) & 0xffff;
+            case 0x84: return (uint)alarmTime & 0xffff;
+            case 0x88:
+                return timerControl | (TimerRunning && timerSource == TimerSource.Crystal ? UsingXosc : 0)
+                    | (TimerRunning && timerSource == TimerSource.LowPowerOscillator ? UsingLposc : 0);
+            case 0xa0: return lastPowerUp;
+            case 0xe0: return interruptRaw;
+            case 0xe4: return interruptEnable;
+            case 0xe8: return interruptForce;
+            case 0xec: return (interruptRaw | interruptForce) & interruptEnable;
             case 0x8c: case 0x90: case 0x94: case 0x98: return powerUp[(offset - 0x8c) / 4];
             case 0xa4: return debugPowerConfiguration;
             case 0xa8: return bootDisable;
@@ -156,6 +192,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 var index = (offset - 0xb0) / 4;
                 scratch[index] = ApplyOperation(scratch[index], value, operation);
                 return;
+            }
+            switch(offset)
+            {
+            case 0xe0: interruptRaw &= ~(ApplyOperation(0, value, operation) & ~TimerInterrupt); UpdateInterrupt(); return;
+            case 0xe4: interruptEnable = ApplyOperation(interruptEnable, value, operation, 0xf); UpdateInterrupt(); return;
+            case 0xe8: interruptForce = ApplyOperation(interruptForce, value, operation, 0xf); UpdateInterrupt(); return;
+            case 0xec: return;
             }
             // Registers through DBGCONFIG require the 16-bit password, including
             // atomic aliases. Scratch and interrupt registers are not protected.
@@ -185,23 +228,48 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 }
                 if(request != current)
                 {
-                    powerState |= 0x2000;
-                    machine.LocalTimeSource.ExecuteInNearestSyncedState(_ =>
+                    // Powering the switched core off waits (STATE.WAITING) until
+                    // both processors sleep; any other change starts at once.
+                    var generation = Volatile.Read(ref resetGeneration);
+                    if((request & SwitchedCoreOff) != 0 && (current & SwitchedCoreOff) == 0)
                     {
-                        var previous = powerState & 0xf;
-                        powerState = (request << 4) | request;
-                        if((request & ~previous & 2) != 0) sramLow?.ZeroAll();
-                        if((request & ~previous & 1) != 0) sramHigh?.ZeroAll();
-                        bootRAM?.SetPowerPresent((request & 4) == 0);
-                        xip?.SetPowerPresent((request & 4) == 0);
-                        machine.SystemBus.SetAddressRangeLocked(new Antmicro.Renode.Core.Range(0x20000000, 0x40000), (request & 2) != 0);
-                        machine.SystemBus.SetAddressRangeLocked(new Antmicro.Renode.Core.Range(0x20040000, 0x42000), (request & 1) != 0);
-                        foreach(var core in cores) core.CpuWaitSignal.Set((request & 8) != 0);
-                    });
+                        powerState |= StateWaiting;
+                        machine.LocalTimeSource.ExecuteInNearestSyncedState(_ => EnterPowerStateWhenAsleep(request, generation));
+                    }
+                    else
+                    {
+                        powerState |= StateChanging;
+                        machine.LocalTimeSource.ExecuteInNearestSyncedState(_ =>
+                        {
+                            if(generation == Volatile.Read(ref resetGeneration)) EnterPowerState(request);
+                        });
+                    }
                 }
                 break;
+            case 0x34:
+                sequencerConfiguration = ApplyOperation(sequencerConfiguration, value, operation, 0x003000f3);
+                break;
+            case 0x50: case 0x54: case 0x58: case 0x5c:
+                // LPOSC/XOSC_FREQ_KHZ: the 1 kHz tick divisors. The timer
+                // counts virtual milliseconds, so they are stored only.
+                var tick = (offset - 0x50) / 4;
+                tickFrequency[tick] = ApplyOperation(tickFrequency[tick], value, operation, tick == 0 ? 0x3fu : 0xffffu);
+                break;
+            case 0x60: case 0x64: case 0x68: case 0x6c:
+                // SET_TIME is written while the timer is stopped (16 bits each).
+                var setShift = (int)(0x6c - offset) * 4;
+                var setPart = ((ulong)ApplyOperation((uint)(timerBase >> setShift) & 0xffff, value, operation, 0xffff)) << setShift;
+                timerBase = (timerBase & ~(0xffffUL << setShift)) | setPart;
+                ScheduleAlarm();
+                break;
+            case 0x78: case 0x7c: case 0x80: case 0x84:
+                var alarmShift = (int)(0x84 - offset) * 4;
+                var alarmPart = ((ulong)ApplyOperation((uint)(alarmTime >> alarmShift) & 0xffff, value, operation, 0xffff)) << alarmShift;
+                alarmTime = (alarmTime & ~(0xffffUL << alarmShift)) | alarmPart;
+                ScheduleAlarm();
+                break;
             case 0x88:
-                timerControl = ApplyOperation(timerControl, value, operation, 0x7ff);
+                WriteTimer(ApplyOperation(timerControl, value, operation, 0x7ff), value, operation);
                 break;
             case 0x8c: case 0x90: case 0x94: case 0x98:
                 var powerIndex = (offset - 0x8c) / 4;
@@ -225,6 +293,141 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 break;
             }
         }
+
+        public GPIO TimerIRQ { get; } = new GPIO();
+
+        protected override IClockSource AccessClock => machine.ClockSource;
+
+        protected override void OnBeforeAccess()
+        {
+            if(machine.SystemBus.TryGetCurrentContextState<CortexM.ContextState>(out var _, out var state) && state.DebugAccess) return;
+            if(machine.SystemBus.TryGetTransactionInitiator(out var initiator) && initiator is ICPU cpu) cpu.SyncTime();
+        }
+
+        // AON timer (datasheet 6.5.2): a 64-bit millisecond counter on a 1 kHz
+        // tick from LPOSC or XOSC, modelled from virtual time. Its alarm raises
+        // TIMER.ALARM and INTR.TIMER, wakes a dormant XOSC or ROSC, and with
+        // PWRUP_ON_ALARM powers the switched core back up.
+        private ulong CurrentTime => TimerRunning ? timerBase + (NowTicks - timerStart) / TicksPerMillisecond : timerBase;
+        private bool TimerRunning => (timerControl & TimerRun) != 0;
+        private ulong NowTicks => machine.ClockSource.CurrentValue.Ticks;
+
+        private void WriteTimer(uint next, uint value, AtomicOperation operation)
+        {
+            var now = CurrentTime;
+            var strobes = operation == AtomicOperation.Clear ? 0 : value;
+            // ALARM is write-1-to-clear through any alias; CLEAR, USE_LPOSC and
+            // USE_XOSC are self-clearing strobes.
+            var alarm = (timerControl & TimerAlarm) != 0 && (value & TimerAlarm) == 0;
+            timerControl = (next & 0x33) | (alarm ? TimerAlarm : 0);
+            if((strobes & TimerClearStrobe) != 0) now = 0;
+            if((strobes & UseLposc) != 0) timerSource = TimerSource.LowPowerOscillator;
+            if((strobes & UseXosc) != 0) timerSource = TimerSource.Crystal;
+            timerBase = now;
+            timerStart = NowTicks;
+            if(!alarm) interruptRaw &= ~TimerInterrupt;
+            ScheduleAlarm();
+            UpdateInterrupt();
+        }
+
+        private void ScheduleAlarm()
+        {
+            alarmTimer.Enabled = false;
+            if(!TimerRunning || (timerControl & TimerAlarmEnable) == 0) return;
+            var now = CurrentTime;
+            if(alarmTime <= now)
+            {
+                RaiseAlarm();
+                return;
+            }
+            // The next tick boundary at or after the alarm time.
+            var dueTicks = timerStart + (alarmTime - timerBase) * TicksPerMillisecond;
+            var nowTicks = NowTicks;
+            alarmTimer.Restart(dueTicks > nowTicks ? dueTicks - nowTicks : 1);
+        }
+
+        private void OnAlarmTime()
+        {
+            lock(SyncRoot)
+            {
+                if(TimerRunning && (timerControl & TimerAlarmEnable) != 0 && CurrentTime >= alarmTime) RaiseAlarm();
+                else ScheduleAlarm();
+            }
+        }
+
+        private void RaiseAlarm()
+        {
+            alarmTimer.Enabled = false;
+            timerControl |= TimerAlarm;
+            interruptRaw |= TimerInterrupt;
+            UpdateInterrupt();
+            // Wake a dormant oscillator: the alarm is a dormant wake source.
+            if(xosc != null && xosc.ReadDoubleWord(0x8) == DormantValue) xosc.WriteDoubleWord(0x8, WakeValue);
+            if(rosc != null && rosc.ReadDoubleWord(0x10) == DormantValue) rosc.WriteDoubleWord(0x10, WakeValue);
+            if((timerControl & TimerPowerUpOnAlarm) != 0 && (powerState & SwitchedCoreOff) != 0) PowerUpSwitchedCore();
+        }
+
+        // The power sequencer brings the switched core up from a low-power state
+        // (P1.x): SRAM domains as SEQ_CFG.HW_PWRUP_SRAMx says, then the
+        // switched core comes out of reset and boots with CHIP_RESET.HAD_SWCORE_PD.
+        private void PowerUpSwitchedCore()
+        {
+            lastPowerUp = 1u << 5; // alarm power-up request
+            var retained = new List<IPeripheral> { this, debugPort };
+            retained.AddRange(machine.GetRegisteredPeripherals().Select(entry => entry.Peripheral).OfType<WinbondW25QFlash>());
+            var sleepState = powerState & 0xf;
+            machine.RequestResetInSafeState(postReset: ApplyRescueHold, unresetable: retained, runRegisteredResetEvents: true, preReset: () =>
+            {
+                var wake = sleepState & ~SwitchedCoreOff;
+                // HW_PWRUP_SRAMx clear means OFF -> ON across the wakeup.
+                if((sequencerConfiguration & 2) == 0) wake &= ~2u;
+                if((sequencerConfiguration & 1) == 0) wake &= ~1u;
+                powerState = (wake << 4) | wake;
+                chipReset = (chipReset & 1) | HadSwitchedCorePowerDown;
+                bootRAM?.SetPowerPresent(true);
+                xip?.SetPowerPresent(true);
+                machine.SystemBus.SetAddressRangeLocked(new Antmicro.Renode.Core.Range(0x20000000, 0x40000), (wake & 2) != 0);
+                machine.SystemBus.SetAddressRangeLocked(new Antmicro.Renode.Core.Range(0x20040000, 0x42000), (wake & 1) != 0);
+                foreach(var core in cores) core.CpuWaitSignal.Set(false);
+                ApplyRescueHold();
+            });
+        }
+
+        private void EnterPowerStateWhenAsleep(uint request, int generation)
+        {
+            if(generation != Volatile.Read(ref resetGeneration) || ((powerState >> 4) & 0xf) != request) return;
+            if(!Enumerable.Range(0, 2).All(IsAsleep))
+            {
+                machine.LocalTimeSource.ExecuteInNearestSyncedState(_ => EnterPowerStateWhenAsleep(request, generation));
+                return;
+            }
+            powerState &= ~StateWaiting;
+            EnterPowerState(request);
+        }
+
+        // WFI and WFE both count: the bootrom parks core 1 in WFE.
+        private bool IsAsleep(int number)
+        {
+            var core = GetProcessor(number);
+            if(core.IsHalted || core.HasAnyHaltingCondition) return true;
+            var nvic = core is CortexM ? nvics[number] : null;
+            return nvic != null && (nvic.InSleep.IsSet || nvic.InDeepSleep.IsSet);
+        }
+
+        private void EnterPowerState(uint request)
+        {
+            var previous = powerState & 0xf;
+            powerState = (request << 4) | request;
+            if((request & ~previous & 2) != 0) sramLow?.ZeroAll();
+            if((request & ~previous & 1) != 0) sramHigh?.ZeroAll();
+            bootRAM?.SetPowerPresent((request & 4) == 0);
+            xip?.SetPowerPresent((request & 4) == 0);
+            machine.SystemBus.SetAddressRangeLocked(new Antmicro.Renode.Core.Range(0x20000000, 0x40000), (request & 2) != 0);
+            machine.SystemBus.SetAddressRangeLocked(new Antmicro.Renode.Core.Range(0x20040000, 0x42000), (request & 1) != 0);
+            foreach(var core in cores) core.CpuWaitSignal.Set((request & SwitchedCoreOff) != 0);
+        }
+
+        private void UpdateInterrupt() => TimerIRQ.Set(((interruptRaw | interruptForce) & interruptEnable & TimerInterrupt) != 0);
 
         private void ApplyRescueHold()
         {
@@ -294,7 +497,40 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private readonly uint[] scratch = new uint[12];
         private readonly uint[] powerUp = new uint[4];
         private uint powerState;
+        private uint[] tickFrequency;
         private uint timerControl;
+        private ulong timerBase;
+        private ulong timerStart;
+        private ulong alarmTime;
+        private TimerSource timerSource;
+        private uint interruptRaw;
+        private uint interruptEnable;
+        private uint interruptForce;
+        private uint sequencerConfiguration;
+        private uint lastPowerUp;
+        private readonly LimitTimer alarmTimer;
+        private readonly RP2_XOSC xosc;
+        private readonly RP2350_ROSC rosc;
+
+        private static readonly ulong TicksPerMillisecond = TimeInterval.TicksPerSecond / 1000;
+        private const uint TimerRun = 1u << 1;
+        private const uint TimerClearStrobe = 1u << 2;
+        private const uint TimerAlarmEnable = 1u << 4;
+        private const uint TimerPowerUpOnAlarm = 1u << 5;
+        private const uint TimerAlarm = 1u << 6;
+        private const uint UseLposc = 1u << 8;
+        private const uint UseXosc = 1u << 9;
+        private const uint UsingXosc = 1u << 16;
+        private const uint UsingLposc = 1u << 17;
+        private const uint TimerInterrupt = 1u << 1;
+        private const uint SwitchedCoreOff = 1u << 3;
+        private const uint HadSwitchedCorePowerDown = 1u << 25;
+        private const uint StateWaiting = 1u << 12;
+        private const uint StateChanging = 1u << 13;
+        private const uint DormantValue = 0x636f6d61;
+        private const uint WakeValue = 0x77616b65;
+
+        private enum TimerSource { LowPowerOscillator, Crystal }
         private uint chipReset;
         private uint bootDisable;
         private uint watchdogSelect;

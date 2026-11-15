@@ -116,6 +116,20 @@ namespace Antmicro.Renode.PeripheralsTests
         }
 
         [Test]
+        public void ShouldRestartCrystalWithSdkSequenceAfterDisable()
+        {
+            xosc.WriteDoubleWord(0x0, 0xfabaa0);
+            xosc.WriteDoubleWord(0x0, 0xd1eaa0);
+            // xosc_init: CTRL = FREQ_RANGE, then an atomic set of ENABLE.
+            xosc.WriteDoubleWord(0x0, 0xaa0);
+            Assert.AreEqual(0u, xosc.ReadDoubleWord(0x4) & 0x1000);
+            xosc.WriteDoubleWord(0x2000, 0xfab000);
+            Assert.AreEqual(0xfabaa0u, xosc.ReadDoubleWord(0x0));
+            Assert.AreEqual(12000000ul, xosc.Frequency);
+            Assert.AreEqual(0x80001000u, xosc.ReadDoubleWord(0x4) & 0x80001000);
+        }
+
+        [Test]
         public void ShouldRequireCrystalAndValidPoweredPLL()
         {
             pllSys.WriteDoubleWord(0x8, 125);
