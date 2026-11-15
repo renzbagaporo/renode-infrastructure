@@ -506,12 +506,20 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 if(AutoPush(sm) && sm.InputCount >= PushThreshold(sm)) complete = Push(sm, true);
                 break;
             case 3: // OUT
+                // A forced OUT (SMx_INSTR) refills an exhausted OSR and shifts in
+                // the one execution, and never refills after it, so it consumes
+                // exactly one TX word: pio_sm_drain_tx_fifo, which issues forced
+                // OUTs until the FIFO is empty, then leaves the OSR empty.
                 if(AutoPull(sm) && sm.OutputCount >= PullThreshold(sm))
                 {
-                    if(TryPull(sm)) sm.RetryNextCycle = true;
-                    else debug |= 1u << (24 + sm.Index);
-                    complete = false;
-                    break;
+                    var pulled = TryPull(sm);
+                    if(!pulled || !sm.Forced)
+                    {
+                        if(pulled) sm.RetryNextCycle = true;
+                        else debug |= 1u << (24 + sm.Index);
+                        complete = false;
+                        break;
+                    }
                 }
                 var outCount = BitCount(argument);
                 var data = OutRight(sm) ? sm.OSR & Mask(outCount) : sm.OSR >> (32 - outCount);
@@ -528,7 +536,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 case 6: sm.ISR = data; sm.InputCount = outCount; break;
                 case 7: sm.Exec = (ushort)data; break;
                 }
-                if(AutoPull(sm) && sm.OutputCount >= PullThreshold(sm)) TryPull(sm);
+                if(!sm.Forced && AutoPull(sm) && sm.OutputCount >= PullThreshold(sm)) TryPull(sm);
                 break;
             case 4: // PUSH / PULL
                 if(rp2350 && (argument & 0x10) != 0)
