@@ -269,6 +269,11 @@ namespace Antmicro.Renode.Peripherals.I2C
         {
             var wasEnabled = Enabled;
             var abort = (value & 2) != 0;
+            // A controller holding the bus after a command without STOP cannot
+            // be disabled: it stays active, SCL held, until the next command
+            // (datasheet "Disabling DW_apb_i2c"). The SDK's blocking calls
+            // disable and re-enable around each burst, which must not end it.
+            if(wasEnabled && (value & 1) == 0 && ControllerMode && HoldingWithoutStop) value |= 1;
             enable = value & 5;
             if(wasEnabled && !Enabled)
             {
@@ -708,6 +713,8 @@ namespace Antmicro.Renode.Peripherals.I2C
         private bool ControllerMode => (control & MasterMode) != 0;
         private bool TargetMode => Enabled && !ControllerMode && (control & SlaveDisable) == 0;
         private bool ControllerBusy => transferActive || phase != Phase.Idle;
+        private bool HoldingWithoutStop => transferActive && phase == Phase.Idle && !commandActive && tx.Count == 0
+            && (command & StopCommand) == 0;
         private bool Active => ControllerBusy || targetActive;
         private ulong Frequency => clocks == null ? fallbackFrequency : clocks.SystemFrequency;
         // SCL high lasts HCNT + SPKLEN + 7 ic_clk cycles and low LCNT + 1.
