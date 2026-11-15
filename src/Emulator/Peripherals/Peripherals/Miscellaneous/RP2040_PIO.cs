@@ -971,7 +971,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private void QueuePin(int pin, uint owners = 0)
         {
             notifications.Enqueue(new Notification { Pin = pin + gpioBase, Value = (output & (1u << pin)) != 0,
-                Enabled = (outputEnable & (1u << pin)) != 0, IsPin = true, Owners = owners });
+                Enabled = (outputEnable & (1u << pin)) != 0, IsPin = true, Owners = owners, Time = PinChangeTime() });
             foreach(var sm in stateMachines) if((owners & (1u << sm.Index)) != 0) sm.UndeliveredPinChanges++;
         }
 
@@ -1027,7 +1027,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     }
                     if(notification.IsPin)
                     {
-                        gpio.SetPeripheralOutput(function, notification.Pin, notification.Value, notification.Enabled);
+                        // Delivered after the locks are released: give the change its own time.
+                        using(SignalTime.At(machine, notification.Time)) gpio.SetPeripheralOutput(function, notification.Pin, notification.Value, notification.Enabled);
                         if(notification.Owners != 0)
                         {
                             lock(SyncRoot)
@@ -1081,7 +1082,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 {
                     for(var pin = 0; pin < 32; pin++)
                     {
-                        notifications.Enqueue(new Notification { Pin = pin + gpioBase, IsPin = true });
+                        notifications.Enqueue(new Notification { Pin = pin + gpioBase, IsPin = true, Time = PinChangeTime() });
                     }
                     gpioBase = newBase;
                 }
@@ -1586,6 +1587,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             public int Pin;
             public bool IsPin, Value, Enabled;
             public uint Owners;
+            // When a pin change happened.
+            public TimeInterval Time;
         }
 
         private readonly StateMachine[] stateMachines = new StateMachine[4];
@@ -1611,6 +1614,16 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         {
             var cycles = (BigInteger)cycle - cycleAnchor;
             return cycleAnchorTime + (ulong)((cycles * TimeInterval.TicksPerSecond + frequency - 1) / frequency);
+        }
+
+        // The start of the cycle a pin change is made on, which a CPU access may
+        // have brought ahead of the machine clock (CatchUpToAccessor).
+        private TimeInterval PinChangeTime()
+        {
+            var now = machine.ClockSource.CurrentValue;
+            if(frequency == 0) return now;
+            var start = TimeInterval.FromTicks(CycleStart(CurrentCycle));
+            return start > now ? start : now;
         }
 
         // Fires the machine's timer on the first tick of its due cycle.

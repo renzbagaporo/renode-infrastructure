@@ -12,6 +12,7 @@ using Antmicro.Renode.Core;
 using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.Miscellaneous;
+using Antmicro.Renode.Time;
 
 namespace Antmicro.Renode.Peripherals.GPIOPort
 {
@@ -259,6 +260,9 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
                         }
                         notification = notifications.Dequeue();
                     }
+                    // Changes queued while their source held its clock lock carry
+                    // that time to receivers that timestamp them; see SignalTime.
+                    using(SignalTime.At(machine, notification.Time))
                     switch(notification.Kind)
                     {
                     case NotificationKind.Input:
@@ -561,7 +565,7 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             if(sampled[pin] != input)
             {
                 sampled[pin] = input;
-                notifications.Enqueue(new Notification(NotificationKind.Input, pin, input));
+                notifications.Enqueue(new Notification(NotificationKind.Input, SignalTime.Of(machine), pin, input));
             }
             var irqInput = Override(padInput, (control[pin] >> 28) & 3);
             if(irqInput != interruptInput[pin])
@@ -576,17 +580,17 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             if(wire != wireLevel[pin])
             {
                 wireLevel[pin] = wire;
-                notifications.Enqueue(new Notification(NotificationKind.Wire, pin, wire));
+                notifications.Enqueue(new Notification(NotificationKind.Wire, SignalTime.Of(machine), pin, wire));
             }
             if(driveChanged)
             {
-                notifications.Enqueue(new Notification(NotificationKind.Drive, pin, value, enabled));
+                notifications.Enqueue(new Notification(NotificationKind.Drive, SignalTime.Of(machine), pin, value, enabled));
             }
             var pull = PadPull(pin);
             if(pull != publishedPull[pin])
             {
                 publishedPull[pin] = pull;
-                notifications.Enqueue(new Notification(NotificationKind.Pull, pin, pull == true, pull.HasValue));
+                notifications.Enqueue(new Notification(NotificationKind.Pull, SignalTime.Of(machine), pin, pull == true, pull.HasValue));
             }
         }
 
@@ -641,7 +645,7 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
                 if(state != interruptState[target])
                 {
                     interruptState[target] = state;
-                    notifications.Enqueue(new Notification(NotificationKind.Interrupt, target, state));
+                    notifications.Enqueue(new Notification(NotificationKind.Interrupt, SignalTime.Of(machine), target, state));
                 }
             }
         }
@@ -661,15 +665,17 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
 
         private readonly struct Notification
         {
-            public Notification(NotificationKind kind, int pin, bool value, bool enabled = false)
+            public Notification(NotificationKind kind, TimeInterval time, int pin, bool value, bool enabled = false)
             {
                 Kind = kind;
+                Time = time;
                 Pin = pin;
                 Value = value;
                 Enabled = enabled;
             }
 
             public readonly NotificationKind Kind;
+            public readonly TimeInterval Time;
             public readonly int Pin;
             public readonly bool Value;
             public readonly bool Enabled;

@@ -120,6 +120,11 @@ namespace Antmicro.Renode.Peripherals.UART
             PublishPending();
         }
 
+        // Characters lost to a full receive FIFO, and frames received without a
+        // stop bit, since the peripheral was created: a board reset keeps them.
+        public ulong ReceiveOverruns { get; private set; }
+        public ulong ReceiveFramingErrors { get; private set; }
+
         // Modem inputs are active-low: 0=CTS, 1=DSR, 2=DCD, 3=RI.
         public void OnGPIO(int number, bool value)
         {
@@ -379,7 +384,7 @@ namespace Antmicro.Renode.Peripherals.UART
         {
             if(txLevel == level) return;
             txLevel = level;
-            notifications.Enqueue(new Notification(TransmitLine, level ? 1 : 0, generation));
+            notifications.Enqueue(new Notification(TransmitLine, level ? 1 : 0, generation, machine.ClockSource.CurrentValue));
         }
 
         private void OnPinInput(int pin, bool level)
@@ -496,11 +501,16 @@ namespace Antmicro.Renode.Peripherals.UART
         private void ReceiveCharacter(byte value, uint errors = 0)
         {
             receiveStatus |= errors >> 8 & 7;
-            if((errors & FramingError) != 0) interruptStatus |= FramingInterrupt;
+            if((errors & FramingError) != 0)
+            {
+                if(ReceiveFramingErrors++ == 0) this.Log(LogLevel.Warning, "Received a frame with no stop bit (counted in ReceiveFramingErrors)");
+                interruptStatus |= FramingInterrupt;
+            }
             if((errors & ParityError) != 0) interruptStatus |= ParityInterrupt;
             if((errors & BreakError) != 0) interruptStatus |= BreakInterrupt;
             if(rx.Count >= Capacity)
             {
+                if(ReceiveOverruns++ == 0) this.Log(LogLevel.Warning, "Receive FIFO overrun: a character was lost (counted in ReceiveOverruns)");
                 pendingOverrun = true;
                 receiveStatus |= 8;
                 interruptStatus |= OverrunInterrupt;
@@ -612,9 +622,13 @@ namespace Antmicro.Renode.Peripherals.UART
                     case 2: RxDMA.Set(notification.Value != 0); break;
                     case 3: TxDMA.Set(notification.Value != 0); break;
                     case TransmitLine:
-                        foreach(var pin in txPins) gpio.SetPeripheralOutput(UartFunction, pin, notification.Value != 0, true);
-                        foreach(var pin in txAuxPins) gpio.SetPeripheralOutput(UartAuxFunction, pin, notification.Value != 0, true);
-                        qspiBank?.SetPeripheralOutput(UartAuxFunction, QspiTxPin, notification.Value != 0, true);
+                        // Delivered after the clock lock is released: give the edge its own time.
+                        using(SignalTime.At(machine, notification.Time))
+                        {
+                            foreach(var pin in txPins) gpio.SetPeripheralOutput(UartFunction, pin, notification.Value != 0, true);
+                            foreach(var pin in txAuxPins) gpio.SetPeripheralOutput(UartAuxFunction, pin, notification.Value != 0, true);
+                            qspiBank?.SetPeripheralOutput(UartAuxFunction, QspiTxPin, notification.Value != 0, true);
+                        }
                         break;
                     default: CharReceived?.Invoke((byte)notification.Value); break;
                     }
@@ -656,15 +670,18 @@ namespace Antmicro.Renode.Peripherals.UART
 
         private struct Notification
         {
-            public Notification(int signal, int value, uint generation)
+            public Notification(int signal, int value, uint generation, TimeInterval time = default(TimeInterval))
             {
                 Signal = signal;
                 Value = value;
                 Generation = generation;
+                Time = time;
             }
             public readonly int Signal;
             public readonly int Value;
             public readonly uint Generation;
+            // When a TransmitLine change happened.
+            public readonly TimeInterval Time;
         }
 
         private readonly IRP2ClockSource clocks;

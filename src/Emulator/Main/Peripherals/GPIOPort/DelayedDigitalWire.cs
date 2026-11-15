@@ -123,7 +123,9 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
                 connection.Pull = pull;
                 own = views[connection.Machine];
                 Refresh(own);
-                var at = connection.Machine.ClockSource.CurrentValue + latency;
+                // A change delivered after its driver released its clock lock carries
+                // the time it happened; see SignalTime.
+                var at = SignalTime.Of(connection.Machine) + latency;
                 foreach(var view in views.Values.Where(v => v.Machine != connection.Machine))
                 {
                     var change = new RemoteChange(++sequence, connection, new Driver(value, enabled, pull));
