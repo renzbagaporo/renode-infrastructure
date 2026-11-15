@@ -424,7 +424,7 @@ namespace Antmicro.Renode.Peripherals.SPI
                 var drive = master || (slave && line == DataLine);
                 if(lineEnabled[line] == drive) continue;
                 lineEnabled[line] = drive;
-                notifications.Enqueue(new Notification(line, lineLevels[line], drive, generation));
+                notifications.Enqueue(new Notification(line, lineLevels[line], drive, generation, machine.ClockSource.CurrentValue));
             }
             if(!shifting)
             {
@@ -437,7 +437,7 @@ namespace Antmicro.Renode.Peripherals.SPI
         {
             if(lineLevels[line] == level) return;
             lineLevels[line] = level;
-            notifications.Enqueue(new Notification(line, level, lineEnabled[line], generation));
+            notifications.Enqueue(new Notification(line, level, lineEnabled[line], generation, machine.ClockSource.CurrentValue));
         }
 
         private void UpdateSignals()
@@ -485,9 +485,13 @@ namespace Antmicro.Renode.Peripherals.SPI
                     case SignalBase + 2: TxDMA.Set(notification.Level); break;
                     default:
                         if(gpio == null) break;
-                        foreach(var pin in outputPins[notification.Target])
+                        // Delivered after the locks are released: give the edge its own time.
+                        using(SignalTime.At(machine, notification.Time))
                         {
-                            gpio.SetPeripheralOutput(SpiFunction, pin, notification.Level, notification.Enabled);
+                            foreach(var pin in outputPins[notification.Target])
+                            {
+                                gpio.SetPeripheralOutput(SpiFunction, pin, notification.Level, notification.Enabled);
+                            }
                         }
                         break;
                     }
@@ -548,18 +552,21 @@ namespace Antmicro.Renode.Peripherals.SPI
 
         private readonly struct Notification
         {
-            public Notification(int target, bool level, bool enabled, uint generation)
+            public Notification(int target, bool level, bool enabled, uint generation, TimeInterval time = default(TimeInterval))
             {
                 Target = target;
                 Level = level;
                 Enabled = enabled;
                 Generation = generation;
+                Time = time;
             }
 
             public readonly int Target;
             public readonly bool Level;
             public readonly bool Enabled;
             public readonly uint Generation;
+            // When a line change happened.
+            public readonly TimeInterval Time;
         }
 
         private readonly IRP2ClockSource clocks;

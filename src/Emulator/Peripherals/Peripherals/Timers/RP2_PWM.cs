@@ -437,14 +437,14 @@ namespace Antmicro.Renode.Peripherals.Timers
             if(outputs == slice.Outputs && slice.Published) return;
             slice.Outputs = outputs;
             slice.Published = true;
-            pending.Enqueue(Tuple.Create(slice.Index, outputs));
+            pending.Enqueue(Tuple.Create(slice.Index, outputs, machine.ClockSource.CurrentValue));
         }
 
         private void QueueInterrupts() => interruptsPending = true;
 
         private void PublishPending()
         {
-            List<Tuple<int, int>> outputs;
+            List<Tuple<int, int, TimeInterval>> outputs;
             bool interrupts;
             uint state0, state1;
             var wraps = new int[slices.Length];
@@ -456,7 +456,7 @@ namespace Antmicro.Renode.Peripherals.Timers
                     slices[i].Wraps = 0;
                 }
                 if(pending.Count == 0 && !interruptsPending && Array.TrueForAll(wraps, count => count == 0)) return;
-                outputs = new List<Tuple<int, int>>(pending);
+                outputs = new List<Tuple<int, int, TimeInterval>>(pending);
                 pending.Clear();
                 interrupts = interruptsPending;
                 interruptsPending = false;
@@ -467,11 +467,15 @@ namespace Antmicro.Renode.Peripherals.Timers
             {
                 foreach(var output in outputs)
                 {
-                    for(var pin = 0; pin < (rp2350 ? 48 : 30); pin++)
+                    // Delivered after the locks are released: give the change its own time.
+                    using(SignalTime.At(machine, output.Item3))
                     {
-                        if(SliceOfPin(pin) != output.Item1) continue;
-                        var input = (pin & 1) != 0 && (output.Item2 & BInput) != 0;
-                        gpio.SetPeripheralOutput(PwmFunction, pin, (output.Item2 & (1 << (pin & 1))) != 0, !input);
+                        for(var pin = 0; pin < (rp2350 ? 48 : 30); pin++)
+                        {
+                            if(SliceOfPin(pin) != output.Item1) continue;
+                            var input = (pin & 1) != 0 && (output.Item2 & BInput) != 0;
+                            gpio.SetPeripheralOutput(PwmFunction, pin, (output.Item2 & (1 << (pin & 1))) != 0, !input);
+                        }
                     }
                 }
             }
@@ -500,7 +504,7 @@ namespace Antmicro.Renode.Peripherals.Timers
 
         private readonly uint[] interruptEnable = new uint[2];
         private readonly uint[] interruptForce = new uint[2];
-        private readonly Queue<Tuple<int, int>> pending = new Queue<Tuple<int, int>>();
+        private readonly Queue<Tuple<int, int, TimeInterval>> pending = new Queue<Tuple<int, int, TimeInterval>>();
         private readonly Slice[] slices;
         private readonly IRP2ClockSource clocks;
         private readonly RP2_GPIOBank0 gpio;
