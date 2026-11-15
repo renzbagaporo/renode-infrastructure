@@ -752,23 +752,23 @@ namespace Antmicro.Renode.PeripheralsTests
         }
 
         [Test]
-        public void ShouldParkAFollowLoopAndKeepItsOutputTimingExact()
+        public void ShouldParkAFollowLoopAndKeepItsOutputTimingExact([Values(false, true)] bool rp2350)
         {
             // metalclaw gpio_link follow: GPIO0 takes GPIO1 through `mov pins, pins`.
-            var parked = RunSteadyLoopScenario(true, ConfigureFollow, FollowStimulus, out var parkedWhileIdle);
-            var running = RunSteadyLoopScenario(false, ConfigureFollow, FollowStimulus, out _);
+            var parked = RunSteadyLoopScenario(true, ConfigureFollow, FollowStimulus, out var parkedWhileIdle, rp2350);
+            var running = RunSteadyLoopScenario(false, ConfigureFollow, FollowStimulus, out _, rp2350);
             Assert.Greater(parked.Count(e => e.StartsWith("pin 0 ")), 20, "The follower did not follow its input");
             CollectionAssert.AreEqual(running, parked);
             Assert.IsTrue(parkedWhileIdle, "The follow loop was not parked while its input held");
         }
 
         [Test]
-        public void ShouldParkAJoinIdleLoopAndResumeItAtTheRightStep()
+        public void ShouldParkAJoinIdleLoopAndResumeItAtTheRightStep([Values(false, true)] bool rp2350)
         {
             // metalclaw gpio_link join, A = GPIO2, B = GPIO3, idling in its
             // four-step test loop with side-set on every step.
-            var parked = RunSteadyLoopScenario(true, ConfigureJoin, JoinStimulus, out var parkedWhileIdle);
-            var running = RunSteadyLoopScenario(false, ConfigureJoin, JoinStimulus, out _);
+            var parked = RunSteadyLoopScenario(true, ConfigureJoin, JoinStimulus, out var parkedWhileIdle, rp2350);
+            var running = RunSteadyLoopScenario(false, ConfigureJoin, JoinStimulus, out _, rp2350);
             Assert.Greater(parked.Count(e => e.StartsWith("pin ")), 4, "The join did not forward any low");
             Assert.Greater(parked.Select(e => e.StartsWith("addr ") ? e.Split(' ')[2] : null).Where(a => a != null).Distinct().Count(), 2,
                 "The ADDR reads did not land on different steps");
@@ -793,14 +793,14 @@ namespace Antmicro.Renode.PeripheralsTests
         }
 
         [Test]
-        public void ShouldMatchUnparkedExecutionForRandomPinLoops([Range(0, 9)] int group)
+        public void ShouldMatchUnparkedExecutionForRandomPinLoops([Range(0, 9)] int group, [Values(false, true)] bool rp2350)
         {
             var parkedPrograms = 0;
             for(var index = 0; index < 20; index++)
             {
                 var seed = group * 1000 + index;
-                var parked = RunRandomLoops(seed, true, out var sawParked);
-                var running = RunRandomLoops(seed, false, out _);
+                var parked = RunRandomLoops(seed, true, out var sawParked, rp2350);
+                var running = RunRandomLoops(seed, false, out _, rp2350);
                 CollectionAssert.AreEqual(running, parked, $"Seed {seed} differs with loop parking");
                 if(sawParked) parkedPrograms++;
             }
@@ -809,14 +809,14 @@ namespace Antmicro.Renode.PeripheralsTests
 
         // Two machines run random pin-only programs (no FIFO or IRQ access) at
         // random dividers, under random pin edges, ADDR reads and no-op writes.
-        private List<string> RunRandomLoops(int seed, bool park, out bool sawParked)
+        private List<string> RunRandomLoops(int seed, bool park, out bool sawParked, bool rp2350 = false)
         {
             var random = new Random(seed);
             var benchMachine = new Machine();
             try
             {
                 var benchGpio = new RP2_GPIOBank0(benchMachine);
-                var benchPio = new RP2040_PIO(benchMachine, benchGpio, frequency: 1000000) { ParkSteadyLoops = park };
+                var benchPio = new RP2040_PIO(benchMachine, benchGpio, frequency: 1000000, rp2350: rp2350) { ParkSteadyLoops = park };
                 var log = new List<string>();
                 benchGpio.DriveChanged += (pin, value, enabled) =>
                     log.Add($"pin {pin} {value} {enabled} at {benchMachine.ClockSource.CurrentValue.Ticks}");
@@ -890,13 +890,13 @@ namespace Antmicro.Renode.PeripheralsTests
         }
 
         private List<string> RunSteadyLoopScenario(bool park, Action<RP2_GPIOBank0, RP2040_PIO> configure,
-            Action<RP2_GPIOBank0, RP2040_PIO, Action<ulong>, List<string>> stimulus, out bool parkedWhileIdle)
+            Action<RP2_GPIOBank0, RP2040_PIO, Action<ulong>, List<string>> stimulus, out bool parkedWhileIdle, bool rp2350 = false)
         {
             var benchMachine = new Machine();
             try
             {
                 var benchGpio = new RP2_GPIOBank0(benchMachine);
-                var benchPio = new RP2040_PIO(benchMachine, benchGpio, frequency: 1000000) { ParkSteadyLoops = park };
+                var benchPio = new RP2040_PIO(benchMachine, benchGpio, frequency: 1000000, rp2350: rp2350) { ParkSteadyLoops = park };
                 var log = new List<string>();
                 benchGpio.DriveChanged += (pin, value, enabled) =>
                     log.Add($"pin {pin} {value} {enabled} at {benchMachine.ClockSource.CurrentValue.Ticks}");
