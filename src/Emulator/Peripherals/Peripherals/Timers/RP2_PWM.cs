@@ -68,7 +68,10 @@ namespace Antmicro.Renode.Peripherals.Timers
                         slice.CountingDown = false;
                         slice.Elapsed16 = 0;
                         slice.PendingTicks = 0;
+                        // Publish the reset levels even though they may equal the
+                        // last ones computed: the pins still show the old levels.
                         slice.Outputs = 0;
+                        slice.Published = false;
                     }
                     rawInterrupts = 0;
                     for(var i = 0; i < 2; i++) interruptEnable[i] = interruptForce[i] = 0;

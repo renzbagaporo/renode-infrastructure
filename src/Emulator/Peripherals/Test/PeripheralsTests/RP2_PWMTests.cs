@@ -197,6 +197,25 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.AreEqual(0x103u, memory.ReadDoubleWord(0x10c));
         }
 
+        [Test]
+        public void ShouldDriveTheResetLevelAfterAResetFromAHighOutput()
+        {
+            // pwm_measure_duty_cycle's restart: the last run left A at 100%,
+            // and after a reset the pin must go low, as a CC of 0 keeps it.
+            pwm.WriteDoubleWord(0x10, 9);
+            pwm.WriteDoubleWord(0x0c, 10); // CC A above TOP: always high
+            pwm.WriteDoubleWord(0x00, 1);
+            Advance(5);
+            Assert.IsTrue(gpio.GetInput(0), "A is not high before the reset");
+            pwm.Reset();
+            Advance(1);
+            Assert.IsFalse(gpio.GetInput(0), "A kept its level from before the reset");
+            pwm.WriteDoubleWord(0x10, 9);
+            pwm.WriteDoubleWord(0x00, 1); // enabled with CC 0
+            Advance(20);
+            Assert.IsFalse(gpio.GetInput(0), "A at CC 0 is not low");
+        }
+
         private List<bool> Sample(int pin, int microseconds)
         {
             var samples = new List<bool>();
