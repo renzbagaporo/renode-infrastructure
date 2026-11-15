@@ -10,6 +10,7 @@ using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.Bus;
 using Antmicro.Renode.Peripherals.CPU;
 using Antmicro.Renode.Peripherals.GPIOPort;
+using Antmicro.Renode.Time;
 
 namespace Antmicro.Renode.Peripherals.Miscellaneous
 {
@@ -70,6 +71,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     }
                 }
                 pending = gpioChanged = true;
+                gpioChangeTime = machine.ClockSource.CurrentValue;
             }
             Publish();
         }
@@ -120,6 +122,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     }
                     if(group == 0) gpioOutput = previous; else gpioEnable = previous;
                     gpioChanged = pending = true;
+                    gpioChangeTime = RP2CpuTime.AccessTime(machine);
                     return previous & allowed;
                 }
             }
@@ -212,6 +215,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                         }
                         if(enable) gpioEnable = previous; else gpioOutput = previous;
                         gpioChanged = pending = true;
+                        gpioChangeTime = RP2CpuTime.AccessTime(machine);
                         return;
                     }
                     switch(offset)
@@ -283,12 +287,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 {
                     bool change;
                     ulong output;
+                    TimeInterval changeTime;
                     var fifo = new bool[4]; var bell = new bool[4];
                     lock(sync)
                     {
                         if(!pending) { publishing = false; return; }
                         pending = false;
                         change = gpioChanged; gpioChanged = false;
+                        changeTime = gpioChangeTime;
                         output = gpioOutput;
                         for(var bank = 0; bank < 2; bank++) for(var core = 0; core < 2; core++)
                         {
@@ -302,8 +308,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     Core0NonSecureDoorbellIRQ.Set(bell[2]); Core1NonSecureDoorbellIRQ.Set(bell[3]);
                     if(change)
                     {
-                        for(var pin = 0; pin < 64; pin++) Connections[pin].Set((output & (1UL << pin)) != 0);
-                        GPIOChanged?.Invoke();
+                        // A CPU's write changes the pins at that CPU's time; see SignalTime.
+                        using(SignalTime.At(machine, changeTime))
+                        {
+                            for(var pin = 0; pin < 64; pin++) Connections[pin].Set((output & (1UL << pin)) != 0);
+                            GPIOChanged?.Invoke();
+                        }
                     }
                 }
             }
@@ -325,6 +335,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private ulong gpioEnable;
         private bool pending;
         private bool gpioChanged;
+        // When the pending GPIO change was made.
+        private TimeInterval gpioChangeTime;
         private bool publishing;
         private const ulong ImplementedGPIOs = 0xff00ffffffffffffUL;
     }
