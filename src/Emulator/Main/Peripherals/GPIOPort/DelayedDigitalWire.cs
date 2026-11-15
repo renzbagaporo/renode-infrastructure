@@ -92,11 +92,13 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
         public void Dispose()
         {
             Connection[] old;
+            MachineView[] oldViews;
             lock(sync)
             {
                 if(disposed) return;
                 disposed = true;
                 old = connections.ToArray();
+                oldViews = views.Values.ToArray();
                 connections.Clear();
                 views.Clear();
             }
@@ -104,6 +106,21 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             {
                 connection.Endpoint.DriveChanged -= connection.Handler;
                 if(connection.Endpoint is IPulledThreeStateGPIO pulled) pulled.PullChanged -= connection.PullHandler;
+            }
+            // Nothing more arrives: drop the pending delivery and the next
+            // change each endpoint was told of.
+            foreach(var view in oldViews)
+            {
+                var clock = view.Machine.ClockSource;
+                clock.ExecuteInLock(() =>
+                {
+                    if(view.TimerArmed) clock.TryRemoveClockEntry(view.Timer);
+                    view.TimerArmed = false;
+                    foreach(var connection in old.Where(c => c.Machine == view.Machine))
+                    {
+                        (connection.Endpoint as IScheduledInputs)?.SetNextInputChange(connection.Pin, null);
+                    }
+                });
             }
         }
 
