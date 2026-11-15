@@ -51,9 +51,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             case Registers.ForceOn:
                 return forceOn;
             case Registers.ForceOff:
-                // The SDK polls FRCE_OFF itself to confirm that the PE is in
-                // reset. A queued request cannot acknowledge that transition.
-                return (forceOff & ~ProcessorMask) | appliedProcessorReset;
+                // FRCE_OFF reads back as written; a PE it forces off holds
+                // itself before its next instruction (see HoldBeforeReset).
+                return forceOff;
             case Registers.WatchdogSelect:
                 return watchdogSelect;
             case Registers.Done:
@@ -88,7 +88,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 {
                     // Retain an assertion edge even if firmware clears the
                     // request before the synchronization callback can run.
-                    if((~previous & forceOff & ProcessorBit(core)) != 0) requestedReset[core]++;
+                    if((~previous & forceOff & ProcessorBit(core)) == 0) continue;
+                    var sequence = ++requestedReset[core];
+                    var generation = resetGeneration;
+                    var target = core;
+                    (GetProcessor(core) as TranslationCPU)?.ExecuteBeforeNextInstruction(() => HoldBeforeReset(target, sequence, generation));
                 }
                 QueueProcessorUpdate();
                 break;
@@ -182,6 +186,21 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         }
 
         private uint ProcessorBit(int core) => 1u << (processor0Bit + core);
+
+        // A forced-off PE stops at once, as in silicon, rather than at the
+        // synchronized reset: it must not answer, for example, a multicore
+        // launch handshake that the firmware starts after reading FRCE_OFF
+        // back. This runs on the PE's own thread, where the synchronized
+        // reset cannot run concurrently; a request it has completed, or that
+        // a PSM reset withdrew, is skipped.
+        private void HoldBeforeReset(int core, ulong sequence, int generation)
+        {
+            lock(SyncRoot)
+            {
+                if(generation != resetGeneration || completedReset[core] >= sequence) return;
+            }
+            SetProcessorResetHold(core, true);
+        }
 
         protected virtual BaseCPU GetProcessor(int core) => cores[core];
 

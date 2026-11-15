@@ -120,6 +120,18 @@ namespace Antmicro.Renode.Peripherals.CPU
         /// is applied on the CPU thread before the CPU executes another instruction; the last
         /// request for a range wins.
         /// </summary>
+        /// <summary>
+        /// Runs <paramref name="action"/> on the CPU thread before the CPU executes another
+        /// instruction: at once if it is executing, otherwise when it next executes. It runs
+        /// outside the translation library and every peripheral and clock lock, and must
+        /// tolerate running after the condition that queued it has passed.
+        /// </summary>
+        public void ExecuteBeforeNextInstruction(Action action)
+        {
+            InvokeInCpuThreadSafely(action);
+            RequestReturn();
+        }
+
         public void RequestReadOnlyMemoryAccess(Range range, bool direct)
         {
             RequestReadOnlyMemoryAccess(range, () => direct);
