@@ -5,7 +5,6 @@
 
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Peripherals.CPU;
-using Antmicro.Renode.Time;
 
 namespace Antmicro.Renode.Peripherals.Miscellaneous
 {
@@ -18,17 +17,6 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public static void SyncInitiator(IMachine machine)
         {
             if(TryGetInitiator(machine, out var cpu)) cpu.SyncTime();
-        }
-
-        // When the current bus access happens: the issuing CPU's own time, which
-        // runs ahead of the machine clock (the slowest CPU) during a quantum, or
-        // the machine clock for an access without a CPU of its own.
-        public static TimeInterval AccessTime(IMachine machine)
-        {
-            var now = machine.ClockSource.CurrentValue;
-            if(!TryGetInitiator(machine, out var cpu) || cpu.TimeHandle == null) return now;
-            var own = cpu.TimeHandle.TotalElapsedTime;
-            return own > now ? own : now;
         }
 
         // The CPU whose own thread issued the current bus access, unless it is

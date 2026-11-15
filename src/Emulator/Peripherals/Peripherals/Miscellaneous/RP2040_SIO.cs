@@ -320,15 +320,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 field ^= value & mask;
                 break;
             }
-            // A CPU's write changes the pins at that CPU's time; see SignalTime.
-            using(SignalTime.At(machine, RP2CpuTime.AccessTime(machine)))
+            for(var pin = 0; pin < NumberOfConnections; pin++)
             {
-                for(var pin = 0; pin < NumberOfConnections; pin++)
-                {
-                    Connections[pin].Set((Output & (1ul << pin)) != 0);
-                }
-                GPIOChanged?.Invoke();
+                Connections[pin].Set((Output & (1ul << pin)) != 0);
             }
+            GPIOChanged?.Invoke();
         }
 
         private static bool IsSpinlockOffset(long offset)
