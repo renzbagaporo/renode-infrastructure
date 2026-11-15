@@ -90,9 +90,9 @@ namespace Antmicro.Renode.Peripherals.SPI
         {
             if(pin != csPin && pin != sckPin && pin != mosiPin) return;
             bool? miso;
-            // The time the change happened, which may come before the latest
-            // CS change reported earlier: CS often comes from a CPU's SIO write
-            // at that CPU's time, ahead of the PIO or SPI clock edges.
+            // The time the change happened. Changes from different sources
+            // (a CPU's SIO write, a PIO a CPU access ran ahead of the machine
+            // clock) can be reported out of their time order.
             var time = SignalTime.Of(machine);
             lock(sync)
             {
