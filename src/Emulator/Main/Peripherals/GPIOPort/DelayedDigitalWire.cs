@@ -71,6 +71,8 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
                 if(!views.TryGetValue(machine, out var own))
                 {
                     own = new MachineView(machine);
+                    var created = own;
+                    own.Timer = () => OnTimer(created);
                     foreach(var other in connections.Where(c => c.Machine != machine)) own.Remote[other] = new Driver(other.Level, other.Enabled, other.Pull);
                     views.Add(machine, own);
                 }
@@ -114,7 +116,7 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
         private void UpdateDriver(Connection connection, bool value, bool enabled, bool? pull)
         {
             MachineView own;
-            var changes = new List<Tuple<MachineView, RemoteChange, TimeInterval>>();
+            var post = new List<MachineView>();
             lock(sync)
             {
                 if(disposed || (connection.Level == value && connection.Enabled == enabled && connection.Pull == pull)) return;
@@ -130,44 +132,95 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
                 {
                     var change = new RemoteChange(++sequence, connection, new Driver(value, enabled, pull));
                     view.Scheduled.Enqueue(change);
-                    changes.Add(Tuple.Create(view, change, at));
+                    view.Incoming.Enqueue(new Arrival(change.Sequence, at));
+                    if(view.IncomingPosted) continue;
+                    view.IncomingPosted = true;
+                    post.Add(view);
                 }
             }
             // The driver may hold its own clock lock; a receiving machine
-            // schedules the change on its clock at its next synchronization point.
-            foreach(var change in changes)
+            // schedules the changes on its clock at its next synchronization point.
+            foreach(var view in post)
             {
-                var view = change.Item1;
-                var remote = change.Item2;
-                var at = change.Item3;
-                view.Machine.LocalTimeSource.ExecuteInNearestSyncedState(_ => Schedule(view, remote, at));
+                view.Machine.LocalTimeSource.ExecuteInNearestSyncedState(_ => ScheduleIncoming(view));
             }
             Publish(own);
         }
 
-        private void Schedule(MachineView view, RemoteChange change, TimeInterval at)
+        // Puts the changes that arrived since the last synchronization point on
+        // the receiving machine's clock. One clock entry for each machine fires
+        // at the earliest due change: a fast signal keeps thousands of changes
+        // in flight, and a clock entry for each would slow every operation of
+        // that machine's clock source.
+        private void ScheduleIncoming(MachineView view)
         {
             var now = view.Machine.ClockSource.CurrentValue;
-            ulong ticks = 1;
-            if(at > now) ticks = (at - now).Ticks;
-            else
+            lock(sync)
             {
-                lock(sync)
+                if(disposed) return;
+                view.IncomingPosted = false;
+                while(view.Incoming.Count != 0)
                 {
-                    if(lateDeliveries++ == 0)
+                    var arrival = view.Incoming.Dequeue();
+                    var due = arrival.At.Ticks;
+                    if(arrival.At <= now)
                     {
-                        this.Log(LogLevel.Warning, "A machine reached {0} past a delayed wire change; raise the latency above two quanta", now - at);
+                        due = now.Ticks + 1;
+                        if(lateDeliveries++ == 0)
+                        {
+                            this.Log(LogLevel.Warning, "A machine reached {0} past a delayed wire change; raise the latency above two quanta", now - arrival.At);
+                        }
                     }
+                    view.Due.Add((due, arrival.Sequence));
                 }
             }
-            Action handler = null;
-            handler = () =>
+            Arm(view);
+        }
+
+        // (Re)arms the machine's clock entry for its earliest due change. Under
+        // the clock lock, then the wire lock, as deliveries take them.
+        private void Arm(MachineView view)
+        {
+            var clock = view.Machine.ClockSource;
+            clock.ExecuteInLock(() =>
             {
-                Apply(view, change.Sequence);
-                view.Machine.ClockSource.TryRemoveClockEntry(handler);
-            };
-            view.Machine.ClockSource.AddClockEntry(new ClockEntry(ticks, TimeInterval.TicksPerSecond, handler, this,
-                "delayed wire", workMode: WorkMode.OneShot));
+                ulong due;
+                lock(sync)
+                {
+                    if(disposed || view.Due.Count == 0 || (view.TimerArmed && view.TimerDue <= view.Due.Min.Ticks)) return;
+                    due = view.Due.Min.Ticks;
+                    if(view.TimerArmed) clock.TryRemoveClockEntry(view.Timer);
+                    view.TimerArmed = true;
+                    view.TimerDue = due;
+                }
+                var now = clock.CurrentValue.Ticks;
+                clock.AddClockEntry(new ClockEntry(due > now ? due - now : 1, TimeInterval.TicksPerSecond, view.Timer, this,
+                    "delayed wire", workMode: WorkMode.OneShot));
+            });
+        }
+
+        // Runs on the receiving machine's clock. A due change applies with every
+        // change the drivers made before it.
+        private void OnTimer(MachineView view)
+        {
+            var clock = view.Machine.ClockSource;
+            var now = clock.CurrentValue.Ticks;
+            ulong last = 0;
+            var any = false;
+            lock(sync)
+            {
+                clock.TryRemoveClockEntry(view.Timer);
+                view.TimerArmed = false;
+                while(view.Due.Count != 0 && view.Due.Min.Ticks <= now)
+                {
+                    var next = view.Due.Min;
+                    view.Due.Remove(next);
+                    if(next.Sequence >= last) last = next.Sequence;
+                    any = true;
+                }
+            }
+            if(any) Apply(view, last);
+            Arm(view);
         }
 
         // Runs on the receiving machine's clock. Applies every change up to
@@ -285,6 +338,13 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             public readonly IMachine Machine;
             public readonly Dictionary<Connection, Driver> Remote = new Dictionary<Connection, Driver>();
             public readonly Queue<RemoteChange> Scheduled = new Queue<RemoteChange>();
+            // Changes not yet on this machine's clock, and those on it by due tick.
+            public readonly Queue<Arrival> Incoming = new Queue<Arrival>();
+            public readonly SortedSet<(ulong Ticks, ulong Sequence)> Due = new SortedSet<(ulong Ticks, ulong Sequence)>();
+            public bool IncomingPosted;
+            public Action Timer;
+            public bool TimerArmed;
+            public ulong TimerDue;
             public readonly Queue<Delivery> Pending = new Queue<Delivery>();
             public bool Level;
             public bool Contended;
@@ -319,6 +379,18 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             public readonly ulong Sequence;
             public readonly Connection Connection;
             public readonly Driver Driver;
+        }
+
+        private readonly struct Arrival
+        {
+            public Arrival(ulong sequence, TimeInterval at)
+            {
+                Sequence = sequence;
+                At = at;
+            }
+
+            public readonly ulong Sequence;
+            public readonly TimeInterval At;
         }
 
         private readonly struct Delivery
