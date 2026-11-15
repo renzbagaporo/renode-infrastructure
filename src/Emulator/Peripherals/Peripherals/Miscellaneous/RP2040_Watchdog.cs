@@ -137,10 +137,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private void SynchronizeTime()
         {
-            if(machine.SystemBus.TryGetCurrentCPU(out var cpu))
-            {
-                cpu.SyncTime();
-            }
+            RP2CpuTime.SyncInitiator(machine);
         }
 
         private void RequestReset(bool forced)

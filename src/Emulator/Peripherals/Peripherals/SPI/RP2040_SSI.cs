@@ -7,6 +7,7 @@ using System;
 using System.Collections.Generic;
 
 using Antmicro.Renode.Core;
+using Antmicro.Renode.Peripherals.Miscellaneous;
 using Antmicro.Renode.Core.Structure;
 using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
@@ -430,7 +431,7 @@ namespace Antmicro.Renode.Peripherals.SPI
 
         private void SynchronizeTime()
         {
-            if(machine.SystemBus.TryGetCurrentCPU(out var cpu)) cpu.SyncTime();
+            RP2CpuTime.SyncInitiator(machine);
         }
 
         private void UpdateInterrupt()

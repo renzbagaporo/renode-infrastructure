@@ -8,6 +8,7 @@ using System.Collections.Generic;
 using System.Threading;
 
 using Antmicro.Renode.Core;
+using Antmicro.Renode.Peripherals.Miscellaneous;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.CPU;
 using Antmicro.Renode.Peripherals.GPIOPort;
@@ -116,7 +117,7 @@ namespace Antmicro.Renode.Peripherals.SPI
 
         protected override void OnBeforeAccess()
         {
-            if(machine.SystemBus.TryGetTransactionInitiator(out var initiator) && initiator is ICPU cpu) cpu.SyncTime();
+            RP2CpuTime.SyncInitiator(machine);
         }
 
         protected override void OnAccessCompleted() => PublishPending();

@@ -339,9 +339,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private void Tick(StateMachine triggeringMachine)
         {
-            lock(SyncRoot)
+            lock(SyncRoot) TickAt(CurrentCycle);
+            PublishPending();
+        }
+
+        private void TickAt(ulong now)
+        {
             {
-                var now = CurrentCycle;
                 foreach(var sm in stateMachines)
                 {
                     // A machine whose own pin changes from an earlier cycle have not
@@ -359,7 +363,43 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 }
                 ExecuteCycle(now);
             }
-            PublishPending();
+        }
+
+        // A CPU access first runs every cycle due up to that CPU's own time, so
+        // the PIO meets the CPU at the same point of its instruction stream
+        // however far the machine clock (the slowest core) lags it. Pin changes
+        // are delivered after each cycle, as for timer-driven cycles; the timer
+        // events for cycles already run then find nothing due.
+        private void CatchUpToAccessor()
+        {
+            var bus = machine.SystemBus;
+            if(bus.TryGetCurrentContextState<CortexM.ContextState>(out var _, out var state) && state.DebugAccess) return;
+            if(!bus.TryGetTransactionInitiator(out var initiator) || !(initiator is BaseCPU cpu) || !cpu.OnPossessedThread || cpu.TimeHandle == null) return;
+            var target = cpu.TimeHandle.TotalElapsedTime.Ticks;
+            while(true)
+            {
+                var ran = false;
+                machine.ClockSource.ExecuteInLock(() =>
+                {
+                    lock(SyncRoot)
+                    {
+                        if(frequency == 0 || target <= cycleAnchorTime) return;
+                        var targetCycle = cycleAnchor + (ulong)((BigInteger)(target - cycleAnchorTime) * frequency / TimeInterval.TicksPerSecond);
+                        var next = ulong.MaxValue;
+                        foreach(var sm in stateMachines) if(sm.Scheduled && sm.DueTick < next) next = sm.DueTick;
+                        if(next > targetCycle)
+                        {
+                            if(targetCycle > aheadCycle) aheadCycle = targetCycle;
+                            return;
+                        }
+                        if(next > aheadCycle) aheadCycle = next;
+                        TickAt(CurrentCycle);
+                        ran = true;
+                    }
+                });
+                PublishPending();
+                if(!ran) return;
+            }
         }
 
         private void ExecuteCycle(ulong now)
@@ -1045,7 +1085,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             lock(SyncRoot)
             {
                 // Cycles counted at the old frequency up to now stay counted.
-                cycleAnchor = CurrentCycle;
+                cycleAnchor = ClockCycle;
                 cycleAnchorTime = machine.ClockSource.CurrentValue.Ticks;
                 frequency = clocks.SystemFrequency;
                 foreach(var sm in stateMachines) Reschedule(sm);
@@ -1186,15 +1226,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         protected override void OnBeforeAccess()
         {
             SynchronizeTime();
+            CatchUpToAccessor();
         }
 
-        private void SynchronizeTime()
-        {
-            if(machine.SystemBus.TryGetTransactionInitiator(out var initiator) && initiator is ICPU cpu)
-            {
-                cpu.SyncTime();
-            }
-        }
+        private void SynchronizeTime() => RP2CpuTime.SyncInitiator(machine);
 
         private bool Enabled(StateMachine sm) => (control & (1u << sm.Index)) != 0;
         private static int TxCapacity(StateMachine sm) => (sm.ShiftControl & (1u << 31)) != 0 ? 0 : (sm.ShiftControl & (1u << 30)) != 0 ? 8 : 4;
@@ -1277,7 +1312,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // clk_sys cycles elapsed: cycleAnchor at virtual time cycleAnchorTime,
         // counted at the current frequency since then. Cycle c starts at the
         // first virtual-time tick at which CurrentCycle reads c.
-        private ulong CurrentCycle => cycleAnchor + (ulong)((BigInteger)(machine.ClockSource.CurrentValue.Ticks - cycleAnchorTime) * frequency / TimeInterval.TicksPerSecond);
+        private ulong ClockCycle => cycleAnchor + (ulong)((BigInteger)(machine.ClockSource.CurrentValue.Ticks - cycleAnchorTime) * frequency / TimeInterval.TicksPerSecond);
+
+        // The machine clock's cycle, or the cycle an accessing CPU has brought
+        // the machines to (CatchUpToAccessor), whichever is later.
+        private ulong CurrentCycle => Math.Max(ClockCycle, aheadCycle);
 
         private ulong CycleStart(ulong cycle)
         {
@@ -1296,6 +1335,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private ulong cycleAnchor;
         private ulong cycleAnchorTime;
+        private ulong aheadCycle;
         private readonly int function;
         private readonly bool rp2350;
         private readonly HashSet<string> warned = new HashSet<string>();

@@ -8,6 +8,7 @@ using System.Collections.Generic;
 using System.Collections.ObjectModel;
 
 using Antmicro.Renode.Core;
+using Antmicro.Renode.Peripherals.Miscellaneous;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Time;
 
@@ -311,10 +312,7 @@ namespace Antmicro.Renode.Peripherals.Timers
 
         private void SynchronizeTime()
         {
-            if(machine.SystemBus.TryGetCurrentCPU(out var cpu))
-            {
-                cpu.SyncTime();
-            }
+            RP2CpuTime.SyncInitiator(machine);
         }
 
         private ulong frequency;

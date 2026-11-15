@@ -8,6 +8,7 @@ using System.Collections.Generic;
 using System.Threading;
 
 using Antmicro.Renode.Core;
+using Antmicro.Renode.Peripherals.Miscellaneous;
 using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.CPU;
@@ -126,7 +127,7 @@ namespace Antmicro.Renode.Peripherals.I2C
 
         protected override void OnBeforeAccess()
         {
-            if(machine.SystemBus.TryGetTransactionInitiator(out var initiator) && initiator is ICPU cpu) cpu.SyncTime();
+            RP2CpuTime.SyncInitiator(machine);
         }
 
         protected override void OnAccessCompleted() => PublishPending();

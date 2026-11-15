@@ -67,10 +67,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 random = (random >> 1) ^ (bit != 0 ? 0x80200003u : 0);
                 return bit;
             case 0x20:
-                if(machine.SystemBus.TryGetCurrentCPU(out var cpu))
-                {
-                    cpu.SyncTime();
-                }
+                RP2CpuTime.SyncInitiator(machine);
                 return countArmed ? (uint)countTimer.Value : 0;
             default:
                 this.LogUnhandledRead(offset);
