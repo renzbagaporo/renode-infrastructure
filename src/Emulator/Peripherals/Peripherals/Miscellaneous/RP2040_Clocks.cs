@@ -6,6 +6,9 @@
 using System;
 
 using Antmicro.Renode.Core;
+using Antmicro.Renode.Time;
+using Antmicro.Renode.Peripherals.Timers;
+using Antmicro.Renode.Peripherals.GPIOPort;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.IRQControllers;
 
@@ -14,8 +17,17 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
     public sealed class RP2040_Clocks : RP2APBPeripheral, IRP2ClockSource
     {
         public RP2040_Clocks(IMachine machine, RP2_XOSC xosc, RP2040_ROSC rosc,
-            RP2_PLL pllSys, RP2_PLL pllUsb, NVIC nvic0 = null, NVIC nvic1 = null, RP2040_SIO sio = null) : base(machine)
+            RP2_PLL pllSys, RP2_PLL pllUsb, NVIC nvic0 = null, NVIC nvic1 = null, RP2040_SIO sio = null,
+            RP2_GPIOBank0 gpio = null) : base(machine)
         {
+            for(var i = 0; i < 2; i++)
+            {
+                var index = i;
+                gpinTimeout[i] = new LimitTimer(machine.ClockSource, TimeInterval.TicksPerSecond, this, $"gpin{i} timeout",
+                    limit: 1, workMode: WorkMode.OneShot, eventEnabled: true);
+                gpinTimeout[i].LimitReached += () => SetMeasuredGpin(index, 0);
+            }
+            if(gpio != null) gpio.InputChanged += OnGpinInput;
             this.xosc = xosc;
             this.rosc = rosc;
             this.pllSys = pllSys;
@@ -85,11 +97,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             return source * 0x100 / division;
         }
 
-        // CLKSRC_GPIN0 and GPIN1: the frequency of the external clock driven
-        // into GPIO20 and GPIO22, set by the bench (0 when nothing drives it).
+        // CLKSRC_GPIN0 and GPIN1: the external clock driven into GPIO20 and
+        // GPIO22. Its frequency is measured from the period between rising
+        // edges at the pin and drops to 0 after four periods without one; with
+        // no edges, the value set here stands in for a clock source.
         public ulong Gpin0Frequency
         {
-            get => gpin0Frequency;
+            get => measuredGpin[0] != 0 ? measuredGpin[0] : gpin0Frequency;
             set
             {
                 gpin0Frequency = value;
@@ -99,12 +113,35 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         public ulong Gpin1Frequency
         {
-            get => gpin1Frequency;
+            get => measuredGpin[1] != 0 ? measuredGpin[1] : gpin1Frequency;
             set
             {
                 gpin1Frequency = value;
                 machine.ClockSource.ExecuteInLock(() => { lock(SyncRoot) UpdateClocks(); });
             }
+        }
+
+        private void OnGpinInput(int pin, bool level)
+        {
+            var index = pin == 20 ? 0 : pin == 22 ? 1 : -1;
+            if(index < 0 || !level) return;
+            var now = machine.ClockSource.CurrentValue.Ticks;
+            var period = lastGpinRise[index] == 0 ? 0 : now - lastGpinRise[index];
+            lastGpinRise[index] = now;
+            if(period == 0) return;
+            gpinTimeout[index].Restart(4 * period);
+            SetMeasuredGpin(index, TimeInterval.TicksPerSecond / period);
+        }
+
+        // A change under 0.5% of the measured rate leaves the clocks as they are.
+        private void SetMeasuredGpin(int index, ulong frequency)
+        {
+            var previous = measuredGpin[index];
+            if(frequency != 0 && previous != 0 && Math.Abs((double)frequency - previous) < previous * 0.005) return;
+            if(frequency == previous) return;
+            measuredGpin[index] = frequency;
+            if(frequency == 0) lastGpinRise[index] = 0;
+            machine.ClockSource.ExecuteInLock(() => { lock(SyncRoot) UpdateClocks(); });
         }
 
         public ulong SystemFrequency => GetFrequency(SystemClock);
@@ -317,6 +354,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private ulong gpin0Frequency;
         private ulong gpin1Frequency;
+        private readonly ulong[] measuredGpin = new ulong[2];
+        private readonly ulong[] lastGpinRise = new ulong[2];
+        private readonly LimitTimer[] gpinTimeout = new LimitTimer[2];
 
         private const int ReferenceClock = 4;
         private const int SystemClock = 5;
