@@ -17,7 +17,7 @@ using Antmicro.Renode.Time;
 namespace Antmicro.Renode.Peripherals.GPIOPort
 {
     [GPIO(NumberOfInputs = 48)]
-    public sealed class RP2_GPIOBank0 : RP2APBPeripheral, IPulledThreeStateGPIO, INumberedGPIOOutput
+    public sealed class RP2_GPIOBank0 : RP2APBPeripheral, IPulledThreeStateGPIO, INumberedGPIOOutput, IScheduledInputs
     {
         public RP2_GPIOBank0(IMachine machine, IRP2GPIO sio = null, bool rp2350 = false, int numberOfPins = 0,
             RP2350_AccessControl accessControl = null, int securityPinOffset = 0) : base(machine)
@@ -94,6 +94,25 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
                 UpdateInterrupts();
             }
             PublishPending();
+        }
+
+        // Under the machine clock lock, where a delayed wire tells it.
+        public void SetNextInputChange(int pin, TimeInterval? at)
+        {
+            if(pin >= 0 && pin < nextInputChange.Length) nextInputChange[pin] = at;
+        }
+
+        // The earliest scheduled input change on `count` pins from `first`, or
+        // null; read under the machine clock lock.
+        public TimeInterval? NextInputChange(int first, int count)
+        {
+            TimeInterval? earliest = null;
+            for(var pin = Math.Max(0, first); pin < Math.Min(nextInputChange.Length, first + count); pin++)
+            {
+                var at = nextInputChange[pin];
+                if(at.HasValue && (!earliest.HasValue || at.Value < earliest.Value)) earliest = at;
+            }
+            return earliest;
         }
 
         public void ReleaseInput(int pin)
@@ -694,6 +713,7 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
         private bool publishing;
         private readonly Queue<Notification> notifications = new Queue<Notification>();
         private readonly bool[] interruptState;
+        private readonly TimeInterval?[] nextInputChange = new TimeInterval?[64];
         private readonly GPIO[] interruptOutputs;
         private readonly RP2350_AccessControl accessControl;
         private readonly int securityPinOffset;

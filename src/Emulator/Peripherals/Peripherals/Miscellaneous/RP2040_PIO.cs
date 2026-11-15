@@ -418,6 +418,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     {
                         if(frequency == 0 || target <= cycleAnchorTime) return;
                         var targetCycle = cycleAnchor + (ulong)((BigInteger)(target - cycleAnchorTime) * frequency / TimeInterval.TicksPerSecond);
+                        // An input change already scheduled from another machine
+                        // is the first level the block cannot know in advance.
+                        var change = gpio.NextInputChange(gpioBase, 32);
+                        if(change.HasValue)
+                        {
+                            var changeCycle = CycleAt(change.Value);
+                            if(changeCycle < targetCycle) targetCycle = changeCycle;
+                        }
                         var next = ulong.MaxValue;
                         foreach(var sm in stateMachines) if(sm.Scheduled && sm.DueTick < next) next = sm.DueTick;
                         if(next > targetCycle)

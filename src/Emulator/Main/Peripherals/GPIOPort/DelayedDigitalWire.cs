@@ -175,6 +175,25 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
                 }
             }
             Arm(view);
+            AnnounceNextChange(view);
+        }
+
+        // Tells this machine's endpoints when the wire's next change reaches them.
+        private void AnnounceNextChange(MachineView view)
+        {
+            var clock = view.Machine.ClockSource;
+            clock.ExecuteInLock(() =>
+            {
+                TimeInterval? next;
+                Connection[] receivers;
+                lock(sync)
+                {
+                    if(disposed) return;
+                    next = view.Due.Count == 0 ? (TimeInterval?)null : TimeInterval.FromTicks(view.Due.Min.Ticks);
+                    receivers = connections.Where(c => c.Machine == view.Machine).ToArray();
+                }
+                foreach(var receiver in receivers) (receiver.Endpoint as IScheduledInputs)?.SetNextInputChange(receiver.Pin, next);
+            });
         }
 
         // (Re)arms the machine's clock entry for its earliest due change. Under
@@ -221,6 +240,7 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             }
             if(any) Apply(view, last);
             Arm(view);
+            AnnounceNextChange(view);
         }
 
         // Runs on the receiving machine's clock. Applies every change up to
