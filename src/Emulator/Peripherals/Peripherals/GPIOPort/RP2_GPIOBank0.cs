@@ -476,8 +476,15 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             long permission;
             if(securityPinOffset >= 56)
             {
-                if(function != 0) return false;
-                permission = pin + securityPinOffset < 58 ? 0x48 : 0xe4; // USB or QMI
+                // IO_QSPI: USB DP/DM, SCLK, SS, SD0-SD3. SCLK and SS carry UART1
+                // and I2C1, SD0 and SD1 UART0 and I2C0, SD2 and SD3 UART0 and I2C1.
+                switch(function)
+                {
+                case 0: permission = pin + securityPinOffset < 58 ? 0x48 : 0xe4; break; // USB or QMI
+                case 2: case 11: permission = pin < 4 ? 0xa4 : 0xa0; break; // UART1 or UART0
+                case 3: permission = pin == 4 || pin == 5 ? 0x84 : 0x88; break; // I2C0 or I2C1
+                default: return false;
+                }
             }
             else
             {

@@ -31,6 +31,8 @@ namespace Antmicro.Renode.Peripherals.UART
         {
             this.clocks = clocks;
             this.gpio = index >= 0 ? gpio : null;
+            this.index = index;
+            this.rp2350 = rp2350;
             var txPins = new List<int>();
             var rxPins = new List<int>();
             var txAuxPins = new List<int>();
@@ -382,14 +384,16 @@ namespace Antmicro.Renode.Peripherals.UART
 
         private void OnPinInput(int pin, bool level)
         {
-            var function = Array.IndexOf(rxPins, pin) >= 0 ? UartFunction : Array.IndexOf(rxAuxPins, pin) >= 0 ? UartAuxFunction : -1;
+            var qspiPin = pin >= QspiPinKey;
+            var function = qspiPin ? (pin - QspiPinKey == QspiRxPin ? UartAuxFunction : -1)
+                : Array.IndexOf(rxPins, pin) >= 0 ? UartFunction : Array.IndexOf(rxAuxPins, pin) >= 0 ? UartAuxFunction : -1;
             if(function < 0) return;
             machine.ClockSource.ExecuteInLock(() =>
             {
                 lock(SyncRoot)
                 {
                     rxLevels[pin] = level;
-                    if(gpio.GetFunction(pin) != function || ResetHeld) return;
+                    if((qspiPin ? qspiBank.GetFunction(pin - QspiPinKey) : gpio.GetFunction(pin)) != function || ResetHeld) return;
                     if(level)
                     {
                         awaitingIdle = false;
@@ -610,6 +614,7 @@ namespace Antmicro.Renode.Peripherals.UART
                     case TransmitLine:
                         foreach(var pin in txPins) gpio.SetPeripheralOutput(UartFunction, pin, notification.Value != 0, true);
                         foreach(var pin in txAuxPins) gpio.SetPeripheralOutput(UartAuxFunction, pin, notification.Value != 0, true);
+                        qspiBank?.SetPeripheralOutput(UartAuxFunction, QspiTxPin, notification.Value != 0, true);
                         break;
                     default: CharReceived?.Invoke((byte)notification.Value); break;
                     }
@@ -665,6 +670,25 @@ namespace Antmicro.Renode.Peripherals.UART
         private readonly IRP2ClockSource clocks;
         private readonly RP2_GPIOBank0 gpio;
         private readonly int[] txPins;
+        // RP2350 UART0 also reaches QSPI SD2 (TX) and SD3 (RX) as UART_AUX, the
+        // pins the boot ROM's UART bootloader uses.
+        public RP2350_QSPI Qspi
+        {
+            set
+            {
+                if(qspiBank != null || value == null || index != 0 || !rp2350 || gpio == null) return;
+                qspiBank = value.Bank;
+                qspiBank.InputChanged += (pin, level) => OnPinInput(QspiPinKey + pin, level);
+            }
+        }
+
+        private RP2_GPIOBank0 qspiBank;
+        private readonly int index;
+        private readonly bool rp2350;
+        // QSPI pins appear in rxLevels and receivePin offset by this key.
+        private const int QspiPinKey = 1000;
+        // IO_QSPI pins: USB DP, DM, SCLK, SS, SD0-SD3.
+        private const int QspiTxPin = 6, QspiRxPin = 7;
         private readonly int[] rxPins;
         private readonly int[] txAuxPins;
         private readonly int[] rxAuxPins;

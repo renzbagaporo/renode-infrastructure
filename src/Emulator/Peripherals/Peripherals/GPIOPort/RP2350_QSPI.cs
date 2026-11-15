@@ -16,7 +16,7 @@ using Antmicro.Renode.Peripherals.Miscellaneous;
 namespace Antmicro.Renode.Peripherals.GPIOPort
 {
     [GPIO(NumberOfInputs = 8)]
-    public sealed class RP2350_QSPI : RP2APBPeripheral, IGPIOReceiver, INumberedGPIOOutput
+    public sealed class RP2350_QSPI : RP2APBPeripheral, IPulledThreeStateGPIO, INumberedGPIOOutput
     {
         public RP2350_QSPI(IMachine machine, IRP2GPIO sio = null, RP2350_QMI qmi = null, RP2350_AccessControl accessControl = null) : base(machine)
         {
@@ -69,6 +69,26 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
         }
 
         public IReadOnlyDictionary<int, IGPIO> Connections { get; }
+
+        // The IO_QSPI pins (USB DP, DM, SCLK, SS, SD0-SD3) for peripherals muxed onto them.
+        internal RP2_GPIOBank0 Bank => bank;
+
+        // Wires connect to the IO_QSPI pads (0-1 USB DP/DM, 2 SCLK, 3 SS, 4-7 SD0-SD3) as to bank 0.
+        public void GetOutputState(int number, out bool level, out bool enabled) => bank.GetOutputState(number, out level, out enabled);
+
+        public bool? GetPull(int number) => bank.GetPull(number);
+
+        public event Action<int, bool, bool> DriveChanged
+        {
+            add => bank.DriveChanged += value;
+            remove => bank.DriveChanged -= value;
+        }
+
+        public event Action<int, bool?> PullChanged
+        {
+            add => bank.PullChanged += value;
+            remove => bank.PullChanged -= value;
+        }
 
         public GPIO Core0IRQ => bank.Core0IRQ;
 
