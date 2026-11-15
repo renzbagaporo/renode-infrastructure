@@ -777,6 +777,47 @@ namespace Antmicro.Renode.PeripheralsTests
         }
 
         [Test]
+        public void ShouldCarryAPA102WordsFromTheExampleToTheMetalclawClockedCapture([Values(false, true)] bool rp2350)
+        {
+            // SM0: pico-examples apa102_mini (CLK side-set GPIO2, DIN OUT GPIO3,
+            // MSB first, autopull 32). SM1: metalclaw wire clocked_in (IN_BASE
+            // DIN, waiting on CLK as IN pin 31, MSB first, autopush 32).
+            var benchMachine = new Machine();
+            try
+            {
+                var benchGpio = new RP2_GPIOBank0(benchMachine);
+                var benchPio = new RP2040_PIO(benchMachine, benchGpio, frequency: 1000000, rp2350: rp2350);
+                benchGpio.WriteDoubleWord(2 * 8 + 4, 6);
+                benchGpio.WriteDoubleWord(3 * 8 + 4, 6);
+                Load(benchPio, 0x6001, 0xb042, 0x203f, 0x20bf, 0x4001);
+                benchPio.WriteDoubleWord(0xc8, 4u << 16); // SM0 clkdiv 4
+                benchPio.WriteDoubleWord(0xcc, 1u << 12); // wrap 0 to 1
+                benchPio.WriteDoubleWord(0xd0, 1u << 17); // autopull, 32, left
+                benchPio.WriteDoubleWord(0xdc, (1u << 29) | (2u << 26) | (1u << 20) | (2u << 10) | (2u << 5) | 3u);
+                benchPio.WriteDoubleWord(0xd8, 0xe083); // set pindirs, 3: CLK and DIN out
+                benchPio.WriteDoubleWord(0xcc + 0x18, (4u << 12) | (2u << 7)); // wrap 2 to 4
+                benchPio.WriteDoubleWord(0xd0 + 0x18, 1u << 16); // autopush, 32, left
+                benchPio.WriteDoubleWord(0xdc + 0x18, 3u << 15); // IN_BASE DIN
+                benchPio.WriteDoubleWord(0xd8 + 0x18, 0x0002); // jmp 2
+                benchPio.WriteDoubleWord(0, 3);
+                var sent = new uint[] { 0x00000000, 0xf0123456, 0xf0abcdef, 0xf0000102, 0xffffffff };
+                var received = new List<uint>();
+                foreach(var word in sent)
+                {
+                    benchPio.WriteDoubleWord(0x10, word);
+                    for(var i = 0; i < 400 && ((benchPio.ReadDoubleWord(0x0c) >> 12) & 0xf) == 0; i++)
+                        ((BaseClockSource)benchMachine.ClockSource).Advance(TimeInterval.FromMicroseconds(4));
+                    received.Add(benchPio.ReadDoubleWord(0x24));
+                }
+                CollectionAssert.AreEqual(sent, received);
+            }
+            finally
+            {
+                benchMachine.Dispose();
+            }
+        }
+
+        [Test]
         public void ShouldNotParkALoopThatPollsItsFIFO()
         {
             // pull noblock; mov x, osr; jmp 0: a loop which takes TX data as it
