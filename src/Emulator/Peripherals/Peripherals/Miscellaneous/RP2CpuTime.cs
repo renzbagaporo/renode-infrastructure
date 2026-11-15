@@ -16,9 +16,19 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // thread have no CPU time of their own to bring forward.
         public static void SyncInitiator(IMachine machine)
         {
+            if(TryGetInitiator(machine, out var cpu)) cpu.SyncTime();
+        }
+
+        // The CPU whose own thread issued the current bus access, unless it is
+        // a debug-port access.
+        public static bool TryGetInitiator(IMachine machine, out BaseCPU cpu)
+        {
+            cpu = null;
             var bus = machine.SystemBus;
-            if(bus.TryGetCurrentContextState<CortexM.ContextState>(out var _, out var state) && state.DebugAccess) return;
-            if(bus.TryGetTransactionInitiator(out var initiator) && initiator is BaseCPU cpu && cpu.OnPossessedThread) cpu.SyncTime();
+            if(bus.TryGetCurrentContextState<CortexM.ContextState>(out var _, out var state) && state.DebugAccess) return false;
+            if(!bus.TryGetTransactionInitiator(out var initiator) || !(initiator is BaseCPU found) || !found.OnPossessedThread) return false;
+            cpu = found;
+            return true;
         }
     }
 }

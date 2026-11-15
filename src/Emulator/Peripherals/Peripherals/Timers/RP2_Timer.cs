@@ -8,6 +8,7 @@ using System.Collections.Generic;
 using System.Collections.ObjectModel;
 
 using Antmicro.Renode.Core;
+using Antmicro.Renode.Peripherals.CPU;
 using Antmicro.Renode.Peripherals.Miscellaneous;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Time;
@@ -23,8 +24,6 @@ namespace Antmicro.Renode.Peripherals.Timers
             this.clocked = clocked;
             this.rp2350 = rp2350;
             interruptOffset = rp2350 ? 0x3c : 0x34;
-            counter = new LimitTimer(machine.ClockSource, Math.Max(1ul, frequency), this, "counter",
-                direction: Direction.Ascending);
             alarmTimers = new LimitTimer[NumberOfAlarms];
             alarmValues = new uint[NumberOfAlarms];
             debugActive = new bool[2];
@@ -62,7 +61,8 @@ namespace Antmicro.Renode.Peripherals.Timers
 
         public override void Reset()
         {
-            counter.Reset();
+            counterRunning = false;
+            SetCounter(0);
             foreach(var alarm in alarmTimers)
             {
                 alarm.Reset();
@@ -129,6 +129,46 @@ namespace Antmicro.Renode.Peripherals.Timers
         // other machines, so it must not happen under this timer's lock.
         protected override void OnBeforeAccess() => SynchronizeTime();
 
+        // A CPU polling the counter reads it millions of times each virtual
+        // second, and bringing its time forward is most of a read's cost. That
+        // is skipped while the CPU cannot have reached the counter's next tick
+        // since its last synchronized read: the machine's time lies between its
+        // time then and the CPU's time now, so the read returns the same value.
+        // An alarm due inside that tick may then fire up to the CPU's lead later.
+        protected override void OnBeforeRead(long offset)
+        {
+            if(offset != 0xc && offset != 0x24 && offset != 0x28)
+            {
+                SynchronizeTime();
+                return;
+            }
+            if(!RP2CpuTime.TryGetInitiator(machine, out var cpu)) return;
+            // Only this CPU's thread uses its record.
+            CounterSync record;
+            lock(counterSyncs)
+            {
+                if(!counterSyncs.TryGetValue(cpu, out record)) counterSyncs[cpu] = record = new CounterSync();
+            }
+            if(record.Valid && record.Generation == counterGeneration)
+            {
+                // Every instruction before the synchronized read was reported then.
+                var lead = TimeInterval.FromCPUCycles(cpu.ExecutedInstructions - record.Instructions + 2, cpu.PerformanceInMips, out var _);
+                if(cpu.TimeHandle.TotalElapsedTime.Ticks + lead.Ticks < record.NextTick) return;
+            }
+            cpu.SyncTime();
+            record.Instructions = cpu.ExecutedInstructions;
+            // A change made while the next tick is computed leaves the record stale.
+            record.Generation = counterGeneration;
+            record.Valid = counterRunning;
+            record.NextTick = counterRunning ? NextTickTime() : 0;
+        }
+
+        private sealed class CounterSync
+        {
+            public bool Valid;
+            public ulong Instructions, NextTick, Generation;
+        }
+
         protected override uint ReadRegister(long offset)
         {
             if(offset >= 0x10 && offset < 0x20)
@@ -153,15 +193,15 @@ namespace Antmicro.Renode.Peripherals.Timers
             case 0x8:
                 return latchedHighTime;
             case 0xc:
-                var value = counter.Value;
+                var value = CounterValue;
                 latchedHighTime = (uint)(value >> 32);
                 return (uint)value;
             case 0x20:
                 return armed;
             case 0x24:
-                return (uint)(counter.Value >> 32);
+                return (uint)(CounterValue >> 32);
             case 0x28:
-                return (uint)counter.Value;
+                return (uint)CounterValue;
             case 0x2c:
                 return debugPause;
             case 0x30:
@@ -211,7 +251,7 @@ namespace Antmicro.Renode.Peripherals.Timers
             switch(offset)
             {
             case 0x0:
-                counter.Value = ((ulong)value << 32) | pendingLowTime;
+                SetCounter(((ulong)value << 32) | pendingLowTime);
                 RescheduleAlarms();
                 return;
             case 0x4:
@@ -258,15 +298,23 @@ namespace Antmicro.Renode.Peripherals.Timers
             var effectiveFrequency = source != 0 ? systemFrequency : frequency;
             if(effectiveFrequency != 0)
             {
-                counter.Frequency = effectiveFrequency;
                 foreach(var timer in alarmTimers)
                 {
                     timer.Frequency = effectiveFrequency;
                 }
             }
-            counter.Enabled = !ResetHeld && effectiveFrequency != 0 && (source != 0 || clocked) && !paused
+            var running = !ResetHeld && effectiveFrequency != 0 && (source != 0 || clocked) && !paused
                 && !(debugActive[0] && (debugPause & 2) != 0)
                 && !(debugActive[1] && (debugPause & 4) != 0);
+            var rate = effectiveFrequency != 0 ? effectiveFrequency : counterFrequency;
+            if(running != counterRunning || rate != counterFrequency)
+            {
+                // Counts made at the old rate up to now stay counted.
+                SetCounter(CounterValue);
+                counterRunning = running;
+                counterFrequency = rate;
+                counterGeneration++;
+            }
             RescheduleAlarms();
         }
 
@@ -274,11 +322,11 @@ namespace Antmicro.Renode.Peripherals.Timers
         {
             var timer = alarmTimers[index];
             timer.Enabled = false;
-            if(!counter.Enabled || (armed & (1u << index)) == 0)
+            if(!counterRunning || (armed & (1u << index)) == 0)
             {
                 return;
             }
-            var distance = unchecked(alarmValues[index] - (uint)counter.Value);
+            var distance = unchecked(alarmValues[index] - (uint)CounterValue);
             if(distance == 0)
             {
                 FireAlarm(index);
@@ -313,6 +361,33 @@ namespace Antmicro.Renode.Peripherals.Timers
             }
         }
 
+        // The counter is anchored at a value and a clock-source time, and read
+        // from the clock source's current time without a clock entry, as a CPU
+        // polling it reads it millions of times each virtual second.
+        private ulong CounterValue
+        {
+            get
+            {
+                if(!counterRunning) return counterBase;
+                var elapsed = machine.ClockSource.CurrentValue.Ticks - counterBaseTicks;
+                return counterBase + (ulong)((UInt128)elapsed * counterFrequency / TimeInterval.TicksPerSecond);
+            }
+        }
+
+        private void SetCounter(ulong value)
+        {
+            counterBase = value;
+            counterBaseTicks = machine.ClockSource.CurrentValue.Ticks;
+            counterGeneration++;
+        }
+
+        // The clock-source time at which the running counter next increments.
+        private ulong NextTickTime()
+        {
+            var next = (UInt128)(CounterValue - counterBase + 1) * TimeInterval.TicksPerSecond;
+            return counterBaseTicks + (ulong)((next + counterFrequency - 1) / counterFrequency);
+        }
+
         private void SynchronizeTime()
         {
             RP2CpuTime.SyncInitiator(machine);
@@ -320,6 +395,11 @@ namespace Antmicro.Renode.Peripherals.Timers
 
         private ulong frequency;
         private ulong systemFrequency;
+        private ulong counterBase, counterBaseTicks, counterFrequency;
+        private bool counterRunning;
+        private ulong counterGeneration;
+        // Each CPU's last counter read whose time was brought forward.
+        private readonly Dictionary<BaseCPU, CounterSync> counterSyncs = new Dictionary<BaseCPU, CounterSync>();
         private bool clocked;
         private uint pendingLowTime;
         private uint latchedHighTime;
@@ -334,7 +414,6 @@ namespace Antmicro.Renode.Peripherals.Timers
 
         private readonly bool rp2350;
         private readonly long interruptOffset;
-        private readonly LimitTimer counter;
         private readonly LimitTimer[] alarmTimers;
         private readonly uint[] alarmValues;
         private readonly bool[] debugActive;

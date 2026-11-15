@@ -20,7 +20,7 @@ namespace Antmicro.Renode.Peripherals
         {
             try
             {
-                OnBeforeAccess();
+                OnBeforeRead(offset & RegisterOffsetMask);
                 var clock = AccessClock;
                 return clock == null ? ReadState(offset) : ReadClockState(clock, offset);
             }
@@ -111,6 +111,10 @@ namespace Antmicro.Renode.Peripherals
         protected virtual void OnBeforeAccess()
         {
         }
+
+        // A read's OnBeforeAccess, for devices whose synchronization depends
+        // on the register read.
+        protected virtual void OnBeforeRead(long offset) => OnBeforeAccess();
 
         // Devices with synchronous signal receivers publish queued notifications
         // after releasing their state monitor, avoiding cross-device lock cycles.
