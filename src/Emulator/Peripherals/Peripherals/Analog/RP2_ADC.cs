@@ -10,9 +10,12 @@ using System.Numerics;
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
+using Antmicro.Renode.Core.Structure;
 using Antmicro.Renode.Peripherals.CPU;
+using Antmicro.Renode.Peripherals.Sensor;
 using Antmicro.Renode.Peripherals.Timers;
 using Antmicro.Renode.Time;
+using Antmicro.Renode.Utilities.RESD;
 
 namespace Antmicro.Renode.Peripherals.Analog
 {
@@ -21,10 +24,11 @@ namespace Antmicro.Renode.Peripherals.Analog
     // whose triggers during a conversion are ignored. RROBIN steps AINSEL
     // after each conversion. The sample FIFO (4 entries on the RP2040, 8 on
     // the RP2350) raises IRQ and, with DREQ_EN, DREQ while it holds at least
-    // THRESH samples. Inputs are voltages against a 3.3 V reference set with
-    // SetChannelVoltage; the last channel is the temperature sensor, whose
-    // Vbe is 0.706 V at 27 C with a -1.721 mV/C slope. Conversions never err.
-    public sealed class RP2_ADC : RP2APBPeripheral
+    // THRESH samples. Inputs are voltages against a 3.3 V reference, set with
+    // SetChannelVoltage or read at each conversion from a voltage source
+    // registered at the channel; the last channel is the temperature sensor, whose Vbe is
+    // 0.706 V at 27 C with a -1.721 mV/C slope. Conversions never err.
+    public sealed class RP2_ADC : RP2APBPeripheral, IADC
     {
         public RP2_ADC(IMachine machine, bool rp2350 = false, int channels = 5, ulong frequency = 48000000) : base(machine)
         {
@@ -32,6 +36,7 @@ namespace Antmicro.Renode.Peripherals.Analog
             this.rp2350 = rp2350;
             this.frequency = frequency;
             voltages = new double[channels];
+            ADCContainer = new SimpleContainerHelper<IRESDSampleSource<VoltageSample>>(machine, this);
             timer = new LimitTimer(machine.ClockSource, TimeInterval.TicksPerSecond, this, "conversion",
                 limit: 1, workMode: WorkMode.OneShot, eventEnabled: true);
             timer.LimitReached += OnTimer;
@@ -57,6 +62,13 @@ namespace Antmicro.Renode.Peripherals.Analog
             if(channel < 0 || channel >= voltages.Length - 1) throw new RecoverableException($"Channel {channel} is not an external input");
             lock(SyncRoot) voltages[channel] = volts;
         }
+
+        // A voltage source registered at an external channel (`@ adc N`), such
+        // as an RCLowPassFilter between a PWM pin and the input, is read at
+        // each conversion in place of the channel's set voltage.
+        public int ADCChannelCount => voltages.Length - 1;
+
+        public SimpleContainerHelper<IRESDSampleSource<VoltageSample>> ADCContainer { get; }
 
         public double TemperatureCelsius { get; set; } = 27;
 
@@ -194,7 +206,7 @@ namespace Antmicro.Renode.Peripherals.Analog
             if(channel >= voltages.Length) return 0;
             var volts = channel == voltages.Length - 1
                 ? ((control & TemperatureEnable) != 0 ? 0.706 - 0.001721 * (TemperatureCelsius - 27) : 0)
-                : voltages[channel];
+                : ADCContainer.TryGetByAddress(channel, out var source) ? source.Sample.Voltage / 1e6 : voltages[channel];
             return (ushort)Math.Max(0, Math.Min(4095, Math.Round(volts / Reference * 4096)));
         }
 
