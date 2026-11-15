@@ -50,9 +50,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // connection schedules domain resets at a separate synchronization boundary.
         public event Action ResetRequested;
 
+        // Synchronized before the access locks; see RP2_Timer.OnBeforeAccess.
+        protected override void OnBeforeAccess() => SynchronizeTime();
+
         protected override uint ReadRegister(long offset)
         {
-            SynchronizeTime();
             if(offset >= 0xc && offset <= 0x28)
             {
                 return scratch[(offset - 0xc) / 4];
@@ -76,7 +78,6 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         protected override void WriteRegister(long offset, uint value, AtomicOperation operation)
         {
-            SynchronizeTime();
             if(offset >= 0xc && offset <= 0x28)
             {
                 var index = (offset - 0xc) / 4;

@@ -124,9 +124,13 @@ namespace Antmicro.Renode.Peripherals.Timers
             UpdateClock();
         }
 
+        // The CPU's time is brought forward before the access takes the clock
+        // and state locks: advancing it runs clock events, which may reach
+        // other machines, so it must not happen under this timer's lock.
+        protected override void OnBeforeAccess() => SynchronizeTime();
+
         protected override uint ReadRegister(long offset)
         {
-            SynchronizeTime();
             if(offset >= 0x10 && offset < 0x20)
             {
                 return alarmValues[(offset - 0x10) / 4];
@@ -181,7 +185,6 @@ namespace Antmicro.Renode.Peripherals.Timers
 
         protected override void WriteRegister(long offset, uint value, AtomicOperation operation)
         {
-            SynchronizeTime();
             if(locked)
             {
                 return;

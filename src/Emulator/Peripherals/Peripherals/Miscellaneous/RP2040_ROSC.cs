@@ -44,6 +44,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         public event Action ClockChanged;
 
+        // Synchronized before the access locks; see RP2_Timer.OnBeforeAccess.
+        protected override void OnBeforeAccess() => RP2CpuTime.SyncInitiator(machine);
+
         protected override uint ReadRegister(long offset)
         {
             switch(offset)
@@ -67,7 +70,6 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 random = (random >> 1) ^ (bit != 0 ? 0x80200003u : 0);
                 return bit;
             case 0x20:
-                RP2CpuTime.SyncInitiator(machine);
                 return countArmed ? (uint)countTimer.Value : 0;
             default:
                 this.LogUnhandledRead(offset);
