@@ -6,6 +6,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -748,6 +749,240 @@ namespace Antmicro.Renode.PeripheralsTests
             // Five more two-cycle iterations, each decrementing X once.
             Assert.AreEqual(first - 5, second);
             Assert.Less(second, 20u);
+        }
+
+        [Test]
+        public void ShouldParkAFollowLoopAndKeepItsOutputTimingExact()
+        {
+            // metalclaw gpio_link follow: GPIO0 takes GPIO1 through `mov pins, pins`.
+            var parked = RunSteadyLoopScenario(true, ConfigureFollow, FollowStimulus, out var parkedWhileIdle);
+            var running = RunSteadyLoopScenario(false, ConfigureFollow, FollowStimulus, out _);
+            Assert.Greater(parked.Count(e => e.StartsWith("pin 0 ")), 20, "The follower did not follow its input");
+            CollectionAssert.AreEqual(running, parked);
+            Assert.IsTrue(parkedWhileIdle, "The follow loop was not parked while its input held");
+        }
+
+        [Test]
+        public void ShouldParkAJoinIdleLoopAndResumeItAtTheRightStep()
+        {
+            // metalclaw gpio_link join, A = GPIO2, B = GPIO3, idling in its
+            // four-step test loop with side-set on every step.
+            var parked = RunSteadyLoopScenario(true, ConfigureJoin, JoinStimulus, out var parkedWhileIdle);
+            var running = RunSteadyLoopScenario(false, ConfigureJoin, JoinStimulus, out _);
+            Assert.Greater(parked.Count(e => e.StartsWith("pin ")), 4, "The join did not forward any low");
+            Assert.Greater(parked.Select(e => e.StartsWith("addr ") ? e.Split(' ')[2] : null).Where(a => a != null).Distinct().Count(), 2,
+                "The ADDR reads did not land on different steps");
+            CollectionAssert.AreEqual(running, parked);
+            Assert.IsTrue(parkedWhileIdle, "The join's idle loop was not parked while its pins held");
+        }
+
+        [Test]
+        public void ShouldNotParkALoopThatPollsItsFIFO()
+        {
+            // pull noblock; mov x, osr; jmp 0: a loop which takes TX data as it
+            // comes, keeping the last word as an empty FIFO's pull copies X.
+            Load(0x8080, 0xa027, 0x0000);
+            pio.WriteDoubleWord(0, 1);
+            Advance(50);
+            Assert.IsFalse(Steady(pio, 0), "A loop which pulls was parked");
+            pio.WriteDoubleWord(0x10, 0x1234);
+            Advance(5);
+            Force(0, 0xa0c1); // mov isr, x
+            Force(0, 0x8020); // push block
+            Assert.AreEqual(0x1234u, pio.ReadDoubleWord(0x20));
+        }
+
+        [Test]
+        public void ShouldMatchUnparkedExecutionForRandomPinLoops([Range(0, 9)] int group)
+        {
+            var parkedPrograms = 0;
+            for(var index = 0; index < 20; index++)
+            {
+                var seed = group * 1000 + index;
+                var parked = RunRandomLoops(seed, true, out var sawParked);
+                var running = RunRandomLoops(seed, false, out _);
+                CollectionAssert.AreEqual(running, parked, $"Seed {seed} differs with loop parking");
+                if(sawParked) parkedPrograms++;
+            }
+            Assert.Greater(parkedPrograms, 2, "Too few random programs reached a steady loop to test parking");
+        }
+
+        // Two machines run random pin-only programs (no FIFO or IRQ access) at
+        // random dividers, under random pin edges, ADDR reads and no-op writes.
+        private List<string> RunRandomLoops(int seed, bool park, out bool sawParked)
+        {
+            var random = new Random(seed);
+            var benchMachine = new Machine();
+            try
+            {
+                var benchGpio = new RP2_GPIOBank0(benchMachine);
+                var benchPio = new RP2040_PIO(benchMachine, benchGpio, frequency: 1000000) { ParkSteadyLoops = park };
+                var log = new List<string>();
+                benchGpio.DriveChanged += (pin, value, enabled) =>
+                    log.Add($"pin {pin} {value} {enabled} at {benchMachine.ClockSource.CurrentValue.Ticks}");
+                for(var pin = 0; pin < 8; pin++) benchGpio.WriteDoubleWord(pin * 8 + 4, 6);
+                for(var sm = 0; sm < 2; sm++)
+                {
+                    var origin = sm * 16;
+                    var length = random.Next(1, 9);
+                    for(var i = 0; i < length; i++) benchPio.WriteDoubleWord(0x48 + 4 * (origin + i), RandomInstruction(random, origin, length));
+                    var sideCount = (uint)random.Next(0, 3);
+                    var execControl = ((uint)random.Next(2) << 30) | ((uint)random.Next(2) << 29) | ((uint)random.Next(8) << 24)
+                        | ((uint)random.Next(8) << 19) | ((uint)random.Next(2) << 18)
+                        | ((uint)(origin + length - 1) << 12) | ((uint)origin << 7);
+                    var pinControl = (sideCount << 29) | ((uint)random.Next(5) << 26) | ((uint)random.Next(5) << 20)
+                        | ((uint)random.Next(8) << 15) | ((uint)random.Next(8) << 10) | ((uint)random.Next(8) << 5) | (uint)random.Next(8);
+                    var divider = ((uint)random.Next(1, 4) << 16) | ((uint)(random.Next(2) == 0 ? 0 : random.Next(256)) << 8);
+                    benchPio.WriteDoubleWord(0xc8 + sm * 0x18, divider);
+                    benchPio.WriteDoubleWord(0xcc + sm * 0x18, execControl);
+                    benchPio.WriteDoubleWord(0xdc + sm * 0x18, pinControl);
+                    benchPio.WriteDoubleWord(0xd8 + sm * 0x18, (ushort)origin); // jmp origin
+                }
+                benchPio.WriteDoubleWord(0, 3);
+                sawParked = false;
+                for(var i = 0; i < 120; i++)
+                {
+                    var gap = random.Next(4) == 0 ? random.Next(100, 400) : random.Next(1, 30);
+                    ((BaseClockSource)benchMachine.ClockSource).Advance(TimeInterval.FromMicroseconds((ulong)gap));
+                    if(park && (Steady(benchPio, 0) || Steady(benchPio, 1))) sawParked = true;
+                    switch(random.Next(6))
+                    {
+                    case 0:
+                    case 1:
+                    case 2: benchGpio.OnGPIO(random.Next(8), random.Next(2) == 0); break;
+                    case 3: log.Add($"addr {i} {benchPio.ReadDoubleWord(0xd4)} {benchPio.ReadDoubleWord(0xec)}"); break;
+                    case 4: benchPio.WriteDoubleWord(0x3c, 0); break; // a write to a read-only register
+                    default: break;
+                    }
+                }
+                for(var sm = 0; sm < 2; sm++)
+                {
+                    benchPio.WriteDoubleWord(0, 0);
+                    foreach(var source in new ushort[] { 0xa0c1, 0xa0c2, 0xa0c6, 0xa0c7 }) // mov isr, x / y / isr / osr
+                    {
+                        benchPio.WriteDoubleWord(0xd8 + sm * 0x18, source);
+                        benchPio.WriteDoubleWord(0xd8 + sm * 0x18, 0x8000); // push noblock
+                        log.Add($"sm{sm} {source:x} {benchPio.ReadDoubleWord(0x20 + sm * 4)}");
+                    }
+                }
+                return log;
+            }
+            finally
+            {
+                benchMachine.Dispose();
+            }
+        }
+
+        private static uint RandomInstruction(Random random, int origin, int length)
+        {
+            var field = (uint)random.Next(32) << 8; // delay / side-set
+            var target = (uint)(origin + random.Next(length));
+            switch(random.Next(6))
+            {
+            case 0: return field | ((uint)random.Next(8) << 5) | target; // JMP
+            case 1: return 0x2000u | field | ((uint)random.Next(2) << 7) | ((uint)random.Next(2) << 5) | (uint)random.Next(8); // WAIT GPIO/PIN
+            case 2: return 0x4000u | field | ((uint)new[] { 0, 1, 2, 3, 6, 7 }[random.Next(6)] << 5) | (uint)random.Next(32); // IN
+            case 3: return 0x6000u | field | ((uint)random.Next(7) << 5) | (uint)random.Next(32); // OUT, not EXEC
+            case 4: return 0xa000u | field | ((uint)new[] { 0, 1, 2, 5, 6, 7 }[random.Next(6)] << 5)
+                | ((uint)random.Next(3) << 3) | (uint)new[] { 0, 1, 2, 3, 6, 7 }[random.Next(6)]; // MOV
+            default: return 0xe000u | field | ((uint)new[] { 0, 1, 2, 4 }[random.Next(4)] << 5) | (uint)random.Next(32); // SET
+            }
+        }
+
+        private List<string> RunSteadyLoopScenario(bool park, Action<RP2_GPIOBank0, RP2040_PIO> configure,
+            Action<RP2_GPIOBank0, RP2040_PIO, Action<ulong>, List<string>> stimulus, out bool parkedWhileIdle)
+        {
+            var benchMachine = new Machine();
+            try
+            {
+                var benchGpio = new RP2_GPIOBank0(benchMachine);
+                var benchPio = new RP2040_PIO(benchMachine, benchGpio, frequency: 1000000) { ParkSteadyLoops = park };
+                var log = new List<string>();
+                benchGpio.DriveChanged += (pin, value, enabled) =>
+                    log.Add($"pin {pin} {value} {enabled} at {benchMachine.ClockSource.CurrentValue.Ticks}");
+                configure(benchGpio, benchPio);
+                void Run(ulong cycles) => ((BaseClockSource)benchMachine.ClockSource).Advance(TimeInterval.FromMicroseconds(cycles));
+                stimulus(benchGpio, benchPio, Run, log);
+                Run(200);
+                parkedWhileIdle = Steady(benchPio, 0);
+                log.Add($"addr end {benchPio.ReadDoubleWord(0xd4)}");
+                return log;
+            }
+            finally
+            {
+                benchMachine.Dispose();
+            }
+        }
+
+        private static void ConfigureFollow(RP2_GPIOBank0 benchGpio, RP2040_PIO benchPio)
+        {
+            benchGpio.WriteDoubleWord(4, 6); // GPIO0 FUNCSEL = PIO0
+            benchPio.WriteDoubleWord(0xdc, (1u << 26) | (1u << 20) | (1u << 15)); // SET 0+1, OUT 0+1, IN_BASE 1
+            benchPio.WriteDoubleWord(0xd8, 0xe081); // set pindirs, 1
+            benchPio.WriteDoubleWord(0x48, 0xa000); // mov pins, pins
+            benchPio.WriteDoubleWord(0xcc, 0); // wrap 0 to 0
+            benchPio.WriteDoubleWord(0, 1);
+        }
+
+        private static void FollowStimulus(RP2_GPIOBank0 benchGpio, RP2040_PIO benchPio, Action<ulong> run, List<string> log)
+        {
+            var random = new Random(7);
+            var level = false;
+            for(var i = 0; i < 60; i++)
+            {
+                run((ulong)random.Next(1, 40));
+                level = !level;
+                benchGpio.OnGPIO(1, level);
+                // Another pin's edges reach the PIO too, and are outside the follower's OUT_COUNT.
+                if(random.Next(3) == 0) benchGpio.OnGPIO(5, random.Next(2) == 0);
+            }
+        }
+
+        private static void ConfigureJoin(RP2_GPIOBank0 benchGpio, RP2040_PIO benchPio)
+        {
+            const int a = 2;
+            const int b = 3;
+            benchGpio.WriteDoubleWord(a * 8 + 4, 6);
+            benchGpio.WriteDoubleWord(b * 8 + 4, 6);
+            benchGpio.OnGPIO(a, true);
+            benchGpio.OnGPIO(b, true);
+            // mov osr, pins; out x, 1; jmp !x 10; jmp pin 0; set pindirs, 1; jmp pin 7; jmp 5;
+            // set pindirs, 0; set y, 15; jmp y-- 9 [15]; wait 1 pin 0 side 1; jmp 8
+            Load(benchPio, 0xa0e0, 0x6021, 0x002a, 0x00c0, 0xe081, 0x00c7, 0x0005, 0xe080, 0xe04f, 0x0f89, 0x30a0, 0x0008);
+            benchPio.WriteDoubleWord(0xcc, (1u << 29) | ((uint)a << 24) | (9u << 12)); // side pindir, JMP_PIN A, wrap 0 to 9
+            benchPio.WriteDoubleWord(0xdc, (1u << 29) | (1u << 26) | ((uint)b << 15) | ((uint)a << 10) | ((uint)b << 5));
+            benchPio.WriteDoubleWord(0, 1);
+        }
+
+        private static void JoinStimulus(RP2_GPIOBank0 benchGpio, RP2040_PIO benchPio, Action<ulong> run, List<string> log)
+        {
+            var random = new Random(11);
+            for(var i = 0; i < 80; i++)
+            {
+                run((ulong)random.Next(1, 60));
+                switch(random.Next(5))
+                {
+                case 0: benchGpio.OnGPIO(2, random.Next(2) == 0); break;
+                case 1: benchGpio.OnGPIO(3, random.Next(2) == 0); break;
+                case 2: log.Add($"addr {i} {benchPio.ReadDoubleWord(0xd4)}"); break;
+                case 3: benchPio.WriteDoubleWord(0xdc, benchPio.ReadDoubleWord(0xdc)); break; // a no-op PINCTRL write
+                default: benchGpio.OnGPIO(7, random.Next(2) == 0); break;
+                }
+            }
+            benchGpio.OnGPIO(2, true);
+            benchGpio.OnGPIO(3, true);
+        }
+
+        private static bool Steady(RP2040_PIO target, int index)
+        {
+            var machines = (Array)typeof(RP2040_PIO).GetField("stateMachines", BindingFlags.Instance | BindingFlags.NonPublic).GetValue(target);
+            var sm = machines.GetValue(index);
+            return (bool)sm.GetType().GetField("Steady").GetValue(sm);
+        }
+
+        private static void Load(RP2040_PIO target, params ushort[] words)
+        {
+            for(var index = 0; index < words.Length; index++) target.WriteDoubleWord(0x48 + 4 * index, words[index]);
         }
 
         private uint ExecutedCounter()

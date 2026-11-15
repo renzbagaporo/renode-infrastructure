@@ -64,6 +64,27 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public GPIO IRQ0 => (GPIO)Connections[8];
         public GPIO IRQ1 => (GPIO)Connections[9];
 
+        // A loop that returns to its own state with no effect outside its
+        // machine is parked until something it reads or writes changes, and
+        // then resumes at the exact cycle and step it would have reached; see
+        // TraceLoop. Disabling it runs every PIO clock, for comparison.
+        public bool ParkSteadyLoops
+        {
+            get => parkSteadyLoops;
+            set
+            {
+                machine.ClockSource.ExecuteInLock(() =>
+                {
+                    lock(SyncRoot)
+                    {
+                        parkSteadyLoops = value;
+                        ResumeSteadyLoops();
+                    }
+                });
+                PublishPending();
+            }
+        }
+
         public override void Reset()
         {
             machine.ClockSource.ExecuteInLock(ResetState);
@@ -92,6 +113,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 {
                     sm.Timer.Enabled = false;
                     sm.Scheduled = false;
+                    sm.Steady = sm.Recording = sm.SteadyCandidate = false;
                     sm.ResumeCycles = 0;
                     sm.StickyMask = sm.StickyValue = sm.WriteMask = sm.WriteValue = sm.DirectionMask = sm.DirectionValue = 0;
                     sm.ClockDivider = 0x10000;
@@ -149,8 +171,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 case 0: return sm.ClockDivider;
                 case 4: return sm.ExecControl | (sm.Forced && sm.Stalled ? 0x80000000u : 0);
                 case 8: return sm.ShiftControl;
-                case 12: return (uint)sm.PC;
-                case 16: return sm.Pending ? sm.Instruction : instructions[sm.PC];
+                case 12:
+                    ResumeSteadyLoop(sm);
+                    return (uint)sm.PC;
+                case 16:
+                    ResumeSteadyLoop(sm);
+                    return sm.Pending ? sm.Instruction : instructions[sm.PC];
                 case 20: return sm.PinControl;
                 }
             }
@@ -198,6 +224,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         protected override void WriteRegister(long offset, uint value, AtomicOperation operation)
         {
+            // A steady loop has no FIFO effects, so only TXF writes leave it be.
+            // Anything else may change what it executes, so resume and retrace.
+            if(offset < 0x10 || offset >= 0x20)
+            {
+                ResumeSteadyLoops();
+                foreach(var sm in stateMachines) sm.Recording = false;
+            }
             if(rp2350)
             {
                 if(offset >= 0x128 && offset < 0x168)
@@ -408,7 +441,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 executingCycle = true;
                 cycleIRQFlags = irqFlags;
                 cycleIRQSet = cycleIRQClear = 0;
-                BeginPinCycle();
+                // Machines whose timers fire separately on one cycle strobe the
+                // latch together: a later pass keeps the earlier passes' strobes.
+                if(pinCycle != now) BeginPinCycle();
+                pinCycle = now;
                 // Clock enables on the same system edge are simultaneous. Run
                 // all of them before resolving pin strobes in SM priority order.
                 foreach(var sm in stateMachines)
@@ -434,7 +470,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     var fetched = !sm.Forced && !sm.Injected;
                     var forced = sm.Forced;
                     var instruction = sm.Instruction;
+                    var step = sm.Recording && fetched ? CaptureStep(sm) : default(LoopStep);
+                    stepEffect = false;
+                    stepReadMask = stepReadValues = 0;
+                    trackingReads = true;
                     var completed = Execute(sm);
+                    trackingReads = false;
                     if(completed)
                     {
                         if(!forced) sm.Edge256 += Divider256(sm) * (ulong)(1 + sm.Delay);
@@ -468,9 +509,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                                 if(usesX) sm.X = 0; else sm.Y = 0;
                             }
                         }
+                        TraceLoop(sm, step, pc, fetched && !forced);
                         Schedule(sm, advance: false);
                     }
-                    else if(sm.RetryNextCycle)
+                    else sm.Recording = false;
+                    if(!completed && sm.RetryNextCycle)
                     {
                         sm.RetryNextCycle = false;
                         if(!forced) sm.Edge256 += Divider256(sm);
@@ -483,6 +526,15 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 if(previousIRQFlags != irqFlags) WakeAll();
                 foreach(var sm in stateMachines) if(sm.Stalled && !sm.Scheduled) Reschedule(sm);
                 ResolvePinWrites();
+                // A loop is parked only once the cycle that closed it has
+                // resolved its pin writes without changing the latch.
+                foreach(var sm in stateMachines)
+                {
+                    if(!sm.SteadyCandidate) continue;
+                    sm.SteadyCandidate = false;
+                    if(!sm.RecordingBroken && WritesHoldLatch(sm) && InputsSettled(sm.TraceReadMask, sm.TraceReadValues)) ParkSteadyLoop(sm);
+                    else StartRecording(sm);
+                }
                 UpdateSignals();
             }
         }
@@ -603,7 +655,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 }
                 break;
             case 5: // MOV
-                var moved = ReadSource(sm, argument & 7);
+                // MOV to PINS or PINDIRS keeps OUT_COUNT bits. Read no more pins
+                // than that unless the bit order is reversed, so a steady loop
+                // depends only on the pins that reach its outputs.
+                var destination = (argument >> 5) & 7;
+                var toPins = (destination == 0 || (destination == 3 && rp2350)) && ((argument >> 3) & 3) != 2;
+                var moved = ReadSource(sm, argument & 7, toPins ? OutCount(sm) : 32);
                 switch((argument >> 3) & 3)
                 {
                 case 1: moved = ~moved; break;
@@ -667,16 +724,22 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             return true;
         }
 
-        private uint ReadIRQFlags() => executingCycle ? cycleIRQFlags : irqFlags;
+        private uint ReadIRQFlags()
+        {
+            stepEffect = true;
+            return executingCycle ? cycleIRQFlags : irqFlags;
+        }
 
         private void SetIRQ(uint mask)
         {
+            stepEffect = true;
             if(executingCycle) cycleIRQSet |= mask;
             else { irqFlags |= mask; WakeAll(); }
         }
 
         private void ClearIRQ(uint mask)
         {
+            stepEffect = true;
             if(executingCycle) cycleIRQClear |= mask;
             else { irqFlags &= ~mask; WakeAll(); }
         }
@@ -696,6 +759,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             case 2: return sm.Y;
             case 3: return 0;
             case 5:
+                stepEffect = true;
                 if(rp2350)
                 {
                     // EXECCTRL.STATUS_SEL (6:5): TX level, RX level or IRQ flag STATUS_N (4:0).
@@ -714,6 +778,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private bool Push(StateMachine sm, bool block)
         {
+            stepEffect = true;
             if(sm.Rx.Count >= RxCapacity(sm))
             {
                 debug |= 1u << sm.Index;
@@ -725,8 +790,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             return true;
         }
 
+        // Even a failed pull depends on the TX FIFO, which a steady loop must not.
         private bool TryPull(StateMachine sm)
         {
+            stepEffect = true;
             if(sm.Tx.Count == 0) return false;
             sm.OSR = sm.Tx.Dequeue();
             sm.OutputCount = 0;
@@ -790,6 +857,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private void BeginPinCycle()
         {
+            pinCycle = ulong.MaxValue;
             foreach(var sm in stateMachines)
             {
                 sm.WriteMask = sm.DirectionMask = 0;
@@ -800,6 +868,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private void ResolvePinWrites()
         {
             var now = CurrentCycle;
+            foreach(var sm in stateMachines)
+            {
+                if(!sm.Steady || !SteadyStepAt(sm, now, out var step)) continue;
+                sm.WriteMask |= step.WriteMask;
+                sm.WriteValue = (sm.WriteValue & ~step.WriteMask) | step.WriteValue;
+                sm.DirectionMask |= step.DirectionMask;
+                sm.DirectionValue = (sm.DirectionValue & ~step.DirectionMask) | step.DirectionValue;
+            }
             foreach(var sm in stateMachines)
             {
                 if(!HasStalledSideSet(sm) || !ClockEnableAt(sm, now)) continue;
@@ -818,6 +894,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 outputEnable = (outputEnable & ~sm.DirectionMask) | (sm.DirectionValue & sm.DirectionMask);
             }
             var changed = (previousOutput ^ output) | (previousEnable ^ outputEnable);
+            foreach(var sm in stateMachines)
+            {
+                if(sm.Recording && (changed & sm.TraceWriteMask) != 0) sm.RecordingBroken = true;
+                // A parked loop's writes would have restored a pin another
+                // write changed; let it run to restore it.
+                if(sm.Steady && (changed & sm.SteadyWriteMask) != 0) ResumeSteadyLoop(sm);
+            }
             for(var pin = 0; pin < 32; pin++)
             {
                 if((changed & (1u << pin)) == 0) continue;
@@ -969,7 +1052,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         {
             var history = inputHistory[pin];
             while(history.Count != 0 && history.Peek().Tick <= now) synchronizedInput[pin] = history.Dequeue().Value;
-            return (inputSyncBypass & (1u << pin)) != 0 ? gpio.GetInput(pin + gpioBase) : synchronizedInput[pin];
+            var value = (inputSyncBypass & (1u << pin)) != 0 ? gpio.GetInput(pin + gpioBase) : synchronizedInput[pin];
+            if(trackingReads)
+            {
+                stepReadMask |= 1u << pin;
+                if(value) stepReadValues |= 1u << pin;
+            }
+            return value;
         }
 
         private void OnInputChanged(int gpioPin, bool level)
@@ -1022,6 +1111,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 var visibleTick = now + ((inputSyncBypass & (1u << pin)) != 0 ? 1ul : 2ul);
                 foreach(var sm in stateMachines)
                 {
+                    // The steps up to the change keep their old input, and the
+                    // machine runs them again from here to meet the new one.
+                    if(sm.Steady && (sm.SteadyReadMask & (1u << pin)) != 0)
+                    {
+                        ResumeSteadyLoop(sm);
+                        continue;
+                    }
                     if(!sm.Stalled) continue;
                     var dependsOnPin = InputDependency(sm);
                     if(dependsOnPin == pin && (!sm.Timer.Enabled || sm.DueTick > visibleTick))
@@ -1136,6 +1232,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private void Schedule(StateMachine sm, bool advance = true, bool wake = false, ulong earliestTick = 0)
         {
+            if(sm.Steady)
+            {
+                RestoreSteadyLoop(sm);
+                advance = false;
+            }
             // Disabling first brings the clock up to date before the due tick is
             // computed; other machines due at this tick run in that update.
             sm.Timer.Enabled = false;
@@ -1189,6 +1290,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private void Restart(StateMachine sm)
         {
+            sm.Steady = sm.Recording = sm.SteadyCandidate = false;
             sm.Timer.Enabled = false;
             sm.Scheduled = false;
             sm.ResumeCycles = 0;
@@ -1215,6 +1317,175 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             var remaining = (uint)(sm.CountLoopValue - done);
             if(sm.CountLoopUsesX) sm.X = remaining; else sm.Y = remaining;
             sm.Edge256 = sm.CountLoopStart + done * period;
+        }
+
+        // A pass of a loop is traced from the step a jump back or a wrap
+        // reaches. If it returns there with the machine's state unchanged, with
+        // no FIFO, IRQ or STATUS access, with the pins it read unchanged and its
+        // pin writes leaving the latch as it was, every later pass repeats it
+        // until one of those inputs changes. The machine is then parked:
+        // RestoreSteadyLoop rebuilds the step and state it would have reached at
+        // the current cycle, and it runs on from there.
+        private void TraceLoop(StateMachine sm, LoopStep step, int pc, bool plain)
+        {
+            // OUT_STICKY re-asserts each step's own last write, which a parked pass does not track.
+            if(!parkSteadyLoops || !plain || stepEffect || sm.JumpLoop || sm.CountLoop || sm.Injected || sm.RetryNextCycle
+                || (sm.ExecControl & (1u << 17)) != 0)
+            {
+                sm.Recording = false;
+                return;
+            }
+            if(!sm.Recording)
+            {
+                if(sm.PC <= pc) StartRecording(sm);
+                return;
+            }
+            if((sm.TraceReadMask & stepReadMask & (sm.TraceReadValues ^ stepReadValues)) != 0 || sm.UndeliveredPinChanges != 0)
+                sm.RecordingBroken = true;
+            step.WriteMask = sm.WriteMask;
+            step.WriteValue = sm.WriteValue;
+            step.DirectionMask = sm.DirectionMask;
+            step.DirectionValue = sm.DirectionValue;
+            sm.Trace.Add(step);
+            sm.TraceReadMask |= stepReadMask;
+            sm.TraceReadValues |= stepReadValues;
+            sm.TraceWriteMask |= sm.WriteMask | sm.DirectionMask;
+            if(sm.PC == sm.LoopHead)
+            {
+                if(!sm.RecordingBroken && SameState(sm, sm.Trace[0])) sm.SteadyCandidate = true;
+                else StartRecording(sm);
+            }
+            else if(sm.Trace.Count >= MaxLoopSteps) sm.Recording = false;
+        }
+
+        private static void StartRecording(StateMachine sm)
+        {
+            sm.Recording = true;
+            sm.RecordingBroken = false;
+            sm.LoopHead = sm.PC;
+            sm.Trace.Clear();
+            sm.TraceReadMask = sm.TraceReadValues = sm.TraceWriteMask = 0;
+        }
+
+        // Every write of the pass leaves the latch as it is now. A pass whose
+        // writes held the latch only because another machine's writes landed
+        // on the same cycles depends on that machine's phase, and is not steady.
+        private bool WritesHoldLatch(StateMachine sm)
+        {
+            foreach(var step in sm.Trace)
+            {
+                if(((step.WriteValue ^ output) & step.WriteMask) != 0) return false;
+                if(((step.DirectionValue ^ outputEnable) & step.DirectionMask) != 0) return false;
+            }
+            return true;
+        }
+
+        // No input change the traced pass did not see is on its way.
+        private bool InputsSettled(uint mask, uint values)
+        {
+            for(var pin = 0; pin < 32; pin++)
+            {
+                if((mask & (1u << pin)) == 0) continue;
+                // Another machine's read may already have taken a change the pass did not see.
+                if(inputHistory[pin].Count != 0) return false;
+                var level = (inputSyncBypass & (1u << pin)) != 0 ? gpio.GetInput(pin + gpioBase) : synchronizedInput[pin];
+                if(level != ((values & (1u << pin)) != 0)) return false;
+            }
+            return true;
+        }
+
+        private static void ParkSteadyLoop(StateMachine sm)
+        {
+            sm.Recording = false;
+            var head = sm.Trace[0].Edge256;
+            var period = sm.Edge256 - head;
+            if(period <= 0) return;
+            var steps = sm.Trace.ToArray();
+            for(var i = 0; i < steps.Length; i++) steps[i].Edge256 -= head;
+            sm.SteadySteps = steps;
+            sm.SteadyBase = head;
+            sm.SteadyPeriod = period;
+            sm.SteadyReadMask = sm.TraceReadMask;
+            sm.SteadyWriteMask = sm.TraceWriteMask;
+            sm.Steady = true;
+            sm.Timer.Enabled = false;
+            sm.Scheduled = false;
+        }
+
+        // Steps due up to and including the current cycle have run.
+        private void RestoreSteadyLoop(StateMachine sm)
+        {
+            sm.Steady = false;
+            var elapsed = (BigInteger)CurrentCycle * 256 + 255 - sm.SteadyBase;
+            var passes = elapsed < 0 ? BigInteger.Zero : elapsed / sm.SteadyPeriod;
+            var phase = elapsed - passes * sm.SteadyPeriod;
+            var index = 0;
+            while(index < sm.SteadySteps.Length && sm.SteadySteps[index].Edge256 <= phase) index++;
+            if(index == sm.SteadySteps.Length)
+            {
+                index = 0;
+                passes += 1;
+            }
+            var step = sm.SteadySteps[index];
+            ClearExecution(sm);
+            sm.PC = step.PC;
+            sm.X = step.X;
+            sm.Y = step.Y;
+            sm.OSR = step.OSR;
+            sm.ISR = step.ISR;
+            sm.InputCount = step.InputCount;
+            sm.OutputCount = step.OutputCount;
+            sm.StickyMask = step.StickyMask;
+            sm.StickyValue = step.StickyValue;
+            sm.Edge256 = sm.SteadyBase + passes * sm.SteadyPeriod + step.Edge256;
+        }
+
+        // The step of a parked pass that executes on the given cycle, if any:
+        // its pin writes still take part in that cycle's priority resolution.
+        private static bool SteadyStepAt(StateMachine sm, ulong tick, out LoopStep found)
+        {
+            var start = (BigInteger)tick * 256 - sm.SteadyBase;
+            found = default(LoopStep);
+            if(start + 255 < 0) return false;
+            var first = start < 0 ? BigInteger.Zero : start / sm.SteadyPeriod;
+            for(var pass = first; pass <= first + 1; pass++)
+            {
+                foreach(var step in sm.SteadySteps)
+                {
+                    var edge = pass * sm.SteadyPeriod + step.Edge256;
+                    if(edge < start || edge > start + 255) continue;
+                    found = step;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private void ResumeSteadyLoop(StateMachine sm)
+        {
+            if(sm.Steady) Schedule(sm, advance: false);
+        }
+
+        private void ResumeSteadyLoops()
+        {
+            foreach(var sm in stateMachines) ResumeSteadyLoop(sm);
+        }
+
+        private static LoopStep CaptureStep(StateMachine sm)
+        {
+            return new LoopStep
+            {
+                PC = sm.PC, X = sm.X, Y = sm.Y, OSR = sm.OSR, ISR = sm.ISR,
+                InputCount = sm.InputCount, OutputCount = sm.OutputCount,
+                StickyMask = sm.StickyMask, StickyValue = sm.StickyValue, Edge256 = sm.Edge256,
+            };
+        }
+
+        private static bool SameState(StateMachine sm, LoopStep step)
+        {
+            return sm.PC == step.PC && sm.X == step.X && sm.Y == step.Y && sm.OSR == step.OSR && sm.ISR == step.ISR
+                && sm.InputCount == step.InputCount && sm.OutputCount == step.OutputCount
+                && sm.StickyMask == step.StickyMask && sm.StickyValue == step.StickyValue;
         }
 
         private static void ClearExecution(StateMachine sm)
@@ -1284,6 +1555,24 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             public BigInteger CountLoopStart;
             public uint CountLoopValue;
             public int CountLoopCycles;
+            // A loop pass being traced, or the parked steady pass; see TraceLoop.
+            public bool Recording, RecordingBroken, SteadyCandidate, Steady;
+            public int LoopHead;
+            public readonly List<LoopStep> Trace = new List<LoopStep>();
+            public uint TraceReadMask, TraceReadValues, TraceWriteMask, SteadyReadMask, SteadyWriteMask;
+            // Steps with Edge256 relative to SteadyBase, the head of the parked pass.
+            public LoopStep[] SteadySteps;
+            public BigInteger SteadyBase, SteadyPeriod;
+        }
+
+        // The machine state before a step of a traced loop, and its clock edge.
+        private struct LoopStep
+        {
+            public int PC, InputCount, OutputCount;
+            public uint X, Y, OSR, ISR, StickyMask, StickyValue;
+            // The pin strobes the step made, which a parked pass replays.
+            public uint WriteMask, WriteValue, DirectionMask, DirectionValue;
+            public BigInteger Edge256;
         }
 
         private struct InputTransition
@@ -1346,6 +1635,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private ulong frequency;
         private bool publishing;
         private bool executingCycle;
+        private bool parkSteadyLoops = true;
+        // The cycle whose execution strobes the machines' write masks hold.
+        private ulong pinCycle = ulong.MaxValue;
+        // What the executing step read and whether it touched a FIFO, an IRQ
+        // flag or STATUS; see TraceLoop.
+        private bool trackingReads, stepEffect;
+        private uint stepReadMask, stepReadValues;
+        private const int MaxLoopSteps = 32;
         private uint cycleIRQFlags, cycleIRQSet, cycleIRQClear;
     }
 }
