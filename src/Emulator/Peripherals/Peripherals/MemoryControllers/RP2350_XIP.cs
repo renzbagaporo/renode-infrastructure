@@ -16,7 +16,7 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
     // Cache maintenance operates on 2048 eight-byte lines, with set/way selected
     // by address bits13:3. Pinned lines retain their tag and data across core
     // resets and can back SRAM in the otherwise unused upper XIP address space.
-    public sealed class RP2350_XIP : RP2APBPeripheral
+    public sealed class RP2350_XIP : RP2APBPeripheral, IRP2XIPStream
     {
         public RP2350_XIP(IMachine machine) : base(machine) { Reset(); }
         public override void Reset()
@@ -27,8 +27,13 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
                 accesses = hits = 0;
                 countersCleared = false;
                 configurationPending = true;
+                streamAddress = 0;
+                streamCount = 0;
+                streamFifo.Clear();
+                streamRequest = false;
             }
             PublishNotifications();
+            PublishStreamRequest();
         }
         public void SetPowerPresent(bool value)
         {
@@ -184,9 +189,12 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
             switch(offset)
             {
             case 0: return control;
-            case 8: return 2; // Streaming FIFO is empty until streaming is supported.
+            case 8: return (streamFifo.Count == 0 ? 2u : 0) | (streamFifo.Count == StreamDepth ? 4u : 0);
             case 0xc: return hits;
             case 0x10: return accesses;
+            case 0x14: return streamAddress;
+            case 0x18: return streamCount;
+            case 0x1c: return PopStreamWord();
             default: this.LogUnhandledRead(offset); return 0;
             }
         }
@@ -203,13 +211,69 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
             // Clearing a counter starts a measurement, so later reads are counted.
             case 0xc: hits = 0; MarkCountersCleared(); return;
             case 0x10: accesses = 0; MarkCountersCleared(); return;
+            case 0x14: streamAddress = ApplyOperation(streamAddress, value, operation, 0xfffffffc); return;
             case 0x18:
-                if(value != 0) this.Log(LogLevel.Error, "XIP streaming reads are not implemented; transfer will not complete");
+                streamCount = ApplyOperation(streamCount, value, operation, 0x3fffff);
+                FillStream();
                 return;
             default: this.LogUnhandledWrite(offset, value); return;
             }
         }
-        protected override void OnAccessCompleted() => PublishNotifications();
+        protected override void OnAccessCompleted()
+        {
+            PublishNotifications();
+            PublishStreamRequest();
+        }
+
+        // The streaming engine reads words through the uncached non-allocating
+        // alias into a 2-word FIFO, popped through STREAM_FIFO or XIP_AUX; its
+        // DREQ follows FIFO non-empty. Each word is fetched as soon as the
+        // FIFO has room: arbitration with XIP fetches is not modelled.
+        public GPIO StreamDMA { get; } = new GPIO();
+
+        public uint PopStream()
+        {
+            uint value;
+            lock(SyncRoot) value = PopStreamWord();
+            PublishStreamRequest();
+            return value;
+        }
+
+        private uint PopStreamWord()
+        {
+            if(streamFifo.Count == 0) return 0;
+            var value = streamFifo.Dequeue();
+            FillStream();
+            return value;
+        }
+
+        private void FillStream()
+        {
+            while(streamCount != 0 && streamFifo.Count < StreamDepth)
+            {
+                streamFifo.Enqueue(machine.SystemBus.ReadDoubleWord(0x14000000 | (streamAddress & 0x03fffffc)));
+                streamAddress += 4;
+                streamCount--;
+            }
+            streamRequest = streamFifo.Count != 0;
+        }
+
+        // Outside the state monitor: a DMA channel answers synchronously.
+        private void PublishStreamRequest()
+        {
+            bool level;
+            lock(SyncRoot) level = streamRequest;
+            if(level == publishedStreamRequest) return;
+            publishedStreamRequest = level;
+            StreamDMA.Set(level);
+        }
+
+        private uint streamAddress;
+        private uint streamCount;
+        private bool streamRequest;
+        private bool publishedStreamRequest;
+        private readonly Queue<uint> streamFifo = new Queue<uint>();
+        private const int StreamDepth = 2;
 
         private void MarkCountersCleared()
         {

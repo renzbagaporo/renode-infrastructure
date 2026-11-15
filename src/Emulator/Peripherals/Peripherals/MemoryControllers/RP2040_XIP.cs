@@ -18,10 +18,10 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
     // transaction, including instruction fetches. The streaming engine
     // (STREAM_ADDR, STREAM_CTR) reads words through the uncached
     // non-allocating alias into a 2-word FIFO, popped through STREAM_FIFO or
-    // the XIP_AUX alias (RP2040_XIPAux); its DREQ follows FIFO non-empty.
+    // the XIP_AUX alias (RP2_XIPAux); its DREQ follows FIFO non-empty.
     // Each word is fetched as soon as the FIFO has room: bus arbitration
     // with XIP fetches is not modelled.
-    public sealed class RP2040_XIP : RP2APBPeripheral
+    public sealed class RP2040_XIP : RP2APBPeripheral, IRP2XIPStream
     {
         public RP2040_XIP(IMachine machine, RP2040_SSI ssi, WinbondW25QFlash flash) : base(machine)
         {
@@ -49,7 +49,7 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
         public GPIO StreamDMA { get; } = new GPIO();
 
         // A pop through the XIP_AUX alias.
-        internal uint PopStream()
+        public uint PopStream()
         {
             uint value;
             lock(SyncRoot) value = PopStreamWord();
@@ -181,15 +181,23 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
         private const int StreamDepth = 2;
     }
 
-    // RP2040 XIP_AUX (0x50400000): reads pop the XIP streaming FIFO.
-    public sealed class RP2040_XIPAux : IDoubleWordPeripheral, IKnownSize
+    // An XIP controller's streaming FIFO, as XIP_AUX pops it.
+    public interface IRP2XIPStream
     {
-        public RP2040_XIPAux(RP2040_XIP xip)
+        uint PopStream();
+    }
+
+    // XIP_AUX (RP2040 0x50400000, RP2350 0x50500000): reads of STREAM (offset
+    // 0) pop the XIP streaming FIFO. The RP2350's QMI direct-mode FIFOs at 4
+    // and 8 are not modelled.
+    public sealed class RP2_XIPAux : IDoubleWordPeripheral, IKnownSize
+    {
+        public RP2_XIPAux(IRP2XIPStream xip)
         {
             this.xip = xip;
         }
 
-        public uint ReadDoubleWord(long offset) => xip.PopStream();
+        public uint ReadDoubleWord(long offset) => offset == 0 ? xip.PopStream() : 0;
 
         public void WriteDoubleWord(long offset, uint value)
         {
@@ -201,6 +209,6 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
 
         public long Size => 0x1000;
 
-        private readonly RP2040_XIP xip;
+        private readonly IRP2XIPStream xip;
     }
 }
