@@ -4,6 +4,7 @@
 //
 
 using System;
+using System.Collections.Generic;
 
 using Antmicro.Renode.Core;
 
@@ -17,41 +18,45 @@ namespace Antmicro.Renode.Time
     public static class SignalTime
     {
         // The time of the change being delivered on this thread for the
-        // machine, or that machine's current clock value.
+        // machine, or that machine's current clock value. Deliveries nest
+        // across machines (a synchronous wire's answer from another machine
+        // arrives inside this one's delivery), so each machine keeps the time
+        // of its innermost delivery.
         public static TimeInterval Of(IMachine machine)
         {
-            return scopeMachine != null && scopeMachine == machine ? scopeTime : machine.ClockSource.CurrentValue;
+            if(scopes != null)
+            {
+                for(var i = scopes.Count - 1; i >= 0; i--)
+                {
+                    if(scopes[i].Machine == machine) return scopes[i].Time;
+                }
+            }
+            return machine.ClockSource.CurrentValue;
         }
 
         public static Scope At(IMachine machine, TimeInterval time)
         {
-            var scope = new Scope(scopeMachine, scopeTime);
-            scopeMachine = machine;
-            scopeTime = time;
-            return scope;
+            if(scopes == null) scopes = new List<(IMachine Machine, TimeInterval Time)>();
+            scopes.Add((machine, time));
+            return new Scope(scopes.Count - 1);
         }
 
         public readonly struct Scope : IDisposable
         {
-            public Scope(IMachine machine, TimeInterval time)
+            public Scope(int depth)
             {
-                previousMachine = machine;
-                previousTime = time;
+                this.depth = depth;
             }
 
             public void Dispose()
             {
-                scopeMachine = previousMachine;
-                scopeTime = previousTime;
+                if(scopes != null && scopes.Count > depth) scopes.RemoveRange(depth, scopes.Count - depth);
             }
 
-            private readonly IMachine previousMachine;
-            private readonly TimeInterval previousTime;
+            private readonly int depth;
         }
 
         [ThreadStatic]
-        private static IMachine scopeMachine;
-        [ThreadStatic]
-        private static TimeInterval scopeTime;
+        private static List<(IMachine Machine, TimeInterval Time)> scopes;
     }
 }
