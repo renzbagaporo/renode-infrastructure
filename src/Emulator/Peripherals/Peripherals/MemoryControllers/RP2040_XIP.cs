@@ -21,6 +21,14 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
     // the XIP_AUX alias (RP2_XIPAux); its DREQ follows FIFO non-empty.
     // Each word is fetched as soon as the FIFO has room: bus arbitration
     // with XIP fetches is not modelled.
+    // The 16 KiB cache is 2-way set-associative with 8-byte lines: set from
+    // address bits 12:3, least recently used way replaced. Reads through the
+    // cached aliases look it up while CTRL.EN is set, and only the
+    // allocating alias fills a missed line; a write to it deallocates a
+    // matching line, and FLUSH clears every line. CTR_ACC and CTR_HIT count
+    // those reads from the first access to either counter: until then the
+    // cached aliases read the NOR directly. Instruction fetches are never
+    // counted.
     public sealed class RP2040_XIP : RP2APBPeripheral, IRP2XIPStream
     {
         public RP2040_XIP(IMachine machine, RP2040_SSI ssi, WinbondW25QFlash flash) : base(machine)
@@ -38,6 +46,10 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
             {
                 control = 3;
                 flushReady = false;
+                Array.Fill(tags, Invalid);
+                Array.Clear(leastRecent, 0, leastRecent.Length);
+                hits = accesses = 0;
+                measuring = false;
                 streamAddress = 0;
                 streamCount = 0;
                 streamFifo.Clear();
@@ -71,6 +83,51 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
 
         public event Action AvailabilityChanged;
 
+        // True from the first counter access: the cached aliases then pass
+        // every data read through RecordRead.
+        public bool Measuring
+        {
+            get
+            {
+                lock(SyncRoot) return measuring;
+            }
+        }
+
+        public void RecordRead(long offset, bool allocate)
+        {
+            lock(SyncRoot)
+            {
+                if((control & 1) == 0) return;
+                var line = offset >> 3;
+                var set = (int)(line & (Sets - 1));
+                if(accesses != uint.MaxValue) accesses++;
+                for(var way = 0; way < Ways; way++)
+                {
+                    if(tags[set * Ways + way] != line) continue;
+                    if(hits != uint.MaxValue) hits++;
+                    leastRecent[set] = (byte)(1 - way);
+                    return;
+                }
+                if(!allocate) return;
+                var victim = leastRecent[set];
+                tags[set * Ways + victim] = line;
+                leastRecent[set] = (byte)(1 - victim);
+            }
+        }
+
+        public void DeallocateLine(long offset)
+        {
+            lock(SyncRoot)
+            {
+                var line = offset >> 3;
+                var set = (int)(line & (Sets - 1));
+                for(var way = 0; way < Ways; way++)
+                {
+                    if(tags[set * Ways + way] == line) tags[set * Ways + way] = Invalid;
+                }
+            }
+        }
+
         protected override uint ReadRegister(long offset)
         {
             switch(offset)
@@ -78,8 +135,8 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
             case 0: return control;
             case 4: return flushReady ? 1u : 0;
             case 8: return (streamFifo.Count == 0 ? 2u : 0) | (streamFifo.Count == StreamDepth ? 4u : 0) | (flushReady ? 1u : 0);
-            case 0xc:
-            case 0x10: return 0;
+            case 0xc: StartMeasuring(); return hits;
+            case 0x10: StartMeasuring(); return accesses;
             case 0x14: return streamAddress;
             case 0x18: return streamCount;
             case 0x1c: return PopStreamWord();
@@ -98,12 +155,16 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
                 control = ApplyOperation(control, value, operation, 0xb);
                 break;
             case 4:
-                // NOR writes invalidate the shared mapped memory's translated
-                // blocks; there are no retained data-cache lines to flush.
+                Array.Fill(tags, Invalid);
                 flushReady = true;
                 break;
             case 0xc:
+                hits = 0;
+                StartMeasuring();
+                break;
             case 0x10:
+                accesses = 0;
+                StartMeasuring();
                 break;
             case 0x14:
                 streamAddress = ApplyOperation(streamAddress, value, operation, 0xfffffffc);
@@ -118,7 +179,24 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
             }
         }
 
-        protected override void OnAccessCompleted() => PublishRequest();
+        protected override void OnAccessCompleted()
+        {
+            PublishRequest();
+            bool pending;
+            lock(SyncRoot)
+            {
+                pending = measuringPending;
+                measuringPending = false;
+            }
+            if(pending) UpdateAvailability();
+        }
+
+        private void StartMeasuring()
+        {
+            if(measuring) return;
+            measuring = true;
+            measuringPending = true;
+        }
 
         private uint PopStreamWord()
         {
@@ -177,8 +255,17 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
         private bool requestLevel;
         private bool publishedRequest;
         private readonly Queue<uint> streamFifo = new Queue<uint>();
+        private readonly long[] tags = new long[Sets * Ways];
+        private readonly byte[] leastRecent = new byte[Sets];
+        private uint hits;
+        private uint accesses;
+        private bool measuring;
+        private bool measuringPending;
 
         private const int StreamDepth = 2;
+        private const int Sets = 1024;
+        private const int Ways = 2;
+        private const long Invalid = -1;
     }
 
     // An XIP controller's streaming FIFO, as XIP_AUX pops it.

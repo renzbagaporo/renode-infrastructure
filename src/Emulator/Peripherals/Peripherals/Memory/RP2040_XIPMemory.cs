@@ -22,14 +22,22 @@ namespace Antmicro.Renode.Peripherals.Memory
     // are ignored. Otherwise every CPU access goes through the bus and observes
     // SSI/NOR availability. Other bus masters always use the bus. Programming
     // remains available only through the flash serial interface.
+    // Each XIP alias is its own instance over the shared NOR: cached
+    // (0x10, 0x11) or not (0x12, 0x13), allocating (0x10) or not. While the
+    // XIP controller measures its cache counters, CPU data reads of a cached
+    // alias go through the bus and are recorded in the cache, and writes to
+    // the cached allocating alias deallocate their line. The instance that
+    // is cached and allocating owns the NOR contents.
     public sealed class RP2040_XIPMemory : IBytePeripheral, IWordPeripheral, IDoubleWordPeripheral,
         IQuadWordPeripheral, IMultibyteWritePeripheral, IExecutableIO, IKnownSize, IDisposable
     {
-        public RP2040_XIPMemory(IMachine machine, WinbondW25QFlash flash, RP2040_XIP xip)
+        public RP2040_XIPMemory(IMachine machine, WinbondW25QFlash flash, RP2040_XIP xip, bool cached = true, bool allocate = true)
         {
             this.machine = machine;
             this.flash = flash;
             this.xip = xip;
+            this.cached = cached;
+            this.allocate = allocate;
             // Availability notifications arrive at the end of every serial
             // transaction; translations are cleared when the array or the
             // availability actually changes.
@@ -47,20 +55,23 @@ namespace Antmicro.Renode.Peripherals.Memory
         {
             if(offset < 0 || offset > Size - count) throw new BusAccessException(BusAccessError.AddressError);
             SynchronizeDataAccess();
-            MarkInstructionFetch();
+            var fetch = MarkInstructionFetch();
             ulong value = 0;
             machine.ClockSource.ExecuteInLock(() =>
             {
                 if(!CanRead()) return;
                 for(var i = 0; i < count; i++) value |= (ulong)flash.UnderlyingMemory.ReadByte(offset + i) << (8 * i);
+                if(cached && !fetch) xip.RecordRead(offset, allocate);
             });
             return value;
         }
 
-        private void MarkInstructionFetch()
+        private bool MarkInstructionFetch()
         {
-            if(machine.GetSystemBus(this).TryGetCurrentContextState<CortexM.ContextState>(out var _, out var state)
-                && state.InstructionFetch) Volatile.Write(ref hasFetchedInstructions, 1);
+            if(!machine.GetSystemBus(this).TryGetCurrentContextState<CortexM.ContextState>(out var _, out var state)
+                || !state.InstructionFetch) return false;
+            Volatile.Write(ref hasFetchedInstructions, 1);
+            return true;
         }
 
         private void SynchronizeDataAccess()
@@ -79,20 +90,17 @@ namespace Antmicro.Renode.Peripherals.Memory
             return false;
         }
 
-        public void WriteByte(long offset, byte value)
-        {
-        }
+        public void WriteByte(long offset, byte value) => Write(offset);
 
-        public void WriteWord(long offset, ushort value)
-        {
-        }
+        public void WriteWord(long offset, ushort value) => Write(offset);
 
-        public void WriteDoubleWord(long offset, uint value)
-        {
-        }
+        public void WriteDoubleWord(long offset, uint value) => Write(offset);
 
-        public void WriteQuadWord(long offset, ulong value)
+        public void WriteQuadWord(long offset, ulong value) => Write(offset);
+
+        private void Write(long offset)
         {
+            if(cached && allocate) xip.DeallocateLine(offset);
         }
 
         public byte[] ReadBytes(long offset, int count, IPeripheral context = null)
@@ -126,7 +134,7 @@ namespace Antmicro.Renode.Peripherals.Memory
             machine.PeripheralsChanged -= OnPeripheralsChanged;
             flash.ArrayChanged -= InvalidateArray;
             xip.AvailabilityChanged -= UpdateDirectAccess;
-            flash.UnderlyingMemory.Dispose();
+            if(cached && allocate) flash.UnderlyingMemory.Dispose();
         }
 
         public void Reset()
@@ -179,7 +187,7 @@ namespace Antmicro.Renode.Peripherals.Memory
                 InvalidateInstructions();
                 return;
             }
-            var available = xip.Available;
+            var available = xip.Available && !(cached && xip.Measuring);
             lock(directAccessLock)
             {
                 if(!force && available == directAccess) return;
@@ -233,5 +241,7 @@ namespace Antmicro.Renode.Peripherals.Memory
         private readonly IMachine machine;
         private readonly WinbondW25QFlash flash;
         private readonly RP2040_XIP xip;
+        private readonly bool cached;
+        private readonly bool allocate;
     }
 }
