@@ -3,6 +3,9 @@
 // Full license text is available in 'licenses/MIT.txt'.
 //
 
+using System;
+using System.Linq;
+
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Peripherals.CPU;
 
@@ -10,6 +13,18 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 {
     public static class RP2CpuTime
     {
+        // The cores execute one instruction per clk_sys cycle, as RP2040's
+        // Cortex-M0+ and RP2350's Cortex-M33 and Hazard3 roughly do.
+        public static void SetCoreClock(IMachine machine, ulong systemFrequency)
+        {
+            if(systemFrequency == 0) return;
+            var mips = (uint)Math.Max(1ul, (systemFrequency + 500000) / 1000000);
+            foreach(var cpu in machine.SystemBus.GetCPUs().OfType<BaseCPU>())
+            {
+                if(cpu.PerformanceInMips != mips) cpu.PerformanceInMips = mips;
+            }
+        }
+
         // Brings the CPU that issued the current bus access up to its own
         // time, so a register reflects every cycle it has executed. A
         // debug-port access, a DMA access and an access made off that CPU's
