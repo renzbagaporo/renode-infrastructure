@@ -276,6 +276,13 @@ namespace Antmicro.Renode.Peripherals.SPI
             && (registers[0xf4 / 4] & 3) <= 2;
 
         public GPIO IRQ { get; } = new GPIO();
+
+        // DW_apb_ssi DMA handshakes as DREQ levels: TX while DMACR.TDMAE is set
+        // and the TX FIFO holds at most DMATDLR entries, RX while DMACR.RDMAE is
+        // set and the RX FIFO holds more than DMARDLR entries.
+        public GPIO TxDMA { get; } = new GPIO();
+
+        public GPIO RxDMA { get; } = new GPIO();
         public long Size => 0x4000;
 
         private void TryStartFrame()
@@ -426,7 +433,13 @@ namespace Antmicro.Renode.Peripherals.SPI
             if(machine.SystemBus.TryGetCurrentCPU(out var cpu)) cpu.SyncTime();
         }
 
-        private void UpdateInterrupt() => IRQ.Set((RawInterrupts & registers[0x2c / 4]) != 0);
+        private void UpdateInterrupt()
+        {
+            IRQ.Set((RawInterrupts & registers[0x2c / 4]) != 0);
+            var dmaControl = registers[0x4c / 4];
+            TxDMA.Set(Enabled && (dmaControl & 2) != 0 && transmitFifo.Count <= (registers[0x50 / 4] & 0xff));
+            RxDMA.Set(Enabled && (dmaControl & 1) != 0 && receiveFifo.Count > (registers[0x54 / 4] & 0xff));
+        }
         private static bool IsDataRegister(long offset) => offset >= 0x60 && offset <= 0xec && offset % 4 == 0;
         private uint RawInterrupts => errors | (Enabled && transmitFifo.Count <= registers[0x18 / 4] ? 1u : 0)
             | (Enabled && receiveFifo.Count > registers[0x1c / 4] ? 16u : 0);
