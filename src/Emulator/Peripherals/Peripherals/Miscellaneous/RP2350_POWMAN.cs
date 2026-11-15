@@ -11,6 +11,7 @@ using System.Threading;
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.CPU;
+using Antmicro.Renode.Peripherals.GPIOPort;
 using Antmicro.Renode.Peripherals.IRQControllers;
 using Antmicro.Renode.Peripherals.Memory;
 using Antmicro.Renode.Peripherals.MemoryControllers;
@@ -25,8 +26,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public RP2350_POWMAN(IMachine machine, CortexM core0, CortexM core1, NVIC nvic0, NVIC nvic1,
             RP2350_DebugPort debugPort, RP2350_BootRAM bootRAM = null, RP2350_XIP xip = null,
             MappedMemory sramLow = null, MappedMemory sramHigh = null,
-            RP2350_ArchitectureSelector architectureSelector = null, RP2_XOSC xosc = null, RP2350_ROSC rosc = null) : base(machine)
+            RP2350_ArchitectureSelector architectureSelector = null, RP2_XOSC xosc = null, RP2350_ROSC rosc = null,
+            RP2_GPIOBank0 gpio = null) : base(machine)
         {
+            this.gpio = gpio;
+            if(gpio != null) gpio.InputChanged += OnWakeInput;
             this.xosc = xosc;
             this.rosc = rosc;
             alarmTimer = new LimitTimer(machine.ClockSource, TimeInterval.TicksPerSecond, this, "aon alarm",
@@ -175,7 +179,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             case 0xe4: return interruptEnable;
             case 0xe8: return interruptForce;
             case 0xec: return (interruptRaw | interruptForce) & interruptEnable;
-            case 0x8c: case 0x90: case 0x94: case 0x98: return powerUp[(offset - 0x8c) / 4];
+            case 0x8c: case 0x90: case 0x94: case 0x98: return PowerUpSourceState((int)(offset - 0x8c) / 4);
             case 0xa4: return debugPowerConfiguration;
             case 0xa8: return bootDisable;
             case 0xac: return debugConfiguration;
@@ -273,7 +277,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 break;
             case 0x8c: case 0x90: case 0x94: case 0x98:
                 var powerIndex = (offset - 0x8c) / 4;
-                powerUp[powerIndex] = ApplyOperation(powerUp[powerIndex], value, operation, 0x3fff);
+                // STATUS (bit 9) latches a wake event; RAW_STATUS (bit 10) is the live match.
+                powerUp[powerIndex] = ApplyOperation(powerUp[powerIndex], value, operation, 0x3ff);
                 break;
             case 0x30:
                 watchdogSelect = ApplyOperation(watchdogSelect, value, operation, 0x1111);
@@ -364,15 +369,58 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             // Wake a dormant oscillator: the alarm is a dormant wake source.
             if(xosc != null && xosc.ReadDoubleWord(0x8) == DormantValue) xosc.WriteDoubleWord(0x8, WakeValue);
             if(rosc != null && rosc.ReadDoubleWord(0x10) == DormantValue) rosc.WriteDoubleWord(0x10, WakeValue);
-            if((timerControl & TimerPowerUpOnAlarm) != 0 && (powerState & SwitchedCoreOff) != 0) PowerUpSwitchedCore();
+            if((timerControl & TimerPowerUpOnAlarm) != 0 && (powerState & SwitchedCoreOff) != 0) PowerUpSwitchedCore(1u << 5);
         }
 
         // The power sequencer brings the switched core up from a low-power state
         // (P1.x): SRAM domains as SEQ_CFG.HW_PWRUP_SRAMx says, then the
         // switched core comes out of reset and boots with CHIP_RESET.HAD_SWCORE_PD.
-        private void PowerUpSwitchedCore()
+        // PWRUPn: GPIO SOURCE (5:0), ENABLE (6), DIRECTION high/rising (7),
+        // MODE edge (8). A matching input latches STATUS and, with the switched
+        // core off, powers it up as power-up request n.
+        private void OnWakeInput(int pin, bool level)
         {
-            lastPowerUp = 1u << 5; // alarm power-up request
+            var wake = -1;
+            lock(SyncRoot)
+            {
+                for(var i = 0; i < powerUp.Length; i++)
+                {
+                    var source = powerUp[i];
+                    if((source & 0x40) == 0 || (source & 0x3f) != pin || level != ((source & 0x80) != 0)) continue;
+                    powerUp[i] |= 0x200;
+                    if(wake < 0 && (powerState & SwitchedCoreOff) != 0) wake = i;
+                }
+            }
+            if(wake >= 0) PowerUpSwitchedCore(1u << wake);
+        }
+
+        private uint PowerUpSourceState(int index)
+        {
+            var source = powerUp[index];
+            var raw = gpio != null && (source & 0x40) != 0 && gpio.GetInput((int)(source & 0x3f)) == ((source & 0x80) != 0);
+            return source | (raw ? 0x400u : 0);
+        }
+
+        // A level source already active, or an edge already latched, when the
+        // switched core powers off brings it straight back up.
+        private void WakeIfPowerUpPending()
+        {
+            for(var i = 0; i < powerUp.Length; i++)
+            {
+                var source = powerUp[i];
+                if((source & 0x40) == 0) continue;
+                var edge = (source & 0x100) != 0;
+                if((edge && (source & 0x200) != 0) || (!edge && (PowerUpSourceState(i) & 0x400) != 0))
+                {
+                    PowerUpSwitchedCore(1u << i);
+                    return;
+                }
+            }
+        }
+
+        private void PowerUpSwitchedCore(uint reason)
+        {
+            lastPowerUp = reason;
             var retained = new List<IPeripheral> { this, debugPort };
             retained.AddRange(machine.GetRegisteredPeripherals().Select(entry => entry.Peripheral).OfType<WinbondW25QFlash>());
             var sleepState = powerState & 0xf;
@@ -425,6 +473,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             machine.SystemBus.SetAddressRangeLocked(new Antmicro.Renode.Core.Range(0x20000000, 0x40000), (request & 2) != 0);
             machine.SystemBus.SetAddressRangeLocked(new Antmicro.Renode.Core.Range(0x20040000, 0x42000), (request & 1) != 0);
             foreach(var core in cores) core.CpuWaitSignal.Set((request & SwitchedCoreOff) != 0);
+            if((request & ~previous & SwitchedCoreOff) != 0) WakeIfPowerUpPending();
         }
 
         private void UpdateInterrupt() => TimerIRQ.Set(((interruptRaw | interruptForce) & interruptEnable & TimerInterrupt) != 0);
@@ -496,6 +545,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private readonly RP2350_ArchitectureSelector architectureSelector;
         private readonly uint[] scratch = new uint[12];
         private readonly uint[] powerUp = new uint[4];
+        private readonly RP2_GPIOBank0 gpio;
         private uint powerState;
         private uint[] tickFrequency;
         private uint timerControl;

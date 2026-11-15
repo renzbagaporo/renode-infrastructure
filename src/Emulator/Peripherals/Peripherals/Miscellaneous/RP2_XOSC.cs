@@ -12,7 +12,7 @@ using Antmicro.Renode.Time;
 
 namespace Antmicro.Renode.Peripherals.Miscellaneous
 {
-    public sealed class RP2_XOSC : RP2APBPeripheral
+    public sealed class RP2_XOSC : RP2APBPeripheral, IGPIOReceiver
     {
         public RP2_XOSC(IMachine machine, ulong crystalFrequency = 12000000, bool rp2350 = false) : base(machine)
         {
@@ -48,6 +48,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public ulong Frequency => stable ? crystalFrequency : 0;
 
         public event Action ClockChanged;
+
+        // The GPIO banks' DORMANT_WAKE restarts a dormant oscillator, as
+        // writing WAKE to DORMANT does.
+        public void OnGPIO(int number, bool value)
+        {
+            if(value) WriteDoubleWord(0x8, 0x77616b65);
+        }
 
         protected override uint ReadRegister(long offset)
         {

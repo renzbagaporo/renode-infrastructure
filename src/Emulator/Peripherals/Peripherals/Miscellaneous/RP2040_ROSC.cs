@@ -12,7 +12,7 @@ using Antmicro.Renode.Time;
 
 namespace Antmicro.Renode.Peripherals.Miscellaneous
 {
-    public sealed class RP2040_ROSC : RP2APBPeripheral
+    public sealed class RP2040_ROSC : RP2APBPeripheral, IGPIOReceiver
     {
         // The free-running ring frequency is board/temperature dependent. This
         // parameter specifies the nominal ring frequency before the divider.
@@ -46,6 +46,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         // Synchronized before the access locks; see RP2_Timer.OnBeforeAccess.
         protected override void OnBeforeAccess() => RP2CpuTime.SyncInitiator(machine);
+
+        // The GPIO banks' DORMANT_WAKE restarts a dormant oscillator, as
+        // writing WAKE to DORMANT does.
+        public void OnGPIO(int number, bool value)
+        {
+            if(value) WriteDoubleWord(0xc, 0x77616b65);
+        }
 
         protected override uint ReadRegister(long offset)
         {
