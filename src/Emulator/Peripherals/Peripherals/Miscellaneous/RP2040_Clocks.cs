@@ -85,6 +85,28 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             return source * 0x100 / division;
         }
 
+        // CLKSRC_GPIN0 and GPIN1: the frequency of the external clock driven
+        // into GPIO20 and GPIO22, set by the bench (0 when nothing drives it).
+        public ulong Gpin0Frequency
+        {
+            get => gpin0Frequency;
+            set
+            {
+                gpin0Frequency = value;
+                machine.ClockSource.ExecuteInLock(() => { lock(SyncRoot) UpdateClocks(); });
+            }
+        }
+
+        public ulong Gpin1Frequency
+        {
+            get => gpin1Frequency;
+            set
+            {
+                gpin1Frequency = value;
+                machine.ClockSource.ExecuteInLock(() => { lock(SyncRoot) UpdateClocks(); });
+            }
+        }
+
         public ulong SystemFrequency => GetFrequency(SystemClock);
 
         public ulong PeripheralFrequency => GetFrequency(PeripheralClock);
@@ -188,7 +210,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             case 0:
                 return rosc.Frequency;
             case 1:
-                return ((control[ReferenceClock] >> 5) & 3) == 0 ? pllUsb.Frequency : 0;
+                switch((control[ReferenceClock] >> 5) & 3)
+                {
+                case 0: return pllUsb.Frequency;
+                case 1: return Gpin0Frequency;
+                case 2: return Gpin1Frequency;
+                default: return 0;
+                }
             case 2:
                 return xosc.Frequency;
             default:
@@ -212,30 +240,41 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 case 2: return pllUsb.Frequency;
                 case 3: return rosc.Frequency;
                 case 4: return xosc.Frequency;
+                case 5: return Gpin0Frequency;
+                case 6: return Gpin1Frequency;
                 default: return 0;
                 }
             }
-            if(clock >= 7)
+            if(clock >= 7 || clock == SystemClock)
             {
-                switch(source)
+                // clk_usb, clk_adc and clk_rtc; clk_sys orders its first two
+                // sources the other way round.
+                var swap = clock == SystemClock && source < 2;
+                switch(swap ? 1 - source : source)
                 {
                 case 0: return pllUsb.Frequency;
                 case 1: return pllSys.Frequency;
                 case 2: return rosc.Frequency;
                 case 3: return xosc.Frequency;
+                case 4: return Gpin0Frequency;
+                case 5: return Gpin1Frequency;
                 default: return 0;
                 }
             }
+            // clk_gpout0-3.
             switch(source)
             {
             case 0: return pllSys.Frequency;
-            case 1: return pllUsb.Frequency;
-            case 2: return rosc.Frequency;
-            case 3: return xosc.Frequency;
-            case 6: return GetFrequency(ReferenceClock);
-            case 7: return GetFrequency(SystemClock);
+            case 1: return Gpin0Frequency;
+            case 2: return Gpin1Frequency;
+            case 3: return pllUsb.Frequency;
+            case 4: return rosc.Frequency;
+            case 5: return xosc.Frequency;
+            case 6: return GetFrequency(SystemClock);
+            case 7: return GetFrequency(7);
             case 8: return GetFrequency(8);
             case 9: return GetFrequency(9);
+            case 0xa: return GetFrequency(ReferenceClock);
             default: return 0;
             }
         }
@@ -275,6 +314,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private static readonly uint[] ControlMasks = { 0x131de0, 0x131de0, 0x131de0, 0x131de0, 0x63, 0xe1, 0xce0, 0x130ce0, 0x130ce0, 0x130ce0 };
         private static readonly uint[] DividerMasks = { 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0x300, 0xffffffff, 0, 0x300, 0x300, 0xffffffff };
+
+        private ulong gpin0Frequency;
+        private ulong gpin1Frequency;
 
         private const int ReferenceClock = 4;
         private const int SystemClock = 5;
