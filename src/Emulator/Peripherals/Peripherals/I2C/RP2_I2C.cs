@@ -555,7 +555,14 @@ namespace Antmicro.Renode.Peripherals.I2C
                 Answer(busEvent, I2CBusEvent.Acknowledge(busEvent.Transfer, targetSelected));
                 break;
             case I2CBusEventType.Write:
-                if(!AnswersTo(busEvent)) return;
+                if(!AnswersTo(busEvent))
+                {
+                    // On a bus only the targets that acknowledged get the
+                    // byte. On the pads this block sees every byte, and one
+                    // that is not its transfer's must not keep SCL held.
+                    if(bus == null) Answer(busEvent, I2CBusEvent.Acknowledge(busEvent.Transfer, false));
+                    return;
+                }
                 if(!listening || !targetSelected)
                 {
                     Answer(busEvent, I2CBusEvent.Acknowledge(busEvent.Transfer, false));
@@ -576,7 +583,11 @@ namespace Antmicro.Renode.Peripherals.I2C
                 Answer(busEvent, I2CBusEvent.Acknowledge(busEvent.Transfer, nackOnly == 0));
                 break;
             case I2CBusEventType.Read:
-                if(!AnswersTo(busEvent)) return;
+                if(!AnswersTo(busEvent))
+                {
+                    if(bus == null) Answer(busEvent, I2CBusEvent.Reply(busEvent.Transfer, 0xff));
+                    return;
+                }
                 if(!listening || !targetSelected)
                 {
                     Answer(busEvent, I2CBusEvent.Reply(busEvent.Transfer, 0xff));
