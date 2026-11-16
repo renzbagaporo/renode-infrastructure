@@ -290,6 +290,7 @@ namespace Antmicro.Renode.Peripherals.SPI
             }
             if(edge == frame.Bits * 2)
             {
+                EndFrame(frame);
                 if(!SecondEdgeSamples && tx.Count != 0 && Enabled)
                 {
                     // With SPH=0, FSS pulses high for one SCK period
@@ -348,10 +349,26 @@ namespace Antmicro.Renode.Peripherals.SPI
             PublishPending();
         }
 
+        // A received frame enters the receive FIFO once all its bits are in
+        // and its clock has ended: with SPH=0 the last bit is sampled half an
+        // SCK period before the frame's trailing edge, and a CPU that waits
+        // for the word (spi_write_read_blocking) and then raises its chip
+        // select must not do so with SCK still high.
         private void Store(Frame target, int bit, bool level)
         {
             if(level) target.Received |= (ushort)(1 << (target.Bits - 1 - bit));
-            if(++target.Sampled < target.Bits) return;
+            if(++target.Sampled < target.Bits || !target.Ended) return;
+            Receive(target);
+        }
+
+        private void EndFrame(Frame target)
+        {
+            target.Ended = true;
+            if(target.Sampled >= target.Bits) Receive(target);
+        }
+
+        private void Receive(Frame target)
+        {
             frames.Remove(target.Id);
             if(rx.Count >= Capacity) rawInterrupts |= OverrunInterrupt;
             else rx.Enqueue(target.Received);
@@ -602,6 +619,7 @@ namespace Antmicro.Renode.Peripherals.SPI
             public readonly int Bits;
             public ushort Received;
             public int Sampled;
+            public bool Ended;
         }
 
         private readonly struct Sample
