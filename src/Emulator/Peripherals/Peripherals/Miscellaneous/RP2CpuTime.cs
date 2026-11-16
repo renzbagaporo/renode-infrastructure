@@ -4,6 +4,7 @@
 //
 
 using System;
+using System.Collections.Generic;
 using System.Linq;
 
 using Antmicro.Renode.Core;
@@ -18,8 +19,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // converts the time it is granted to instructions at the start of its
         // round and the instructions it ran back to time at the end, so a
         // change a core makes while it executes applies at the next
-        // synchronization point, between rounds.
-        public static void SetCoreClock(IMachine machine, ulong systemFrequency)
+        // synchronization point, between rounds. The clocks model passes
+        // itself, so only its own chip's cores follow its clk_sys.
+        public static void SetCoreClock(IMachine machine, ulong systemFrequency, IPeripheral chipMember = null)
         {
             if(systemFrequency == 0) return;
             var mips = (uint)Math.Max(1ul, (systemFrequency + 500000) / 1000000);
@@ -27,7 +29,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
                 try
                 {
-                    foreach(var cpu in machine.SystemBus.GetCPUs().OfType<BaseCPU>())
+                    foreach(var cpu in Cores(machine, chipMember))
                     {
                         if(cpu.PerformanceInMips != mips) cpu.PerformanceInMips = mips;
                     }
@@ -38,9 +40,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 }
             };
             var timeSource = machine.LocalTimeSource;
-            if(timeSource == null || !machine.SystemBus.GetCPUs().OfType<BaseCPU>().Any(cpu => cpu.OnPossessedThread)) apply();
+            if(timeSource == null || !Cores(machine, chipMember).Any(cpu => cpu.OnPossessedThread)) apply();
             else timeSource.ExecuteInNearestSyncedState(_ => apply());
         }
+
+        private static IEnumerable<BaseCPU> Cores(IMachine machine, IPeripheral chipMember) =>
+            chipMember == null ? machine.SystemBus.GetCPUs().OfType<BaseCPU>() : RP2_Chip.Cores(machine, chipMember);
 
         // Brings the CPU that issued the current bus access up to its own
         // time, so a register reflects every cycle it has executed. A

@@ -209,7 +209,7 @@ namespace Antmicro.Renode.Peripherals.Memory
                 var bus = machine.GetSystemBus(this);
                 foreach(var registration in bus.GetRegistrationPoints(this))
                 {
-                    foreach(var cpu in bus.GetCPUs().OfType<TranslationCPU>())
+                    foreach(var cpu in Miscellaneous.RP2_Chip.Of(machine, this, bus.GetCPUs().OfType<TranslationCPU>()))
                     {
                         cpu.RequestReadOnlyMemoryAccess(registration.Range, available);
                     }
@@ -222,7 +222,7 @@ namespace Antmicro.Renode.Peripherals.Memory
             var bus = machine.GetSystemBus(this);
             foreach(var registration in bus.GetRegistrationPoints(this))
             {
-                foreach(var cpu in bus.GetCPUs().OfType<ICPUWithMappedMemory>())
+                foreach(var cpu in Miscellaneous.RP2_Chip.Of(machine, this, bus.GetCPUs().OfType<ICPUWithMappedMemory>()))
                 {
                     cpu.RegisterAccessFlags(registration.Range.StartAddress, registration.Range.Size, isIoMemory: true);
                 }
@@ -232,7 +232,7 @@ namespace Antmicro.Renode.Peripherals.Memory
         private void InvalidateInstructions()
         {
             if(Volatile.Read(ref hasFetchedInstructions) == 0) return;
-            foreach(var cpu in machine.GetSystemBus(this).GetCPUs().OfType<TranslationCPU>())
+            foreach(var cpu in Miscellaneous.RP2_Chip.Of(machine, this, machine.GetSystemBus(this).GetCPUs().OfType<TranslationCPU>()))
             {
                 // Request clearing on the CPU thread after a concurrent code
                 // translation returns, including any newly published block.

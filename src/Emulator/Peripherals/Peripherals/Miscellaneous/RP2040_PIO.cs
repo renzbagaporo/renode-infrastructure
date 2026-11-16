@@ -417,7 +417,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             if(bus.TryGetCurrentContextState<CortexM.ContextState>(out var _, out var state) && state.DebugAccess) return;
             if(!bus.TryGetTransactionInitiator(out var initiator) || !(initiator is BaseCPU cpu) || !cpu.OnPossessedThread || cpu.TimeHandle == null) return;
             var target = cpu.TimeHandle.TotalElapsedTime.Ticks;
-            if(dma == null) dma = machine.GetPeripheralsOfType<RP2040_DMA>().FirstOrDefault();
+            if(dma == null) dma = RP2_Chip.Own<RP2040_DMA>(machine, this).FirstOrDefault();
             while(true)
             {
                 var ran = false;

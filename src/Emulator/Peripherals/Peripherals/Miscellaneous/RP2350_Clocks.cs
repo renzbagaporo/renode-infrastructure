@@ -161,7 +161,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 nvic.Clocked = systemFrequency != 0;
             }
             GateCores(systemFrequency != 0);
-            RP2CpuTime.SetCoreClock(machine, systemFrequency);
+            RP2CpuTime.SetCoreClock(machine, systemFrequency, this);
             ClockChanged?.Invoke();
         }
 
@@ -171,7 +171,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private void GateCores(bool clocked)
         {
             machine.SystemBus.TryGetCurrentCPU(out var current);
-            foreach(var cpu in machine.SystemBus.GetCPUs())
+            foreach(var cpu in RP2_Chip.Cores(machine, this))
             {
                 if(cpu == current)
                 {

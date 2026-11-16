@@ -51,22 +51,24 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             machine.RequestResetInSafeState(postReset: () =>
             {
                 ApplyRunHold();
-            }, unresetable: RetainedAcrossChipReset(machine), runRegisteredResetEvents: true, preReset: () =>
+            }, unresetable: RetainedAcrossChipReset(machine, this), runRegisteredResetEvents: true, preReset: () =>
             {
-                machine.GetPeripheralsOfType<RP2040_VregAndChipReset>().FirstOrDefault()?.RecordRunReset();
+                RP2_Chip.Own<RP2040_VregAndChipReset>(machine, this).FirstOrDefault()?.RecordRunReset();
                 ApplyRunHold();
             });
         }
 
         // External flash and VREG_AND_CHIP_RESET keep their state across the
         // resets below power-on: RUN, the rescue restart and SYSRESETREQ.
-        internal static List<IPeripheral> RetainedAcrossChipReset(IMachine machine) =>
+        // Another chip in the same machine is not reset at all.
+        internal static List<IPeripheral> RetainedAcrossChipReset(IMachine machine, IPeripheral member) =>
             machine.GetRegisteredPeripherals().Select(entry => entry.Peripheral)
-                .Where(peripheral => peripheral is WinbondW25QFlash || peripheral is RP2040_VregAndChipReset).ToList();
+                .Where(peripheral => peripheral is WinbondW25QFlash || peripheral is RP2040_VregAndChipReset)
+                .Concat(RP2_Chip.OtherChips(machine, member)).Distinct().ToList();
 
         private void RequestSystemReset()
         {
-            machine.RequestResetInSafeState(postReset: ApplyRunHold, unresetable: RetainedAcrossChipReset(machine), runRegisteredResetEvents: true, preReset: ApplyRunHold);
+            machine.RequestResetInSafeState(postReset: ApplyRunHold, unresetable: RetainedAcrossChipReset(machine, this), runRegisteredResetEvents: true, preReset: ApplyRunHold);
         }
 
         private void ApplyRunHold()

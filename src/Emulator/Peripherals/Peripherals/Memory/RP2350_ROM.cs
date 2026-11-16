@@ -42,7 +42,7 @@ namespace Antmicro.Renode.Peripherals.Memory
             if(offset < 0 || offset + data.LongLength > Size)
                 throw new ArgumentException("ROM image exceeds the 32 KiB mask ROM");
             memory.WriteBytes(offset, data, 0, data.Length);
-            foreach(var cpu in machine.SystemBus.GetCPUs().OfType<TranslationCPU>()) cpu.InvalidateTranslationBlocks();
+            foreach(var cpu in Miscellaneous.RP2_Chip.Of(machine, this, machine.SystemBus.GetCPUs().OfType<TranslationCPU>())) cpu.InvalidateTranslationBlocks();
         }
 
         public void Reset() { }
@@ -59,7 +59,7 @@ namespace Antmicro.Renode.Peripherals.Memory
             if(change.Peripheral != this && !(change.Peripheral is ICPUWithMappedMemory)) return;
             var bus = machine.SystemBus;
             foreach(var registration in bus.GetRegistrationPoints(this))
-                foreach(var cpu in bus.GetCPUs().OfType<ICPUWithMappedMemory>())
+                foreach(var cpu in Miscellaneous.RP2_Chip.Of(machine, this, bus.GetCPUs().OfType<ICPUWithMappedMemory>()))
                     cpu.RegisterAccessFlags(registration.Range.StartAddress, registration.Range.Size, isIoMemory: true);
         }
 

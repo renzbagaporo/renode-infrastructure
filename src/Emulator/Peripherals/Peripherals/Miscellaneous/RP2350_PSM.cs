@@ -82,7 +82,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 var retained = machine.GetRegisteredPeripherals().Select(entry => entry.Peripheral)
                     .Where(peripheral => peripheral is RP2350_DebugPort || peripheral is RP2350_POWMAN
                         || peripheral is WinbondW25QFlash || peripheral == watchdog
-                        || peripheral == ArchitectureSelector).Distinct().ToList();
+                        || peripheral == ArchitectureSelector).Concat(RP2_Chip.OtherChips(machine, this)).Distinct().ToList();
                 machine.RequestResetInSafeState(unresetable: retained);
                 return;
             }

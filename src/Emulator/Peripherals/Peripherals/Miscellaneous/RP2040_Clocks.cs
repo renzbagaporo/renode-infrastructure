@@ -237,7 +237,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 }
                 nvic.Clocked = systemFrequency != 0;
             }
-            RP2CpuTime.SetCoreClock(machine, systemFrequency);
+            RP2CpuTime.SetCoreClock(machine, systemFrequency, this);
             ClockChanged?.Invoke();
         }
 

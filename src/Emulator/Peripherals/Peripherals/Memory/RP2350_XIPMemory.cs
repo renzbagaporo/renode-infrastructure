@@ -212,7 +212,7 @@ namespace Antmicro.Renode.Peripherals.Memory
             if(!registrations.Any(registration => pages.Any(page =>
                 (ulong)((page + 1) * PageSize) > registration.Offset
                 && (ulong)(page * PageSize) < registration.Offset + registration.Range.Size))) return;
-            foreach(var cpu in bus.GetCPUs().OfType<TranslationCPU>())
+            foreach(var cpu in Miscellaneous.RP2_Chip.Of(machine, this, bus.GetCPUs().OfType<TranslationCPU>()))
             {
                 // A code read may still be translating when another master
                 // changes the flash mapping. Clear on the CPU thread after
@@ -287,7 +287,7 @@ namespace Antmicro.Renode.Peripherals.Memory
                 for(var window = 0; window < DirectWindows; window++)
                 {
                     var range = new Range(registration.Range.StartAddress + DirectWindowSize * (ulong)window, DirectWindowSize);
-                    foreach(var cpu in bus.GetCPUs().OfType<TranslationCPU>())
+                    foreach(var cpu in Miscellaneous.RP2_Chip.Of(machine, this, bus.GetCPUs().OfType<TranslationCPU>()))
                     {
                         cpu.RequestReadOnlyMemoryAccess(range, directAccessEvaluators[window]);
                     }
@@ -352,7 +352,7 @@ namespace Antmicro.Renode.Peripherals.Memory
             var bus = machine.GetSystemBus(this);
             foreach(var registration in bus.GetRegistrationPoints(this))
             {
-                foreach(var cpu in bus.GetCPUs().OfType<ICPUWithMappedMemory>())
+                foreach(var cpu in Miscellaneous.RP2_Chip.Of(machine, this, bus.GetCPUs().OfType<ICPUWithMappedMemory>()))
                 {
                     cpu.RegisterAccessFlags(registration.Range.StartAddress, registration.Range.Size, isIoMemory: true);
                 }

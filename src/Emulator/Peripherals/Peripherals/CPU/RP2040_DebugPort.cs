@@ -81,10 +81,10 @@ namespace Antmicro.Renode.Peripherals.CPU
         // whether RUN or the rescue DP caused the reset.
         private void RequestReset(bool rescue)
         {
-            machine.RequestResetInSafeState(postReset: ApplyRunHold, unresetable: Miscellaneous.RP2040_PSM.RetainedAcrossChipReset(machine),
+            machine.RequestResetInSafeState(postReset: ApplyRunHold, unresetable: Miscellaneous.RP2040_PSM.RetainedAcrossChipReset(machine, this),
                 runRegisteredResetEvents: true, preReset: () =>
                 {
-                    var chipReset = machine.GetPeripheralsOfType<Miscellaneous.RP2040_VregAndChipReset>().FirstOrDefault();
+                    var chipReset = Miscellaneous.RP2_Chip.Own<Miscellaneous.RP2040_VregAndChipReset>(machine, this).FirstOrDefault();
                     if(rescue) chipReset?.RecordPsmRestart();
                     else chipReset?.RecordRunReset();
                     ApplyRunHold();

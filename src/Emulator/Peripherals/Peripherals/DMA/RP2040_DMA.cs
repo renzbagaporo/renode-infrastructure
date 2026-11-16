@@ -34,8 +34,10 @@ namespace Antmicro.Renode.Peripherals.DMA
 
     public sealed class RP2040_DMA : RP2APBPeripheral, IGPIOReceiver
     {
-        public RP2040_DMA(IMachine machine, IRP2ClockSource clocks = null, ulong frequency = 125000000, bool rp2350 = false) : base(machine)
+        public RP2040_DMA(IMachine machine, IRP2ClockSource clocks = null, ulong frequency = 125000000, bool rp2350 = false,
+            IPeripheral busContext = null) : base(machine)
         {
+            this.busContext = busContext ?? this;
             this.rp2350 = rp2350;
             channelCount = rp2350 ? 16 : 12;
             channelMask = (1u << channelCount) - 1;
@@ -120,7 +122,7 @@ namespace Antmicro.Renode.Peripherals.DMA
             // A CPU ahead of the machine clock sees the channels serving the
             // PIO blocks as they are at its own time: the blocks run up to it,
             // stepping this DMA with them (RP2040_PIO.CatchUpToAccessor).
-            if(pios == null) pios = machine.GetPeripheralsOfType<RP2040_PIO>().ToArray();
+            if(pios == null) pios = RP2_Chip.Own<RP2040_PIO>(machine, this).ToArray();
             foreach(var pio in pios) pio.CatchUpToAccessor();
         }
 
@@ -441,9 +443,9 @@ namespace Antmicro.Renode.Peripherals.DMA
             uint value;
             switch(transfer.Bytes)
             {
-            case 1: value = machine.SystemBus.ReadByte(transfer.ReadAddress, context: this); break;
-            case 2: value = machine.SystemBus.ReadWord(transfer.ReadAddress, context: this); break;
-            default: value = machine.SystemBus.ReadDoubleWord(transfer.ReadAddress, context: this); break;
+            case 1: value = machine.SystemBus.ReadByte(transfer.ReadAddress, context: busContext); break;
+            case 2: value = machine.SystemBus.ReadWord(transfer.ReadAddress, context: busContext); break;
+            default: value = machine.SystemBus.ReadDoubleWord(transfer.ReadAddress, context: busContext); break;
             }
             BusAccessCompleted?.Invoke(transfer.ReadAddress, false);
             return value;
@@ -453,9 +455,9 @@ namespace Antmicro.Renode.Peripherals.DMA
         {
             switch(transfer.Bytes)
             {
-            case 1: machine.SystemBus.WriteByte(transfer.WriteAddress, (byte)transfer.Data, context: this); break;
-            case 2: machine.SystemBus.WriteWord(transfer.WriteAddress, (ushort)transfer.Data, context: this); break;
-            default: machine.SystemBus.WriteDoubleWord(transfer.WriteAddress, transfer.Data, context: this); break;
+            case 1: machine.SystemBus.WriteByte(transfer.WriteAddress, (byte)transfer.Data, context: busContext); break;
+            case 2: machine.SystemBus.WriteWord(transfer.WriteAddress, (ushort)transfer.Data, context: busContext); break;
+            default: machine.SystemBus.WriteDoubleWord(transfer.WriteAddress, transfer.Data, context: busContext); break;
             }
             BusAccessCompleted?.Invoke(transfer.WriteAddress, true);
         }
@@ -463,7 +465,7 @@ namespace Antmicro.Renode.Peripherals.DMA
         public event Action<ulong, bool> BusAccessCompleted;
 
         private bool Mapped(uint address, int bytes) => (address & (uint)(bytes - 1)) == 0
-            && machine.SystemBus.WhatIsAt(address, this) != null && machine.SystemBus.WhatIsAt((ulong)address + (uint)bytes - 1, this) != null;
+            && machine.SystemBus.WhatIsAt(address, busContext) != null && machine.SystemBus.WhatIsAt((ulong)address + (uint)bytes - 1, busContext) != null;
 
         private Channel Arbitrate()
         {
@@ -743,6 +745,9 @@ namespace Antmicro.Renode.Peripherals.DMA
         private readonly PhasedTimer timer, cycleCounter;
         private readonly IRP2ClockSource clocks;
         private RP2040_PIO[] pios;
+        // The context the DMA's transfers use on the bus: itself, or with two
+        // chips in one machine an RP2_BusMaster the chip's map is registered for.
+        private readonly IPeripheral busContext;
         private Transfer pending;
         private ulong frequency, dueCycle, lastTimerCycle;
         private uint rawInterrupts, sniffControl, sniffData, highServed;

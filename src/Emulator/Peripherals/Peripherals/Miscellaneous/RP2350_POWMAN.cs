@@ -148,6 +148,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             if((selected & 0x111) != 0) powerState = 0;
             watchdog.ClearScratchOnPowerReset();
             var retained = new List<IPeripheral> { this, debugPort, watchdog };
+            retained.AddRange(RP2_Chip.OtherChips(machine, this));
             retained.AddRange(machine.GetRegisteredPeripherals().Select(entry => entry.Peripheral).OfType<WinbondW25QFlash>());
             machine.RequestResetInSafeState(unresetable: retained);
         }
@@ -424,6 +425,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         {
             lastPowerUp = reason;
             var retained = new List<IPeripheral> { this, debugPort };
+            retained.AddRange(RP2_Chip.OtherChips(machine, this));
             retained.AddRange(machine.GetRegisteredPeripherals().Select(entry => entry.Peripheral).OfType<WinbondW25QFlash>());
             var sleepState = powerState & 0xf;
             machine.RequestResetInSafeState(postReset: ApplyRescueHold, unresetable: retained, runRegisteredResetEvents: true, preReset: () =>
@@ -502,6 +504,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             // RP-AP rescue resets POWMAN and the switched domain. It retains
             // the always-on DP/RP-AP and externally powered serial flash.
             var retained = new List<IPeripheral> { this, debugPort };
+            retained.AddRange(RP2_Chip.OtherChips(machine, this));
             retained.AddRange(machine.GetRegisteredPeripherals().Select(entry => entry.Peripheral).OfType<WinbondW25QFlash>());
             machine.RequestResetInSafeState(postReset: ApplyRescueHold, unresetable: retained, runRegisteredResetEvents: false, preReset: () =>
             {
@@ -520,6 +523,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             var retained = machine.GetRegisteredPeripherals().Select(entry => entry.Peripheral)
                 .Where(peripheral => peripheral is WinbondW25QFlash).ToList();
             retained.Add(this);
+            retained.AddRange(RP2_Chip.OtherChips(machine, this));
             // RP2350 datasheet table 560: RUN hard-resets POWMAN and the debug
             // port, but preserves DOUBLE_TAP. Ordinary SRAM loses power. Zero
             // is the model's deterministic policy for undefined power-up data.
@@ -547,6 +551,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private void OnPowerManagerReset()
         {
             var retained = new List<IPeripheral> { this, debugPort };
+            retained.AddRange(RP2_Chip.OtherChips(machine, this));
             retained.AddRange(machine.GetRegisteredPeripherals().Select(entry => entry.Peripheral).OfType<WinbondW25QFlash>());
             machine.RequestResetInSafeState(postReset: () =>
             {
