@@ -5,6 +5,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Numerics;
 
 using Antmicro.Renode.Core;
@@ -24,6 +25,13 @@ namespace Antmicro.Renode.Peripherals.DMA
     // layout with reversed increments, TRANS_COUNT modes, four interrupt
     // outputs and the RP2350 register map. SECCFG and MPU registers hold their
     // values; channel security attributes are not enforced on bus accesses.
+    internal enum AheadWork
+    {
+        None,
+        Step,
+        Blocked
+    }
+
     public sealed class RP2040_DMA : RP2APBPeripheral, IGPIOReceiver
     {
         public RP2040_DMA(IMachine machine, IRP2ClockSource clocks = null, ulong frequency = 125000000, bool rp2350 = false) : base(machine)
@@ -109,6 +117,50 @@ namespace Antmicro.Renode.Peripherals.DMA
             // registers. Descriptor writes have this DMA as their bus initiator
             // and must not recursively synchronize a CPU clock callback.
             RP2CpuTime.SyncInitiator(machine);
+            // A CPU ahead of the machine clock sees the channels serving the
+            // PIO blocks as they are at its own time: the blocks run up to it,
+            // stepping this DMA with them (RP2040_PIO.CatchUpToAccessor).
+            if(pios == null) pios = machine.GetPeripheralsOfType<RP2040_PIO>().ToArray();
+            foreach(var pio in pios) pio.CatchUpToAccessor();
+        }
+
+        // What a PIO block running ahead of the machine clock may do with this
+        // DMA: step it at the block's time when every transfer it could make
+        // next is paced by a PIO DREQ or unpaced, so FIFO traffic keeps pace
+        // with the state machines; anything else waits for the machine clock.
+        internal AheadWork NextAheadWork()
+        {
+            lock(SyncRoot)
+            {
+                if(executing || ResetHeld || frequency == 0) return AheadWork.None;
+                if(pending != null) return PacedForAhead(pending.Channel) ? AheadWork.Step : AheadWork.Blocked;
+                var any = false;
+                foreach(var channel in channels)
+                {
+                    if(!Ready(channel)) continue;
+                    if(!PacedForAhead(channel)) return AheadWork.Blocked;
+                    any = true;
+                }
+                return any ? AheadWork.Step : AheadWork.None;
+            }
+        }
+
+        // Runs one bus phase now, for a PIO block that has run to the virtual
+        // time this phase is due at (StepAheadTime).
+        internal void StepAhead(ulong ticks)
+        {
+            StepAheadTime = ticks;
+            machine.ClockSource.ExecuteInLock(Tick);
+        }
+
+        // The virtual time of the last bus phase a PIO block ran ahead of the
+        // machine clock, in ticks.
+        internal ulong StepAheadTime { get; private set; }
+
+        private bool PacedForAhead(Channel channel)
+        {
+            var treq = Treq(channel);
+            return treq == 63 || treq < (rp2350 ? 24 : 16);
         }
 
         protected override void OnResetHeldChanged() => Schedule();
@@ -690,6 +742,7 @@ namespace Antmicro.Renode.Peripherals.DMA
         private readonly Queue<Notification> notifications = new Queue<Notification>();
         private readonly PhasedTimer timer, cycleCounter;
         private readonly IRP2ClockSource clocks;
+        private RP2040_PIO[] pios;
         private Transfer pending;
         private ulong frequency, dueCycle, lastTimerCycle;
         private uint rawInterrupts, sniffControl, sniffData, highServed;

@@ -6,12 +6,14 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
+using System.Linq;
 using System.Numerics;
 
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.CPU;
+using Antmicro.Renode.Peripherals.DMA;
 using Antmicro.Renode.Peripherals.GPIOPort;
 using Antmicro.Renode.Peripherals.Timers;
 using Antmicro.Renode.Time;
@@ -403,17 +405,25 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // however far the machine clock (the slowest core) lags it. Pin changes
         // are delivered after each cycle, as for timer-driven cycles; the timer
         // events for cycles already run then find nothing due.
-        private void CatchUpToAccessor()
+        // The DMA steps along at the block's time, one bus phase a cycle, while
+        // its next transfer is paced by a PIO DREQ or unpaced: a state machine
+        // fed or drained by DMA then sees its FIFO serviced as on silicon, not
+        // only once the machine clock catches up. Any other DMA work stops the
+        // block where it is, since that transfer belongs to the machine clock.
+        // A CPU access to the DMA's registers runs this too (RP2040_DMA).
+        internal void CatchUpToAccessor()
         {
             var bus = machine.SystemBus;
             if(bus.TryGetCurrentContextState<CortexM.ContextState>(out var _, out var state) && state.DebugAccess) return;
             if(!bus.TryGetTransactionInitiator(out var initiator) || !(initiator is BaseCPU cpu) || !cpu.OnPossessedThread || cpu.TimeHandle == null) return;
             var target = cpu.TimeHandle.TotalElapsedTime.Ticks;
+            if(dma == null) dma = machine.GetPeripheralsOfType<RP2040_DMA>().FirstOrDefault();
             while(true)
             {
                 var ran = false;
                 machine.ClockSource.ExecuteInLock(() =>
                 {
+                    ulong dmaStep = 0;
                     lock(SyncRoot)
                     {
                         if(frequency == 0 || target <= cycleAnchorTime) return;
@@ -428,15 +438,35 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                         }
                         var next = ulong.MaxValue;
                         foreach(var sm in stateMachines) if(sm.Scheduled && sm.DueTick < next) next = sm.DueTick;
-                        if(next > targetCycle)
+                        var dmaNext = ulong.MaxValue;
+                        switch(dma?.NextAheadWork() ?? AheadWork.None)
+                        {
+                        case AheadWork.Blocked:
+                            return;
+                        case AheadWork.Step:
+                            dmaNext = Math.Max(CurrentCycle, CycleAt(TimeInterval.FromTicks(dma.StepAheadTime))) + 1;
+                            break;
+                        }
+                        if(Math.Min(next, dmaNext) > targetCycle)
                         {
                             if(targetCycle > aheadCycle) aheadCycle = targetCycle;
                             return;
                         }
-                        if(next > aheadCycle) aheadCycle = next;
-                        TickAt(CurrentCycle);
+                        if(dmaNext < next)
+                        {
+                            if(dmaNext > aheadCycle) aheadCycle = dmaNext;
+                            dmaStep = CycleStart(dmaNext);
+                        }
+                        else
+                        {
+                            if(next > aheadCycle) aheadCycle = next;
+                            TickAt(CurrentCycle);
+                        }
                         ran = true;
                     }
+                    // The DMA's bus phase may access this block, so it runs
+                    // outside the block's lock, as the DMA's own timer does.
+                    if(dmaStep != 0) dma.StepAhead(dmaStep);
                 });
                 PublishPending();
                 if(!ran) return;
@@ -1669,6 +1699,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private ulong cycleAnchor;
         private ulong cycleAnchorTime;
         private ulong aheadCycle;
+        private RP2040_DMA dma;
         // The latest late input change: the cycle it was made at, and the one it arrived at.
         private ulong lateMade, lateArrival;
         private readonly int function;
