@@ -27,7 +27,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         }
 
         // Input 0 is the physical active-low RUN pin. SRAM retains its contents
-        // across RUN on RP2040; externally powered NOR retains its own state.
+        // across RUN on RP2040; externally powered NOR retains its own state,
+        // and VREG_AND_CHIP_RESET records the reset.
         // Inputs 1 and 2 are the cores' NVIC SYSRESETREQ outputs; the request
         // may come from a debugger on another machine's thread, so the reset
         // waits for every processor to stop at a safe point.
@@ -45,21 +46,27 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 machine.LocalTimeSource.ExecuteInNearestSyncedState(_ => ApplyRunHold());
                 return;
             }
-            var retained = machine.GetRegisteredPeripherals().Select(entry => entry.Peripheral)
-                .Where(peripheral => peripheral is WinbondW25QFlash).ToList();
             // Every falling edge queues a reset, even if release arrives before
             // the synchronized callback. Release reconciles the current level.
             machine.RequestResetInSafeState(postReset: () =>
             {
                 ApplyRunHold();
-            }, unresetable: retained, runRegisteredResetEvents: true, preReset: ApplyRunHold);
+            }, unresetable: RetainedAcrossChipReset(machine), runRegisteredResetEvents: true, preReset: () =>
+            {
+                machine.GetPeripheralsOfType<RP2040_VregAndChipReset>().FirstOrDefault()?.RecordRunReset();
+                ApplyRunHold();
+            });
         }
+
+        // External flash and VREG_AND_CHIP_RESET keep their state across the
+        // resets below power-on: RUN, the rescue restart and SYSRESETREQ.
+        internal static List<IPeripheral> RetainedAcrossChipReset(IMachine machine) =>
+            machine.GetRegisteredPeripherals().Select(entry => entry.Peripheral)
+                .Where(peripheral => peripheral is WinbondW25QFlash || peripheral is RP2040_VregAndChipReset).ToList();
 
         private void RequestSystemReset()
         {
-            var retained = machine.GetRegisteredPeripherals().Select(entry => entry.Peripheral)
-                .Where(peripheral => peripheral is WinbondW25QFlash).ToList();
-            machine.RequestResetInSafeState(postReset: ApplyRunHold, unresetable: retained, runRegisteredResetEvents: true, preReset: ApplyRunHold);
+            machine.RequestResetInSafeState(postReset: ApplyRunHold, unresetable: RetainedAcrossChipReset(machine), runRegisteredResetEvents: true, preReset: ApplyRunHold);
         }
 
         private void ApplyRunHold()

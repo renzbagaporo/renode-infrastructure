@@ -65,7 +65,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             return false;
         }
 
-        protected override void ResetTarget() => RequestReset();
+        protected override void ResetTarget() => RequestReset(rescue: false);
 
         protected override void ReleaseTarget()
         {
@@ -77,12 +77,18 @@ namespace Antmicro.Renode.Peripherals.CPU
         // The request comes from the debugger's SWD thread, which may belong to
         // another machine: reset once every processor has stopped, holding the
         // cores at the current RUN/rescue level before and after. External flash
-        // keeps its state, as on a RUN reset.
-        private void RequestReset()
+        // and VREG_AND_CHIP_RESET keep their state, and CHIP_RESET records
+        // whether RUN or the rescue DP caused the reset.
+        private void RequestReset(bool rescue)
         {
-            var retained = machine.GetRegisteredPeripherals().Select(entry => entry.Peripheral)
-                .Where(peripheral => peripheral is SPI.WinbondW25QFlash).ToList();
-            machine.RequestResetInSafeState(postReset: ApplyRunHold, unresetable: retained, runRegisteredResetEvents: true, preReset: ApplyRunHold);
+            machine.RequestResetInSafeState(postReset: ApplyRunHold, unresetable: Miscellaneous.RP2040_PSM.RetainedAcrossChipReset(machine),
+                runRegisteredResetEvents: true, preReset: () =>
+                {
+                    var chipReset = machine.GetPeripheralsOfType<Miscellaneous.RP2040_VregAndChipReset>().FirstOrDefault();
+                    if(rescue) chipReset?.RecordPsmRestart();
+                    else chipReset?.RecordRunReset();
+                    ApplyRunHold();
+                });
         }
 
         private void ApplyRunHold()
@@ -159,10 +165,10 @@ namespace Antmicro.Renode.Peripherals.CPU
             rescueHold = requested;
             if(requested)
             {
-                this.Log(LogLevel.Info, "Rescue reset asserted; the boot ROM rescue halt is not modelled");
+                this.Log(LogLevel.Info, "Rescue reset asserted");
                 ports[0].Reset();
                 ports[1].Reset();
-                RequestReset();
+                RequestReset(rescue: true);
             }
             else
             {
