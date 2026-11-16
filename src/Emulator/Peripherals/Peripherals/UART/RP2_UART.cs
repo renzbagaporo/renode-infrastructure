@@ -393,11 +393,15 @@ namespace Antmicro.Renode.Peripherals.UART
             var function = qspiPin ? (pin - QspiPinKey == QspiRxPin ? UartAuxFunction : -1)
                 : Array.IndexOf(rxPins, pin) >= 0 ? UartFunction : Array.IndexOf(rxAuxPins, pin) >= 0 ? UartAuxFunction : -1;
             if(function < 0) return;
+            // The time the edge happened, which a delivery can carry (SignalTime)
+            // to here some time after the machine clock has passed it.
+            var made = SignalTime.TryOf(machine, out var delivered) ? delivered : (TimeInterval?)null;
             machine.ClockSource.ExecuteInLock(() =>
             {
                 lock(SyncRoot)
                 {
                     rxLevels[pin] = level;
+                    RecordEdge(pin, made ?? machine.ClockSource.CurrentValue, level);
                     if((qspiPin ? qspiBank.GetFunction(pin - QspiPinKey) : gpio.GetFunction(pin)) != function || ResetHeld) return;
                     if(level)
                     {
@@ -405,21 +409,81 @@ namespace Antmicro.Renode.Peripherals.UART
                         return;
                     }
                     if(receiving || awaitingIdle || !ReceiveEnabled || Loopback) return;
-                    // A falling edge starts the frame; check the start bit at its centre.
+                    // A falling edge starts the frame; check the start bit at its
+                    // centre, half a bit from the time of the edge.
                     receiving = true;
                     receivePin = pin;
                     receiveBit = -1;
                     receiveValue = 0;
                     receiveOnes = 0;
                     receiveErrors = 0;
+                    frameSamples.Clear();
+                    var half = (long)(activeDivisor / 2);
+                    if(made.HasValue)
+                    {
+                        var now = machine.ClockSource.CurrentValue;
+                        var offset = made.Value > now ? (long)TimerCycles(made.Value - now) : -(long)TimerCycles(now - made.Value);
+                        half += offset;
+                    }
                     sampleTimer.Enabled = false;
-                    sampleTimer.Limit = Math.Max(1u, activeDivisor / 2);
+                    sampleTimer.Limit = (ulong)Math.Max(1L, half);
                     sampleTimer.ResetValue();
                     sampleTimer.Enabled = true;
                 }
             });
             PublishPending();
         }
+
+        // A delivery can bring an edge after the machine clock has passed it
+        // (SignalTime), so samples read the line as of their own time from the
+        // edges' times, and an edge that lands before samples already taken
+        // in the frame takes them again.
+        private void RecordEdge(int pin, TimeInterval time, bool level)
+        {
+            if(!receiveEdges.TryGetValue(pin, out var edges)) receiveEdges[pin] = edges = new List<(TimeInterval, bool)>();
+            var index = edges.Count;
+            while(index > 0 && edges[index - 1].Item1 > time) index--;
+            edges.Insert(index, (time, level));
+            if(edges.Count > 64) edges.RemoveRange(0, edges.Count - 64);
+            if(!receiving || pin != receivePin || frameSamples.Count == 0 || frameSamples[frameSamples.Count - 1] < time) return;
+            var parityBit = (lineControl & 2) != 0 ? 1 : 0;
+            receiveValue = 0;
+            receiveOnes = 0;
+            receiveErrors &= ~ParityError;
+            for(var bit = 0; bit < frameSamples.Count; bit++)
+            {
+                var sampled = LevelAt(pin, frameSamples[bit]);
+                if(bit < DataBits)
+                {
+                    if(sampled)
+                    {
+                        receiveValue |= 1 << bit;
+                        receiveOnes++;
+                    }
+                }
+                else if(bit < DataBits + parityBit)
+                {
+                    if(sampled) receiveOnes++;
+                    if(sampled != ParityLevel(receiveOnes - (sampled ? 1 : 0))) receiveErrors |= ParityError;
+                }
+            }
+        }
+
+        private bool LevelAt(int pin, TimeInterval time)
+        {
+            if(receiveEdges.TryGetValue(pin, out var edges))
+            {
+                for(var i = edges.Count - 1; i >= 0; i--)
+                {
+                    if(edges[i].Item1 <= time) return edges[i].Item2;
+                }
+            }
+            return !rxLevels.TryGetValue(pin, out var known) || known;
+        }
+
+        // Sample timer cycles (four a UART clock cycle) in an interval.
+        private ulong TimerCycles(TimeInterval interval) =>
+            (ulong)((System.Numerics.BigInteger)interval.Ticks * sampleTimer.Frequency / TimeInterval.TicksPerSecond);
 
         private void SampleReceiveBit()
         {
@@ -430,8 +494,10 @@ namespace Antmicro.Renode.Peripherals.UART
                     sampleTimer.Enabled = false;
                     return;
                 }
-                var level = !rxLevels.TryGetValue(receivePin, out var known) || known;
+                var now = machine.ClockSource.CurrentValue;
+                var level = LevelAt(receivePin, now);
                 var parityBit = (lineControl & 2) != 0 ? 1 : 0;
+                if(receiveBit >= 0 && receiveBit < DataBits + parityBit) frameSamples.Add(now);
                 if(receiveBit < 0)
                 {
                     if(level)
@@ -710,6 +776,8 @@ namespace Antmicro.Renode.Peripherals.UART
         private readonly int[] txAuxPins;
         private readonly int[] rxAuxPins;
         private readonly Dictionary<int, bool> rxLevels;
+        private readonly Dictionary<int, List<(TimeInterval, bool)>> receiveEdges = new Dictionary<int, List<(TimeInterval, bool)>>();
+        private readonly List<TimeInterval> frameSamples = new List<TimeInterval>();
         private readonly LimitTimer bitTimer;
         private readonly LimitTimer sampleTimer;
         private bool[] frameLevels;
