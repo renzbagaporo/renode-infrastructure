@@ -1185,11 +1185,21 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // signal (a clock and its data) is delayed whole instead of having its
         // edges land on one cycle, where they would cancel. A change made at a
         // cycle still to come, by another chip's CPU running ahead of the
-        // machine clock (RP2_GPIOBank0), arrives at that cycle.
+        // machine clock (RP2_GPIOBank0), arrives at that cycle. A delivery can
+        // also come late, when another thread was delivering; while such a
+        // burst is still ahead of the block, later changes keep its delay, so
+        // a data line changed on time does not overtake the clock edges that
+        // came before it. The delay ends at the first gap the burst drains in.
         private ulong ArrivalCycle()
         {
             var now = CurrentCycle;
             var made = CycleAt(SignalTime.Of(machine));
+            if(lateArrival > now && made >= lateMade)
+            {
+                lateArrival += made - lateMade;
+                lateMade = made;
+                return lateArrival;
+            }
             if(made > now) return made;
             if(made == now) return now;
             if(lateArrival < now || made < lateMade) lateArrival = now;
