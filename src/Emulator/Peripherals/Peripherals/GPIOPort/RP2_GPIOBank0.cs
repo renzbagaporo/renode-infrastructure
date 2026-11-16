@@ -218,6 +218,19 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             }
         }
 
+        // The level on the pad itself, whatever its input enable: an external
+        // drive, else the pin's own output, else its pull or bus keeper; null
+        // while nothing sets it. The ADC samples this level.
+        public bool? GetPadLevel(int pin)
+        {
+            lock(SyncRoot)
+            {
+                if(!IsBondedPin(pin)) return null;
+                if(!external[pin].HasValue && !drivenEnable[pin] && (pads[pin] & 0xc) == 0) return null;
+                return ReadWireLevel(pin);
+            }
+        }
+
         // The pad's pull resistor: PUE up, PDE down. Both together form a bus
         // keeper, which holds a level instead of pulling to one.
         public bool? GetPull(int number)

@@ -5,6 +5,7 @@
 
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Peripherals.Analog;
+using Antmicro.Renode.Peripherals.GPIOPort;
 using Antmicro.Renode.Time;
 
 using NUnit.Framework;
@@ -19,6 +20,13 @@ namespace Antmicro.Renode.PeripheralsTests
         {
             machine = new Machine();
             adc = new RP2_ADC(machine);
+        }
+
+        private uint ConvertChannel(int channel)
+        {
+            adc.WriteDoubleWord(Cs, Enable | ((uint)channel << 12) | StartOnce);
+            AdvanceNanoseconds(3000);
+            return adc.ReadDoubleWord(Result);
         }
 
         [TearDown]
@@ -37,6 +45,22 @@ namespace Antmicro.Renode.PeripheralsTests
             AdvanceNanoseconds(20);
             Assert.AreNotEqual(0u, adc.ReadDoubleWord(Cs) & Ready);
             Assert.AreEqual(2048u, adc.ReadDoubleWord(Result));
+        }
+
+        [Test]
+        public void ShouldConvertThePadLevelOfAChannelWithoutASetVoltage()
+        {
+            var gpio = new RP2_GPIOBank0(machine);
+            adc = new RP2_ADC(machine, gpio: gpio);
+            Assert.AreEqual(0u, ConvertChannel(1), "GPIO27's reset pull-down");
+            gpio.OnGPIO(27, true);
+            Assert.AreEqual(4095u, ConvertChannel(1), "A wire driving GPIO27 high");
+            Assert.AreEqual(0u, ConvertChannel(0), "GPIO26 is not driven");
+            gpio.ReleaseInput(27);
+            Assert.AreEqual(0u, ConvertChannel(1));
+            gpio.OnGPIO(27, true);
+            adc.SetChannelVoltage(1, 1.65);
+            Assert.AreEqual(2048u, ConvertChannel(1), "A set voltage takes precedence");
         }
 
         [Test]

@@ -13,6 +13,7 @@ using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Core.Structure;
 using Antmicro.Renode.Peripherals.CPU;
+using Antmicro.Renode.Peripherals.GPIOPort;
 using Antmicro.Renode.Peripherals.Sensor;
 using Antmicro.Renode.Peripherals.Timers;
 using Antmicro.Renode.Time;
@@ -27,16 +28,23 @@ namespace Antmicro.Renode.Peripherals.Analog
     // the RP2350) raises IRQ and, with DREQ_EN, DREQ while it holds at least
     // THRESH samples. Inputs are voltages against a 3.3 V reference, set with
     // SetChannelVoltage or read at each conversion from a voltage source
-    // registered at the channel; the last channel is the temperature sensor, whose Vbe is
-    // 0.706 V at 27 C with a -1.721 mV/C slope. Conversions never err.
+    // registered at the channel; without either, a channel converts the
+    // digital level on its pad (`gpio`) as a wire or the pin itself drives
+    // it, at the reference or 0 V. The last channel is the temperature
+    // sensor, whose Vbe is 0.706 V at 27 C with a -1.721 mV/C slope.
+    // Conversions never err.
     public sealed class RP2_ADC : RP2APBPeripheral, IADC
     {
-        public RP2_ADC(IMachine machine, bool rp2350 = false, int channels = 5, ulong frequency = 48000000) : base(machine)
+        public RP2_ADC(IMachine machine, bool rp2350 = false, int channels = 5, ulong frequency = 48000000, RP2_GPIOBank0 gpio = null) : base(machine)
         {
             if(channels != 5 && !(rp2350 && channels == 9)) throw new ConstructionException("The ADC has 5 channels (9 on the RP2350 QFN-80)");
             this.rp2350 = rp2350;
             this.frequency = frequency;
+            this.gpio = gpio;
+            // ADC0 is GPIO26, or GPIO40 on the RP2350 QFN-80.
+            firstPin = channels == 9 ? 40 : 26;
             voltages = new double[channels];
+            voltageSet = new bool[channels];
             ADCContainer = new SimpleContainerHelper<IRESDSampleSource<VoltageSample>>(machine, this);
             timer = new LimitTimer(machine.ClockSource, TimeInterval.TicksPerSecond, this, "conversion",
                 limit: 1, workMode: WorkMode.OneShot, eventEnabled: true);
@@ -61,7 +69,11 @@ namespace Antmicro.Renode.Peripherals.Analog
         public void SetChannelVoltage(int channel, double volts)
         {
             if(channel < 0 || channel >= voltages.Length - 1) throw new RecoverableException($"Channel {channel} is not an external input");
-            lock(SyncRoot) voltages[channel] = volts;
+            lock(SyncRoot)
+            {
+                voltages[channel] = volts;
+                voltageSet[channel] = true;
+            }
         }
 
         // A voltage source registered at an external channel (`@ adc N`), such
@@ -207,8 +219,17 @@ namespace Antmicro.Renode.Peripherals.Analog
             if(channel >= voltages.Length) return 0;
             var volts = channel == voltages.Length - 1
                 ? ((control & TemperatureEnable) != 0 ? 0.706 - 0.001721 * (TemperatureCelsius - 27) : 0)
-                : ADCContainer.TryGetByAddress(channel, out var source) ? source.Sample.Voltage / 1e6 : voltages[channel];
+                : ADCContainer.TryGetByAddress(channel, out var source) ? source.Sample.Voltage / 1e6 : ExternalVoltage(channel);
             return (ushort)Math.Max(0, Math.Min(4095, Math.Round(volts / Reference * 4096)));
+        }
+
+        // A set voltage, else the digital level on the channel's pad (a wire
+        // or the pin's own output) at the reference voltage or 0 V.
+        private double ExternalVoltage(int channel)
+        {
+            if(voltageSet[channel] || gpio == null) return voltages[channel];
+            var level = gpio.GetPadLevel(firstPin + channel);
+            return level.HasValue ? (level.Value ? Reference : 0) : voltages[channel];
         }
 
         private void Schedule(BigInteger unit)
@@ -242,6 +263,9 @@ namespace Antmicro.Renode.Peripherals.Analog
         private readonly bool rp2350;
         private readonly ulong frequency;
         private readonly double[] voltages;
+        private readonly bool[] voltageSet;
+        private readonly RP2_GPIOBank0 gpio;
+        private readonly int firstPin;
         private readonly LimitTimer timer;
         private readonly Queue<ushort> fifo = new Queue<ushort>();
         private uint control, result, fifoControl, divider, interruptEnable, interruptForce;
