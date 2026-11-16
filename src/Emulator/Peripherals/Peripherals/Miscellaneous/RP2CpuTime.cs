@@ -14,15 +14,32 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
     public static class RP2CpuTime
     {
         // The cores execute one instruction per clk_sys cycle, as RP2040's
-        // Cortex-M0+ and RP2350's Cortex-M33 and Hazard3 roughly do.
+        // Cortex-M0+ and RP2350's Cortex-M33 and Hazard3 roughly do. A core
+        // converts the time it is granted to instructions at the start of its
+        // round and the instructions it ran back to time at the end, so a
+        // change a core makes while it executes applies at the next
+        // synchronization point, between rounds.
         public static void SetCoreClock(IMachine machine, ulong systemFrequency)
         {
             if(systemFrequency == 0) return;
             var mips = (uint)Math.Max(1ul, (systemFrequency + 500000) / 1000000);
-            foreach(var cpu in machine.SystemBus.GetCPUs().OfType<BaseCPU>())
+            Action apply = () =>
             {
-                if(cpu.PerformanceInMips != mips) cpu.PerformanceInMips = mips;
-            }
+                try
+                {
+                    foreach(var cpu in machine.SystemBus.GetCPUs().OfType<BaseCPU>())
+                    {
+                        if(cpu.PerformanceInMips != mips) cpu.PerformanceInMips = mips;
+                    }
+                }
+                catch(ObjectDisposedException)
+                {
+                    // The machine was disposed before its next synchronization.
+                }
+            };
+            var timeSource = machine.LocalTimeSource;
+            if(timeSource == null || !machine.SystemBus.GetCPUs().OfType<BaseCPU>().Any(cpu => cpu.OnPossessedThread)) apply();
+            else timeSource.ExecuteInNearestSyncedState(_ => apply());
         }
 
         // Brings the CPU that issued the current bus access up to its own
