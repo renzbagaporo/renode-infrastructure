@@ -19,8 +19,9 @@ namespace Antmicro.Renode.Peripherals.DMA
 {
     // One shared read/data slot models the bus pipeline. Requests accept reads;
     // writes already accepted into that slot drain independently of DREQ and EN.
-    // This conservative bus pipeline completes at most one transfer per two
-    // system cycles; it does not model the RP2040 crossbar's parallel masters.
+    // Each system cycle writes the transfer read on the cycle before and reads
+    // the next, so an uncontended channel completes one transfer per cycle;
+    // bus contention with other masters is not modelled.
     // With rp2350 set it is the RP2350 DMA: 16 channels, the RP2350 CTRL field
     // layout with reversed increments, TRANS_COUNT modes, four interrupt
     // outputs and the RP2350 register map. SECCFG and MPU registers hold their
@@ -357,32 +358,57 @@ namespace Antmicro.Renode.Peripherals.DMA
 
         private void Tick()
         {
-            Transfer transfer;
-            bool write;
+            // The write of the transfer read on the previous cycle, then the
+            // read of the next one: one transfer per cycle in steady state.
+            Transfer transfer = null;
             lock(SyncRoot)
             {
                 scheduled = false;
                 UpdatePacing();
                 if(ResetHeld || frequency == 0) return;
-                write = pending != null;
-                if(write) transfer = pending;
-                else
-                {
-                    var channel = Arbitrate();
-                    if(channel == null) { Schedule(); return; }
-                    var size = (int)((channel.Control >> 2) & 3);
-                    transfer = new Transfer { Channel = channel, Generation = channel.Generation,
-                        ReadAddress = channel.ReadAddress, WriteAddress = channel.WriteAddress,
-                        Control = channel.Control, Bytes = size == 3 ? 0 : 1 << size };
-                    var treq = Treq(channel);
-                    if(treq >= 59 && treq < 63) channel.TimerCredit--;
-                    else if(treq < 59 && !requests[treq] && pulseCredits[treq] != 0) pulseCredits[treq]--;
-                    pending = transfer;
-                }
+                transfer = pending;
                 executing = true;
             }
-            // Bus accesses can synchronously change GPIO/DREQ, trigger or abort
-            // other channels. Never hold the register monitor across the bus.
+            try
+            {
+                if(transfer != null) Access(transfer, true);
+                lock(SyncRoot)
+                {
+                    transfer = null;
+                    if(pending == null && !ResetHeld)
+                    {
+                        var channel = Arbitrate();
+                        if(channel != null)
+                        {
+                            var size = (int)((channel.Control >> 2) & 3);
+                            transfer = new Transfer { Channel = channel, Generation = channel.Generation,
+                                ReadAddress = channel.ReadAddress, WriteAddress = channel.WriteAddress,
+                                Control = channel.Control, Bytes = size == 3 ? 0 : 1 << size };
+                            var treq = Treq(channel);
+                            if(treq >= 59 && treq < 63) channel.TimerCredit--;
+                            else if(treq < 59 && !requests[treq] && pulseCredits[treq] != 0) pulseCredits[treq]--;
+                            pending = transfer;
+                        }
+                    }
+                }
+                if(transfer != null) Access(transfer, false);
+            }
+            finally
+            {
+                lock(SyncRoot)
+                {
+                    executing = false;
+                    UpdateInterrupts();
+                    Schedule();
+                }
+                PublishPending();
+            }
+        }
+
+        // Bus accesses can synchronously change GPIO/DREQ, trigger or abort
+        // other channels. Never hold the register monitor across the bus.
+        private void Access(Transfer transfer, bool write)
+        {
             var error = false;
             try
             {
@@ -394,7 +420,6 @@ namespace Antmicro.Renode.Peripherals.DMA
             {
                 lock(SyncRoot)
                 {
-                    executing = false;
                     var channel = transfer.Channel;
                     if(channel.Generation == transfer.Generation && pending == transfer)
                     {
@@ -431,10 +456,7 @@ namespace Antmicro.Renode.Peripherals.DMA
                             Sniff(transfer);
                         }
                     }
-                    UpdateInterrupts();
-                    Schedule();
                 }
-                PublishPending();
             }
         }
 
