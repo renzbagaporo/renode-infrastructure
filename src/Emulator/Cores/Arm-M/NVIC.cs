@@ -2801,6 +2801,10 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
         private bool IsCurrentCPUInSecureState(out ICPU currentCpu)
         {
             currentCpu = null;
+            // An NVIC whose core has no TrustZone has only the non-secure bank,
+            // whichever CPU's thread reaches it: in a machine with several
+            // chips, another chip's TrustZone core may run this chip's timers.
+            if(cpu != null && !cpu.TrustZoneEnabled) return false;
             try
             {
                 if(EnableMemoryMappedDebug && machine.GetSystemBus(this).TryGetCurrentContextState<CortexM.ContextState>(out var context, out var state))
