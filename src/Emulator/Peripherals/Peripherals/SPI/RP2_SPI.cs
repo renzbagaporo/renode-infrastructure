@@ -21,7 +21,8 @@ namespace Antmicro.Renode.Peripherals.SPI
     // implements the Motorola frame format. As a master it drives SCK, TX and
     // FSS on its GPIO function 1 pins with the configured polarity, phase,
     // frame size and bit rate (clk_peri / (CPSDVSR * (1 + SCR))), and samples
-    // RX at each sampling edge. When the target is reached through delayed
+    // RX at each sampling edge. With SPH=0, FSS pulses high for one SCK
+    // period between back-to-back frames; with SPH=1 it stays low. When the target is reached through delayed
     // wires, InputDelayNanoseconds moves each sample by the round trip so the
     // target's response to that edge is read. As a slave it follows CSn and
     // SCK on its input pins, samples RX on the sampling edges, and drives TX
@@ -94,6 +95,7 @@ namespace Antmicro.Renode.Peripherals.SPI
                     notifications.Clear();
                     generation++;
                     shifting = false;
+                    pulseHalves = 0;
                     slaveSelected = slaveLoaded = false;
                     slaveBits = 0;
                     slaveIn = slaveOut = 0;
@@ -205,6 +207,7 @@ namespace Antmicro.Renode.Peripherals.SPI
             frame = new Frame(++frameId, tx.Dequeue(), FrameBits);
             frames[frame.Id] = frame;
             shifting = true;
+            pulseHalves = 0;
             edge = 0;
             edgeTimer.Enabled = false;
             edgeTimer.Limit = HalfPeriod;
@@ -224,32 +227,59 @@ namespace Antmicro.Renode.Peripherals.SPI
                     edgeTimer.Enabled = false;
                     return;
                 }
-                edge++;
-                var leading = edge % 2 == 1;
-                var bit = (edge - 1) / 2;
-                SetLine(ClockLine, leading ? !IdleHigh : IdleHigh);
-                if(leading == !SecondEdgeSamples)
+                if(pulseHalves > 0)
                 {
-                    Capture(frame, bit);
+                    // The end of FSS's pulse between back-to-back frames.
+                    if(--pulseHalves == 0)
+                    {
+                        shifting = false;
+                        TryStartFrame();
+                        if(!shifting) SetLine(FssLine, true);
+                        UpdateSignals();
+                    }
                 }
-                else if(!SecondEdgeSamples)
+                else OnFrameEdge();
+            }
+            PublishPending();
+        }
+
+        private void OnFrameEdge()
+        {
+            edge++;
+            var leading = edge % 2 == 1;
+            var bit = (edge - 1) / 2;
+            SetLine(ClockLine, leading ? !IdleHigh : IdleHigh);
+            if(leading == !SecondEdgeSamples)
+            {
+                Capture(frame, bit);
+            }
+            else if(!SecondEdgeSamples)
+            {
+                if(bit + 1 < frame.Bits) SetLine(DataLine, frame.Bit(bit + 1));
+            }
+            else
+            {
+                SetLine(DataLine, frame.Bit(bit));
+            }
+            if(edge == frame.Bits * 2)
+            {
+                if(!SecondEdgeSamples && tx.Count != 0 && Enabled)
                 {
-                    if(bit + 1 < frame.Bits) SetLine(DataLine, frame.Bit(bit + 1));
+                    // With SPH=0, FSS pulses high for one SCK period
+                    // between back-to-back frames, so a target sees
+                    // every frame as a select window of its own.
+                    SetLine(FssLine, true);
+                    pulseHalves = 2;
                 }
                 else
-                {
-                    SetLine(DataLine, frame.Bit(bit));
-                }
-                if(edge == frame.Bits * 2)
                 {
                     shifting = false;
                     edgeTimer.Enabled = false;
                     TryStartFrame();
                     if(!shifting) SetLine(FssLine, true);
                 }
-                UpdateSignals();
             }
-            PublishPending();
+            UpdateSignals();
         }
 
         private void Capture(Frame target, int bit)
@@ -589,6 +619,7 @@ namespace Antmicro.Renode.Peripherals.SPI
         private ulong frameId;
         private int edge;
         private bool shifting, publishing, rxLevel, slaveSelected, slaveLoaded;
+        private int pulseHalves;
         private int slaveBits;
         private ushort slaveIn, slaveOut;
         private uint generation;

@@ -95,6 +95,40 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.AreEqual(1u, spi.ReadDoubleWord(0x0c) & 1, "Both frames left the transmit FIFO");
         }
 
+        [TestCase(false)]
+        [TestCase(true)]
+        public void ShouldPulseSelectBetweenBackToBackMasterFramesOnlyWithTheFirstEdgeSampling(bool secondEdge)
+        {
+            var select = new System.Collections.Generic.List<(bool Level, ulong Microseconds)>();
+            gpio.DriveChanged += (pin, value, enabled) =>
+            {
+                if(pin == Select && enabled) select.Add((value, (ulong)machine.ClockSource.CurrentValue.TotalMicroseconds));
+            };
+            // 8 bits, SCR 124 with CPSDVSR 2: a 1 us half period at 125 MHz.
+            spi.WriteDoubleWord(0x00, 7 | (124u << 8) | (secondEdge ? 0x80u : 0));
+            spi.WriteDoubleWord(0x10, 2);
+            spi.WriteDoubleWord(0x08, 0x81);
+            spi.WriteDoubleWord(0x08, 0x42);
+            spi.WriteDoubleWord(0x04, 2);
+            for(var i = 0; i < 60; i++) AdvanceMicroseconds(1);
+            var levels = select.ConvertAll(change => change.Level);
+            if(secondEdge)
+            {
+                CollectionAssert.AreEqual(new[] { true, false, true }, levels, "Idle high, then SPH=1 holds FSS low across the frames");
+                return;
+            }
+            CollectionAssert.AreEqual(new[] { true, false, true, false, true }, levels, "Idle high, then SPH=0 pulses FSS between the frames");
+            Assert.AreEqual(16ul, select[2].Microseconds, "FSS rises after the first frame's 16 half periods");
+            Assert.AreEqual(18ul, select[3].Microseconds, "and stays high for one SCK period");
+            spi.ReadDoubleWord(0x08);
+            Assert.AreEqual(4u, spi.ReadDoubleWord(0x0c) & 4, "Both frames were received");
+            spi.ReadDoubleWord(0x08);
+            Assert.AreEqual(0u, spi.ReadDoubleWord(0x0c) & 4);
+        }
+
+        private void AdvanceMicroseconds(ulong microseconds) =>
+            ((Antmicro.Renode.Time.BaseClockSource)machine.ClockSource).Advance(Antmicro.Renode.Time.TimeInterval.FromMicroseconds(microseconds));
+
         // One SPH=0 frame from the master's side: returns the bits on MISO.
         private int Exchange()
         {
