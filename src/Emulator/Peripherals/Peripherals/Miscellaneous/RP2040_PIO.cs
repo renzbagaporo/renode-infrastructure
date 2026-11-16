@@ -1283,11 +1283,25 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             foreach(var sm in stateMachines) if(sm != except) Wake(sm);
         }
 
+        // A FIFO access that frees a stalled machine lets it go on from the
+        // accessing CPU's time when another RP2 chip shares the machine: that
+        // CPU runs ahead of the machine clock, and the pins the machine then
+        // drives must follow what the CPU drove through SIO just before (a
+        // chip select lowered before the bytes it frames).
         private void Wake(StateMachine sm)
         {
-            if(sm.Stalled && !sm.Timer.Enabled && CanResume(sm)) Schedule(sm, wake: true);
+            var earliest = AccessorCycle();
+            if(sm.Stalled && !sm.Timer.Enabled && CanResume(sm)) Schedule(sm, wake: true, earliestTick: earliest);
             else if(!sm.Stalled && sm.Scheduled && AutoPull(sm) && sm.OutputCount >= PullThreshold(sm) && sm.Tx.Count != 0)
-                Schedule(sm, advance: false);
+                Schedule(sm, advance: false, earliestTick: earliest);
+        }
+
+        private ulong AccessorCycle()
+        {
+            if(!sharedMachine.HasValue) sharedMachine = machine.GetPeripheralsOfType<RP2_Chip>().Skip(1).Any();
+            if(!sharedMachine.Value) return 0;
+            var time = RP2CpuTime.InitiatorTime(machine);
+            return time.HasValue ? CycleAt(time.Value) : 0;
         }
 
         private bool CanResume(StateMachine sm)
