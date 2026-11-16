@@ -25,8 +25,10 @@ namespace Antmicro.Renode.Peripherals.I2C
     // (data, CMD, STOP, RESTART) at the configured SCL rate and waits for each
     // target answer; as a target it acknowledges its address, fills the RX
     // FIFO and raises RD_REQ until firmware supplies the byte to send.
-    // 10-bit addressing, multi-controller arbitration, high speed mode and
-    // SDA/SCL pin levels are not modeled.
+    // With no DelayedI2CBus connected, the block's pads carry the bus as
+    // open-drain SDA and SCL levels instead (RP2_I2CPins), for devices that
+    // follow or drive the pins. 10-bit addressing, multi-controller
+    // arbitration and high speed mode are not modeled.
     public sealed class RP2_I2C : RP2APBPeripheral, IDelayedI2CBusEndpoint
     {
         public RP2_I2C(IMachine machine, IRP2ClockSource clocks = null, ulong frequency = 125000000,
@@ -44,6 +46,8 @@ namespace Antmicro.Renode.Peripherals.I2C
                 limit: 1, workMode: WorkMode.OneShot, eventEnabled: true);
             phaseTimer.LimitReached += OnPhaseElapsed;
             if(clocks != null) clocks.ClockChanged += OnClockChanged;
+            if(this.gpio != null) pins = new RP2_I2CPins(machine, this, this.gpio, index, () => Math.Max(1ul, BitCycles / 2),
+                () => Frequency, () => TargetMode && bus == null);
             Reset();
         }
 
@@ -80,6 +84,9 @@ namespace Antmicro.Renode.Peripherals.I2C
                 }
             });
             PublishPending();
+            // The pads are released at once unless this runs inside this
+            // block's own reset hold, which holds its state monitor.
+            pins?.Reset(flush: !Monitor.IsEntered(SyncRoot));
         }
 
         public void AttachToBus(DelayedI2CBus bus, int sdaPin, int sclPin)
@@ -404,7 +411,7 @@ namespace Antmicro.Renode.Peripherals.I2C
                     transferActive = true;
                     answerAcknowledged = 0;
                     AwaitAnswers(Phase.AwaitAddress, I2CBusEvent.Start(transfer, (int)(targetAddress & 0x7f), transferRead, repeatedStart),
-                        Routed ? bus.PeerCount(this) : 0);
+                        Routed ? (bus != null ? bus.PeerCount(this) : 1) : 0);
                     if(awaiting == 0) StartPhase(Phase.AddressAcknowledge, BitCycles);
                     break;
                 case Phase.AddressAcknowledge:
@@ -628,8 +635,9 @@ namespace Antmicro.Renode.Peripherals.I2C
         private void QueueBusEvent(I2CBusEvent busEvent, IDelayedI2CBusEndpoint to)
         {
             var target = bus;
-            if(target == null) return;
-            pending.Enqueue(() => target.Send(this, busEvent, to));
+            if(target != null) pending.Enqueue(() => target.Send(this, busEvent, to));
+            // Without a bus the pads carry it; the pins are the only peer.
+            else if(pins != null) pending.Enqueue(() => pins.OnBusEvent(busEvent.WithSender(this)));
         }
 
         // Common ---------------------------------------------------------
@@ -708,8 +716,9 @@ namespace Antmicro.Renode.Peripherals.I2C
             }
         }
 
-        private bool Routed => bus != null && (gpio == null || sdaPin < 0
-            || (gpio.GetFunction(sdaPin) == I2CFunction && gpio.GetFunction(sclPin) == I2CFunction));
+        private bool Routed => bus != null ? (gpio == null || sdaPin < 0
+            || (gpio.GetFunction(sdaPin) == I2CFunction && gpio.GetFunction(sclPin) == I2CFunction))
+            : pins != null && pins.Selected;
         private bool Enabled => !ResetHeld && (enable & 1) != 0;
         private bool ControllerMode => (control & MasterMode) != 0;
         private bool TargetMode => Enabled && !ControllerMode && (control & SlaveDisable) == 0;
@@ -761,6 +770,7 @@ namespace Antmicro.Renode.Peripherals.I2C
         private readonly bool[] signalStates;
         private readonly LimitTimer phaseTimer;
         private DelayedI2CBus bus;
+        private readonly RP2_I2CPins pins;
         private int sdaPin = -1, sclPin = -1;
         private Phase phase;
         private ulong transfer;
