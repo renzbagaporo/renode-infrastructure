@@ -5,10 +5,12 @@
 
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.Bus;
+using Antmicro.Renode.Peripherals.Miscellaneous;
 using Antmicro.Renode.Peripherals.CPU;
 
 namespace Antmicro.Renode.Peripherals.MemoryControllers
@@ -247,11 +249,30 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
             return value;
         }
 
+        // The stream reads the flash as its chip's own bus master: with several
+        // RP2 chips in a machine (RP2_Chip), each chip's XIP window answers
+        // only its own CPUs and its RP2_BusMaster.
+        private IPeripheral StreamContext
+        {
+            get
+            {
+                if(!streamContextKnown)
+                {
+                    streamContext = RP2_Chip.Own<RP2_BusMaster>(machine, this).FirstOrDefault();
+                    streamContextKnown = true;
+                }
+                return streamContext;
+            }
+        }
+
+        private IPeripheral streamContext;
+        private bool streamContextKnown;
+
         private void FillStream()
         {
             while(streamCount != 0 && streamFifo.Count < StreamDepth)
             {
-                streamFifo.Enqueue(machine.SystemBus.ReadDoubleWord(0x14000000 | (streamAddress & 0x03fffffc)));
+                streamFifo.Enqueue(machine.SystemBus.ReadDoubleWord(0x14000000 | (streamAddress & 0x03fffffc), context: StreamContext));
                 streamAddress += 4;
                 streamCount--;
             }
