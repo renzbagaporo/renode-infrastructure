@@ -411,8 +411,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // only once the machine clock catches up. Any other DMA work stops the
         // block where it is, since that transfer belongs to the machine clock.
         // A CPU access to the DMA's registers runs this too (RP2040_DMA).
+        // With several chips in one machine (RP2_Chip) the block does not run
+        // ahead: another chip's peripherals change its inputs at machine-clock
+        // times no wire announces, and a change landing in cycles already run
+        // would reach the block late, and its answering outputs with it.
         internal void CatchUpToAccessor()
         {
+            if(!sharedMachine.HasValue) sharedMachine = machine.GetPeripheralsOfType<RP2_Chip>().Skip(1).Any();
+            if(sharedMachine.Value) return;
             var bus = machine.SystemBus;
             if(bus.TryGetCurrentContextState<CortexM.ContextState>(out var _, out var state) && state.DebugAccess) return;
             if(!bus.TryGetTransactionInitiator(out var initiator) || !(initiator is BaseCPU cpu) || !cpu.OnPossessedThread || cpu.TimeHandle == null) return;
@@ -1706,6 +1712,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private readonly bool rp2350;
         private readonly HashSet<string> warned = new HashSet<string>();
         private int gpioBase;
+        private bool? sharedMachine;
         // RP2350 moves INTR and IRQ0/IRQ1 INTE/INTF/INTS from 0x128 to 0x16c.
         private const long V1InterruptOffset = 0x44;
         private uint control, debug, irqFlags, inputSyncBypass, output, outputEnable;
