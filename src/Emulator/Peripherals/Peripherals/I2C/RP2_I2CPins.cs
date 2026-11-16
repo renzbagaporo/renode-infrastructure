@@ -19,10 +19,11 @@ namespace Antmicro.Renode.Peripherals.I2C
     //
     // As a controller's bus it plays each event's waveform at half the SCL
     // bit period per step (START, the eight bits with SDA changed while SCL
-    // is low, the ninth clock with the target's ACK sampled while SCL is
+    // is low, the SDA hold time (IC_SDA_HOLD) after SCL falls, the ninth clock with the target's ACK sampled while SCL is
     // high, a read's bits sampled the same way, the controller's ACK or NACK
     // of a read byte before the next byte, a repeated START or the STOP) and
-    // waits while another device holds SCL low. It answers with the ACK or
+    // waits while another device holds SCL low; SCL pulled low again during
+    // its high time restarts that high time once it rises. It answers with the ACK or
     // the byte it sampled.
     //
     // As a target's bus it follows START and STOP (SDA changing while SCL is
@@ -34,8 +35,9 @@ namespace Antmicro.Renode.Peripherals.I2C
     internal sealed class RP2_I2CPins : IDelayedI2CBusEndpoint
     {
         public RP2_I2CPins(IMachine machine, IDelayedI2CBusEndpoint owner, RP2_GPIOBank0 gpio, int index,
-            Func<ulong> halfPeriodCycles, Func<ulong> frequency, Func<bool> targetMode)
+            Func<ulong> halfPeriodCycles, Func<ulong> holdCycles, Func<ulong> frequency, Func<bool> targetMode)
         {
+            this.holdCycles = holdCycles;
             this.owner = owner;
             this.gpio = gpio;
             this.index = index;
@@ -59,6 +61,8 @@ namespace Antmicro.Renode.Peripherals.I2C
                 timer.Enabled = false;
                 ops.Clear();
                 waitingForScl = false;
+                highPhase = false;
+                holdPending = false;
                 readPending = false;
                 state = TargetState.Idle;
                 Release();
@@ -113,7 +117,7 @@ namespace Antmicro.Renode.Peripherals.I2C
                 ops.Enqueue(Op.Wait());
                 ops.Enqueue(Op.Scl(true));
                 ops.Enqueue(Op.WaitScl());
-                ops.Enqueue(Op.Wait());
+                ops.Enqueue(Op.WaitHigh());
             }
             ops.Enqueue(Op.Sda(false));
             ops.Enqueue(Op.Wait());
@@ -138,7 +142,7 @@ namespace Antmicro.Renode.Peripherals.I2C
                 ops.Enqueue(Op.Wait());
                 ops.Enqueue(Op.Scl(true));
                 ops.Enqueue(Op.WaitScl());
-                ops.Enqueue(Op.Wait());
+                ops.Enqueue(Op.WaitHigh());
                 ops.Enqueue(Op.SampleBit());
                 ops.Enqueue(Op.Scl(false));
             }
@@ -154,7 +158,7 @@ namespace Antmicro.Renode.Peripherals.I2C
             ops.Enqueue(Op.Wait());
             ops.Enqueue(Op.Scl(true));
             ops.Enqueue(Op.WaitScl());
-            ops.Enqueue(Op.Wait());
+            ops.Enqueue(Op.WaitHigh());
             ops.Enqueue(Op.Sda(true));
             ops.Enqueue(Op.Unhold());
         }
@@ -167,7 +171,7 @@ namespace Antmicro.Renode.Peripherals.I2C
                 ops.Enqueue(Op.Wait());
                 ops.Enqueue(Op.Scl(true));
                 ops.Enqueue(Op.WaitScl());
-                ops.Enqueue(Op.Wait());
+                ops.Enqueue(Op.WaitHigh());
                 ops.Enqueue(Op.Scl(false));
             }
         }
@@ -179,7 +183,7 @@ namespace Antmicro.Renode.Peripherals.I2C
             ops.Enqueue(Op.Wait());
             ops.Enqueue(Op.Scl(true));
             ops.Enqueue(Op.WaitScl());
-            ops.Enqueue(Op.Wait());
+            ops.Enqueue(Op.WaitHigh());
             ops.Enqueue(Op.SampleAcknowledge());
             ops.Enqueue(Op.Scl(false));
             ops.Enqueue(Op.AnswerAcknowledge(transfer));
@@ -192,15 +196,36 @@ namespace Antmicro.Renode.Peripherals.I2C
             ops.Enqueue(Op.Wait());
             ops.Enqueue(Op.Scl(true));
             ops.Enqueue(Op.WaitScl());
-            ops.Enqueue(Op.Wait());
+            ops.Enqueue(Op.WaitHigh());
             ops.Enqueue(Op.Scl(false));
             ops.Enqueue(Op.Sda(true));
             ops.Enqueue(Op.UnpendRead());
         }
 
+        private void Schedule(ulong cycles)
+        {
+            timer.Enabled = false;
+            timer.Frequency = Math.Max(1ul, frequency());
+            timer.Limit = cycles;
+            timer.ResetValue();
+            timer.Enabled = true;
+        }
+
+        private void PushFront(Op op)
+        {
+            var rest = ops.ToArray();
+            ops.Clear();
+            ops.Enqueue(op);
+            foreach(var other in rest) ops.Enqueue(other);
+        }
+
         private void OnStep()
         {
-            lock(sync) RunOps();
+            lock(sync)
+            {
+                highPhase = false;
+                RunOps();
+            }
             Flush();
         }
 
@@ -211,14 +236,30 @@ namespace Antmicro.Renode.Peripherals.I2C
                 var op = ops.Dequeue();
                 switch(op.Kind)
                 {
-                case OpKind.Sda: Drive(sdaPin, op.Level); break;
-                case OpKind.Scl: Drive(sclPin, op.Level); break;
+                case OpKind.Sda:
+                    if(holdPending)
+                    {
+                        // SDA changes the hold time after SCL falls, as
+                        // IC_SDA_HOLD sets, never on the same instant.
+                        holdPending = false;
+                        PushFront(op);
+                        Schedule(Math.Max(1ul, holdCycles()));
+                        return;
+                    }
+                    Drive(sdaPin, op.Level);
+                    break;
+                case OpKind.Scl:
+                    Drive(sclPin, op.Level);
+                    holdPending = !op.Level;
+                    break;
+                case OpKind.WaitHigh:
+                    // SCL's high time; another device pulling SCL low in it
+                    // restarts it once SCL rises again (clock synchronization).
+                    highPhase = true;
+                    goto case OpKind.Wait;
                 case OpKind.Wait:
-                    timer.Enabled = false;
-                    timer.Frequency = Math.Max(1ul, frequency());
-                    timer.Limit = Math.Max(1ul, halfPeriodCycles());
-                    timer.ResetValue();
-                    timer.Enabled = true;
+                    holdPending = false;
+                    Schedule(Math.Max(1ul, halfPeriodCycles()));
                     return;
                 case OpKind.WaitScl:
                     // Another device stretching the clock holds SCL low.
@@ -252,7 +293,16 @@ namespace Antmicro.Renode.Peripherals.I2C
                 sclPin = scl;
                 if(pin == scl)
                 {
-                    if(waitingForScl && level)
+                    if(highPhase && !level && !sclLow)
+                    {
+                        // Held low again before the high time ended.
+                        timer.Enabled = false;
+                        highPhase = false;
+                        PushFront(Op.WaitHigh());
+                        PushFront(Op.WaitScl());
+                        waitingForScl = true;
+                    }
+                    else if(waitingForScl && level)
                     {
                         waitingForScl = false;
                         RunOps();
@@ -430,6 +480,7 @@ namespace Antmicro.Renode.Peripherals.I2C
         private readonly RP2_GPIOBank0 gpio;
         private readonly int index;
         private readonly Func<ulong> halfPeriodCycles;
+        private readonly Func<ulong> holdCycles;
         private readonly Func<ulong> frequency;
         private readonly Func<bool> targetMode;
         private readonly LimitTimer timer;
@@ -437,7 +488,7 @@ namespace Antmicro.Renode.Peripherals.I2C
         private readonly Queue<Action> actions = new Queue<Action>();
         private readonly object sync = new object();
         private int sdaPin = -1, sclPin = -1;
-        private bool sdaLow, sclLow, waitingForScl, readPending, controllerHolding, acknowledgeSample, flushing;
+        private bool sdaLow, sclLow, waitingForScl, highPhase, holdPending, readPending, controllerHolding, acknowledgeSample, flushing;
         private bool repeated, readTransfer, acknowledgedLast, controllerAcknowledged;
         private TargetState state;
         private ulong transfer;
@@ -464,6 +515,7 @@ namespace Antmicro.Renode.Peripherals.I2C
             Sda,
             Scl,
             Wait,
+            WaitHigh,
             WaitScl,
             SampleBit,
             SampleAcknowledge,
@@ -481,6 +533,7 @@ namespace Antmicro.Renode.Peripherals.I2C
             public static Op Scl(bool level) => new Op(OpKind.Scl, level, 0);
             public static Op Wait() => new Op(OpKind.Wait, false, 0);
             public static Op WaitScl() => new Op(OpKind.WaitScl, false, 0);
+            public static Op WaitHigh() => new Op(OpKind.WaitHigh, false, 0);
             public static Op SampleBit() => new Op(OpKind.SampleBit, false, 0);
             public static Op SampleAcknowledge() => new Op(OpKind.SampleAcknowledge, false, 0);
             public static Op AnswerAcknowledge(ulong transfer) => new Op(OpKind.AnswerAcknowledge, false, transfer);
