@@ -129,6 +129,23 @@ namespace Antmicro.Renode.PeripheralsTests
         private void AdvanceMicroseconds(ulong microseconds) =>
             ((Antmicro.Renode.Time.BaseClockSource)machine.ClockSource).Advance(Antmicro.Renode.Time.TimeInterval.FromMicroseconds(microseconds));
 
+        [Test]
+        public void ShouldTakeAnSph0SlaveFrameWrittenAfterTheLastWindowAtTheNextSelect()
+        {
+            spi.WriteDoubleWord(0x00, 7);
+            spi.WriteDoubleWord(0x10, 2);
+            spi.WriteDoubleWord(0x04, 2 | 4);
+            spi.WriteDoubleWord(0x08, 0x81);
+            gpio.OnGPIO(Select, false);
+            Assert.AreEqual(0x81, Exchange());
+            gpio.OnGPIO(Select, true);
+            // The transmit FIFO was empty when that window ended.
+            spi.WriteDoubleWord(0x08, 0x5a);
+            gpio.OnGPIO(Select, false);
+            Assert.AreEqual(0x5a, Exchange(), "The frame written between windows goes out in the next one");
+            gpio.OnGPIO(Select, true);
+        }
+
         // One SPH=0 frame from the master's side: returns the bits on MISO.
         private int Exchange()
         {

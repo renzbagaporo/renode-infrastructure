@@ -409,8 +409,19 @@ namespace Antmicro.Renode.Peripherals.SPI
             {
                 // SPH=0 shifts the next bit out on the trailing edge, SPH=1 the
                 // bit about to be sampled on the leading edge. A back-to-back
-                // frame starts on this edge with its first bit.
-                if(slaveBits == 0) LoadSlaveFrame();
+                // frame starts on this edge with its first bit. With SPH=0
+                // and nothing to send, zeros go out but no frame is taken: a
+                // frame written before CSn falls again goes out in that window.
+                if(slaveBits == 0)
+                {
+                    if(!SecondEdgeSamples && tx.Count == 0 && !slaveLoaded)
+                    {
+                        slaveOut = 0;
+                        DriveSlaveBit(0);
+                        return;
+                    }
+                    LoadSlaveFrame();
+                }
                 DriveSlaveBit(slaveBits);
             }
         }
