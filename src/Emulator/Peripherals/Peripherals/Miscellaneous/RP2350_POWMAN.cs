@@ -46,7 +46,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             this.sramLow = sramLow;
             this.sramHigh = sramHigh;
             debugPort.RescueResetChanged += OnRescueReset;
+            debugPort.SwitchedCorePowered = () => (Volatile.Read(ref powerState) & SwitchedCoreOff) == 0;
             debugPort.RunResetRequested += OnRunReset;
+            debugPort.PowerManagerResetRequested += OnPowerManagerReset;
             Reset();
         }
 
@@ -453,10 +455,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             EnterPowerState(request);
         }
 
-        // WFI and WFE both count: the bootrom parks core 1 in WFE.
+        // WFI and WFE both count: the bootrom parks core 1 in WFE. A core a
+        // debugger halted is not asleep, even if it halted inside WFI: the
+        // switched core powers off only once the debugger lets it sleep again.
         private bool IsAsleep(int number)
         {
             var core = GetProcessor(number);
+            if(core.HaltedByDebugger) return false;
             if(core.IsHalted || core.HasAnyHaltingCondition) return true;
             var nvic = core is CortexM ? nvics[number] : null;
             return nvic != null && (nvic.InSleep.IsSet || nvic.InDeepSleep.IsSet);
@@ -528,9 +533,28 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 ApplyRescueHold();
                 var doubleTap = chipReset & 1;
                 Reset();
+                EnterPowerState(0);
                 chipReset = (1u << 18) | doubleTap;
                 sramLow?.ZeroAll();
                 sramHigh?.ZeroAll();
+            });
+        }
+
+        // The RP-AP's DBG_POW_OVRD reset: the power manager and the switched
+        // core restart as from power on, with every domain powered. SRAM keeps
+        // its supply, and the always-on debug port and external flash their state.
+        private void OnPowerManagerReset()
+        {
+            var retained = new List<IPeripheral> { this, debugPort };
+            retained.AddRange(machine.GetRegisteredPeripherals().Select(entry => entry.Peripheral).OfType<WinbondW25QFlash>());
+            machine.RequestResetInSafeState(postReset: () =>
+            {
+                debugPort.ApplyRunHold();
+                ApplyRescueHold();
+            }, unresetable: retained, runRegisteredResetEvents: true, preReset: () =>
+            {
+                Reset();
+                EnterPowerState(0);
             });
         }
 

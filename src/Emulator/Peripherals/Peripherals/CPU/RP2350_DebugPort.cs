@@ -32,7 +32,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         protected override void ResetBackend()
         {
             var rescueWasAsserted = RescueResetAsserted;
-            select = select1 = readBuffer = rpControl = 0;
+            select = select1 = readBuffer = rpControl = powerOverride = 0;
             control = 0x40;
             if(aps != null) foreach(var ap in aps) ap.Reset();
             // RP-AP CTRL belongs to the DP reset domain. Its physical rescue
@@ -87,6 +87,14 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         internal RP2350_ArchitectureSelector ArchitectureSelector { get; set; }
 
+        // Whether the switched core domain, which holds the processors' debug
+        // logic, has power; POWMAN answers. While it is off CDBGPWRUPACK reads
+        // 0 and the processors' APs answer WAIT, as the datasheet's power-down
+        // with DBG_PWRCFG.IGNORE leaves a debugger.
+        internal Func<bool> SwitchedCorePowered { get; set; }
+
+        private bool DebugPowered => (control & 0x20000000) != 0 && (SwitchedCorePowered?.Invoke() ?? true);
+
         protected override Acknowledgement BeginTransfer(bool accessPort, bool read, byte address, out uint value)
         {
             value = 0;
@@ -98,7 +106,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             if((control & 0xa2) != 0) return Acknowledgement.Fault;
             var apAddress = ((ulong)select1 << 32) | (select & 0xfffffff0u) | address;
             // The RP-AP is accessible while the switched core debug domain is powered off.
-            if(apAddress < 0x80000 && (control & 0x20000000) == 0) return Acknowledgement.Wait;
+            if(apAddress < 0x80000 && !DebugPowered) return Acknowledgement.Wait;
             if(!IsAPAddress(apAddress))
             {
                 control |= 0x20;
@@ -171,7 +179,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             {
                 switch(bank)
                 {
-                case 0: return control;
+                case 0: return DebugPowered ? control : control & ~0x20000000u;
                 case 1: return 0; // DLCR: one turnaround cycle
                 case 2: return 0x01002927;
                 case 3: return 1; // SWD protocol version 2 is encoded as 1.
@@ -200,6 +208,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             if(address >= 0x80000)
             {
                 if(address == 0x80000) return rpControl;
+                if(address == 0x80018) return powerOverride;
                 // The RP-AP is not a CoreSight component. The datasheet specifies
                 // an implementation-defined IDR at 0xdfc, with an undefined reset.
                 return 0;
@@ -215,11 +224,24 @@ namespace Antmicro.Renode.Peripherals.CPU
                 rpControl = value & 0xc000007f;
                 if(rescueChanged) RescueResetChanged?.Invoke((value & 0x80000000) != 0);
             }
+            else if(address == 0x80018)
+            {
+                // DBG_POW_OVRD: RESET with OVRD_RESET resets the power manager
+                // and the switched core. The power switch and isolation
+                // overrides are stored only.
+                var wasReset = (powerOverride & 0x30) == 0x30;
+                powerOverride = value & 0x7f;
+                if(!wasReset && (powerOverride & 0x30) == 0x30) PowerManagerResetRequested?.Invoke();
+            }
             else if(address >= 0x2000 && address < 0x5000) aps[address >= 0x4000 ? 1 : 0].Write((uint)(address & 0xfff), value);
         }
 
         // This reports physical reset assertion/release to the SoC power/reset model.
         public event Action<bool> RescueResetChanged;
+
+        // The RP-AP's DBG_POW_OVRD asked for a reset of the power manager and
+        // the switched core.
+        public event Action PowerManagerResetRequested;
 
         // A falling physical RUN edge requests a chip reset. Protocol resets
         // alone never raise this event, including while RUN remains asserted.
@@ -350,7 +372,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         private readonly IMachine machine;
         private readonly CortexM[] cores;
         private readonly MemoryAccessPort[] aps;
-        private uint select, select1, control, readBuffer, rpControl;
+        private uint select, select1, control, readBuffer, rpControl, powerOverride;
         private bool appliedRunHold;
         private bool appliedRescueHold;
     }
