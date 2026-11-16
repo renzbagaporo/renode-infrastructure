@@ -34,6 +34,25 @@ namespace Antmicro.Renode.Time
             return machine.ClockSource.CurrentValue;
         }
 
+        // The time of the change being delivered on this thread for the
+        // machine, if one is being delivered.
+        public static bool TryOf(IMachine machine, out TimeInterval time)
+        {
+            if(scopes != null)
+            {
+                for(var i = scopes.Count - 1; i >= 0; i--)
+                {
+                    if(scopes[i].Machine == machine)
+                    {
+                        time = scopes[i].Time;
+                        return true;
+                    }
+                }
+            }
+            time = default(TimeInterval);
+            return false;
+        }
+
         public static Scope At(IMachine machine, TimeInterval time)
         {
             if(scopes == null) scopes = new List<(IMachine Machine, TimeInterval Time)>();

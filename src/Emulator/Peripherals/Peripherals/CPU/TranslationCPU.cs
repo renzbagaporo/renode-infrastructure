@@ -777,9 +777,28 @@ namespace Antmicro.Renode.Peripherals.CPU
             ReportExecutedInstructions();
         }
 
+        // The virtual time this CPU has reached, to the instruction making the
+        // access in progress: TimeHandle.TotalElapsedTime holds only what was
+        // reported (SyncTime cannot report while another thread holds the time
+        // progress lock), and tlib counts a translation block's instructions
+        // when the block ends. Valid on the CPU's own thread.
+        public Antmicro.Renode.Time.TimeInterval OwnElapsedTime
+        {
+            get
+            {
+                var total = TlibGetTotalExecutedInstructions();
+                var unreported = total > reportedTotalInstructions ? total - reportedTotalInstructions : 0;
+                if(insideTranslatedCode) unreported += (ulong)Math.Max(0, TlibGetCurrentBlockProgress());
+                return TimeHandle.TotalElapsedTime + Antmicro.Renode.Time.TimeInterval.FromCPUCycles(unreported, PerformanceInMips, out var _);
+            }
+        }
+
+        private ulong reportedTotalInstructions;
+
         private void ReportExecutedInstructions()
         {
             var numberOfExecutedInstructions = TlibGetExecutedInstructions();
+            reportedTotalInstructions = TlibGetTotalExecutedInstructions();
             this.Trace($"CPU executed {numberOfExecutedInstructions} instructions and time synced");
             ReportProgress(numberOfExecutedInstructions);
         }
@@ -837,6 +856,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             finally
             {
                 numberOfExecutedInstructions = TlibGetExecutedInstructions();
+                reportedTotalInstructions = TlibGetTotalExecutedInstructions();
                 if(numberOfExecutedInstructions == 0)
                 {
                     this.Trace($"Asked tlib to execute {numberOfInstructionsToExecute}, but did nothing");
@@ -2495,6 +2515,9 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         [Import]
         private readonly Func<int> TlibRestoreContext;
+
+        [Import]
+        private readonly Func<int> TlibGetCurrentBlockProgress;
 
         [Import]
         private readonly Func<IntPtr> TlibExportState;
