@@ -532,8 +532,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 debugPort.ApplyRunHold();
                 ApplyRescueHold();
                 var doubleTap = chipReset & 1;
+                var poweredDown = (powerState & 0xf) != 0;
                 Reset();
-                EnterPowerState(0);
+                if(poweredDown) EnterPowerState(0);
                 chipReset = (1u << 18) | doubleTap;
                 sramLow?.ZeroAll();
                 sramHigh?.ZeroAll();
@@ -553,8 +554,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 ApplyRescueHold();
             }, unresetable: retained, runRegisteredResetEvents: true, preReset: () =>
             {
+                var poweredDown = (powerState & 0xf) != 0;
                 Reset();
-                EnterPowerState(0);
+                // Restores the domains POWMAN switched off, and only those
+                // signals: other holds on the cores stay as they are.
+                if(poweredDown) EnterPowerState(0);
             });
         }
 
