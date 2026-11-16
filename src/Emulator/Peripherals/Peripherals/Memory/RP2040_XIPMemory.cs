@@ -24,7 +24,7 @@ namespace Antmicro.Renode.Peripherals.Memory
     // remains available only through the flash serial interface.
     // Each XIP alias is its own instance over the shared NOR: cached
     // (0x10, 0x11) or not (0x12, 0x13), allocating (0x10) or not. While the
-    // XIP controller measures its cache counters, CPU data reads of a cached
+    // XIP controller's cache counters count, CPU data reads of a cached
     // alias go through the bus and are recorded in the cache, and writes to
     // the cached allocating alias deallocate their line. The instance that
     // is cached and allocating owns the NOR contents.
@@ -63,6 +63,7 @@ namespace Antmicro.Renode.Peripherals.Memory
                 for(var i = 0; i < count; i++) value |= (ulong)flash.UnderlyingMemory.ReadByte(offset + i) << (8 * i);
                 if(cached && !fetch) xip.RecordRead(offset, allocate);
             });
+            if(cached) xip.PublishMeasuring();
             return value;
         }
 
@@ -187,14 +188,19 @@ namespace Antmicro.Renode.Peripherals.Memory
                 InvalidateInstructions();
                 return;
             }
-            var available = xip.Available && !(cached && xip.Measuring);
+            var flashReadable = xip.Available;
+            var available = flashReadable && !(cached && xip.Measuring);
             lock(directAccessLock)
             {
-                if(!force && available == directAccess) return;
+                if(!force && available == directAccess && flashReadable == xipAvailable) return;
+                var remap = force || available != directAccess;
                 directAccess = available;
+                xipAvailable = flashReadable;
                 // Code translated while XIP was available must not run while
-                // it is not, and the reverse.
+                // it is not, and the reverse, whether it came from the mapping
+                // or from bus fetches while the cache counters count.
                 InvalidateInstructions();
+                if(!remap) return;
                 if(available)
                 {
                     // Translations may now come from the mapping without a bus fetch.
@@ -237,6 +243,7 @@ namespace Antmicro.Renode.Peripherals.Memory
         private int hasFetchedInstructions;
         private readonly HashSet<ulong> mappedAliases = new HashSet<ulong>();
         private bool directAccess;
+        private bool xipAvailable;
         private readonly object directAccessLock = new object();
         private readonly IMachine machine;
         private readonly WinbondW25QFlash flash;

@@ -106,6 +106,23 @@ namespace Antmicro.Renode.PeripheralsTests
         }
 
         [Test]
+        public void ShouldCountTheBootsReadsBeforeAnyCounterAccess()
+        {
+            Read(0x10000100);
+            Read(0x10000100);
+            AssertCounters(1, 2, "flash_cache_perfctr's \"At boot\" counts");
+        }
+
+        [Test]
+        public void ShouldStopCountingAfterTheBootUntilACounterAccess()
+        {
+            for(var i = 0; i < 65536 + 10; i++) Read(0x10000200);
+            AssertCounters(65535, 65536, "Counting stops after the boot's reads");
+            Read(0x10000200);
+            AssertCounters(65536, 65537, "A counter access restarts it");
+        }
+
+        [Test]
         public void ShouldClearEveryLineOnFlush()
         {
             xip.WriteDoubleWord(Accesses, 1);

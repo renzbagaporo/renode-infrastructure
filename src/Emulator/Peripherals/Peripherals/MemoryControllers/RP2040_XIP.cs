@@ -26,9 +26,11 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
     // cached aliases look it up while CTRL.EN is set, and only the
     // allocating alias fills a missed line; a write to it deallocates a
     // matching line, and FLUSH clears every line. CTR_ACC and CTR_HIT count
-    // those reads from the first access to either counter: until then the
-    // cached aliases read the NOR directly. Instruction fetches are never
-    // counted.
+    // those reads from reset for the first BootReads of them, so a program
+    // reads its boot's counts, and stop there unless the program has
+    // accessed either counter, which restarts and keeps the counting; while
+    // they do not count, the cached aliases read the NOR directly.
+    // Instruction fetches are never counted.
     public sealed class RP2040_XIP : RP2APBPeripheral, IRP2XIPStream
     {
         public RP2040_XIP(IMachine machine, RP2040_SSI ssi, WinbondW25QFlash flash) : base(machine)
@@ -49,7 +51,9 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
                 Array.Fill(tags, Invalid);
                 Array.Clear(leastRecent, 0, leastRecent.Length);
                 hits = accesses = 0;
-                measuring = false;
+                measuring = true;
+                countersUsed = false;
+                bootReads = BootReads;
                 streamAddress = 0;
                 streamCount = 0;
                 streamFifo.Clear();
@@ -83,8 +87,8 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
 
         public event Action AvailabilityChanged;
 
-        // True from the first counter access: the cached aliases then pass
-        // every data read through RecordRead.
+        // True while the counters count: the cached aliases then pass every
+        // data read through RecordRead.
         public bool Measuring
         {
             get
@@ -100,11 +104,17 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
                 if((control & 1) == 0) return;
                 var line = offset >> 3;
                 var set = (int)(line & (Sets - 1));
-                if(accesses != uint.MaxValue) accesses++;
+                var counting = measuring;
+                if(counting && accesses != uint.MaxValue) accesses++;
+                if(!countersUsed && measuring && --bootReads <= 0)
+                {
+                    measuring = false;
+                    measuringPending = true;
+                }
                 for(var way = 0; way < Ways; way++)
                 {
                     if(tags[set * Ways + way] != line) continue;
-                    if(hits != uint.MaxValue) hits++;
+                    if(counting && hits != uint.MaxValue) hits++;
                     leastRecent[set] = (byte)(1 - way);
                     return;
                 }
@@ -182,6 +192,13 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
         protected override void OnAccessCompleted()
         {
             PublishRequest();
+            PublishMeasuring();
+        }
+
+        // Applies a change of whether the counters count to the cached
+        // aliases, outside the locks of the access that made it.
+        public void PublishMeasuring()
+        {
             bool pending;
             lock(SyncRoot)
             {
@@ -193,6 +210,7 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
 
         private void StartMeasuring()
         {
+            countersUsed = true;
             if(measuring) return;
             measuring = true;
             measuringPending = true;
@@ -261,7 +279,10 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
         private uint accesses;
         private bool measuring;
         private bool measuringPending;
+        private bool countersUsed;
+        private int bootReads;
 
+        private const int BootReads = 65536;
         private const int StreamDepth = 2;
         private const int Sets = 1024;
         private const int Ways = 2;
