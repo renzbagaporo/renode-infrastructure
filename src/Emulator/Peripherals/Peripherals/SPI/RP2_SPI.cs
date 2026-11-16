@@ -5,6 +5,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 
 using Antmicro.Renode.Core;
@@ -35,6 +36,8 @@ namespace Antmicro.Renode.Peripherals.SPI
         {
             this.clocks = clocks;
             fallbackFrequency = frequency;
+            // Chips register one after another while a platform loads.
+            machine.PeripheralsChanged += (_, __) => sharedMachine = null;
             this.gpio = index >= 0 ? gpio : null;
             InputDelayNanoseconds = inputDelayNanoseconds;
             var rxPins = new List<int>();
@@ -174,12 +177,12 @@ namespace Antmicro.Renode.Peripherals.SPI
                 control1 = value & 0xf;
                 if(!SlaveMode) slaveSelected = false;
                 UpdatePins();
-                TryStartFrame();
+                TryStartFrame(AccessorTime());
                 break;
             case 0x08:
                 if(tx.Count < Capacity) tx.Enqueue((ushort)(value & FrameMask));
                 else this.Log(LogLevel.Warning, "Transmit FIFO write while full");
-                TryStartFrame();
+                TryStartFrame(AccessorTime());
                 break;
             case 0x10:
                 prescale = value & 0xfe;
@@ -201,7 +204,12 @@ namespace Antmicro.Renode.Peripherals.SPI
             UpdateSignals();
         }
 
-        private void TryStartFrame()
+        // A frame a CPU's write starts begins at that CPU's time (start), which
+        // leads the machine clock when another RP2 chip shares the machine (see
+        // AccessorTime): its first edge waits out the lead, and its select and
+        // first bit carry that time, so they follow the chip select the CPU
+        // drove through SIO just before.
+        private void TryStartFrame(TimeInterval? start = null)
         {
             if(shifting || tx.Count == 0 || !Enabled || (control1 & 4) != 0 || HalfPeriod == 0 || Frequency == 0) return;
             frame = new Frame(++frameId, tx.Dequeue(), FrameBits);
@@ -209,14 +217,31 @@ namespace Antmicro.Renode.Peripherals.SPI
             shifting = true;
             pulseHalves = 0;
             edge = 0;
+            var now = machine.ClockSource.CurrentValue;
+            var lead = start.HasValue && start.Value > now ? start.Value - now : TimeInterval.Empty;
+            var leadCycles = (ulong)((System.Numerics.BigInteger)lead.Ticks * Frequency / TimeInterval.TicksPerSecond);
             edgeTimer.Enabled = false;
-            edgeTimer.Limit = HalfPeriod;
+            edgeTimer.Limit = HalfPeriod + leadCycles;
             edgeTimer.ResetValue();
             edgeTimer.Enabled = true;
+            lineTime = leadCycles != 0 ? start : null;
             SetLine(FssLine, false);
             // With SPH=0 the first bit is valid half a clock before the first edge.
             if(!SecondEdgeSamples) SetLine(DataLine, frame.Bit(0));
+            lineTime = null;
         }
+
+        // The time of the CPU making the current access, in a machine holding
+        // several RP2 chips; null otherwise, as the frame then starts at the
+        // machine clock.
+        private TimeInterval? AccessorTime()
+        {
+            if(!sharedMachine.HasValue) sharedMachine = machine.GetPeripheralsOfType<RP2_Chip>().Skip(1).Any();
+            return sharedMachine.Value ? RP2CpuTime.InitiatorTime(machine) : null;
+        }
+
+        private bool? sharedMachine;
+        private TimeInterval? lineTime;
 
         private void OnClockEdge()
         {
@@ -227,6 +252,8 @@ namespace Antmicro.Renode.Peripherals.SPI
                     edgeTimer.Enabled = false;
                     return;
                 }
+                // The first edge of a frame started ahead of the clock is past.
+                if(edgeTimer.Limit != HalfPeriod) edgeTimer.Limit = HalfPeriod;
                 if(pulseHalves > 0)
                 {
                     // The end of FSS's pulse between back-to-back frames.
@@ -478,7 +505,7 @@ namespace Antmicro.Renode.Peripherals.SPI
         {
             if(lineLevels[line] == level) return;
             lineLevels[line] = level;
-            notifications.Enqueue(new Notification(line, level, lineEnabled[line], generation, machine.ClockSource.CurrentValue));
+            notifications.Enqueue(new Notification(line, level, lineEnabled[line], generation, lineTime ?? machine.ClockSource.CurrentValue));
         }
 
         private void UpdateSignals()

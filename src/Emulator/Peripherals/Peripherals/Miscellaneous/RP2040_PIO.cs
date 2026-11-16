@@ -33,6 +33,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         {
             if(pioId < 0 || pioId > (rp2350 ? 2 : 1)) throw new ConstructionException(rp2350 ? "RP2350 has three PIO blocks" : "RP2040 has two PIO blocks");
             this.rp2350 = rp2350;
+            // Chips register one after another while a platform loads.
+            machine.PeripheralsChanged += (_, __) => sharedMachine = null;
             this.gpio = gpio;
             this.clocks = clocks;
             function = 6 + pioId;
@@ -1133,6 +1135,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 for(var pin = 0; pin < 32; pin++)
                 {
                     inputHistory[pin].Clear();
+                    lastInputTick[pin] = 0;
                     synchronizedInput[pin] = gpio.GetInput(pin + gpioBase);
                     QueuePin(pin);
                 }
@@ -1152,6 +1155,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
                 ReadInput(pin);
                 var now = ArrivalCycle();
+                // A pin's changes keep their order, even one made at a time
+                // ahead of an earlier one's arrival.
+                if(now + 2 < lastInputTick[pin]) now = lastInputTick[pin] - 2;
+                lastInputTick[pin] = now + 2;
                 inputHistory[pin].Enqueue(new InputTransition { Tick = now + 2, Value = level });
                 var visibleTick = now + ((inputSyncBypass & (1u << pin)) != 0 ? 1ul : 2ul);
                 foreach(var sm in stateMachines)
@@ -1176,12 +1183,15 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // ahead of the machine clock (CatchUpToAccessor), arrives now; a burst
         // of such changes on any pins keeps its spacing from there, so a fast
         // signal (a clock and its data) is delayed whole instead of having its
-        // edges land on one cycle, where they would cancel.
+        // edges land on one cycle, where they would cancel. A change made at a
+        // cycle still to come, by another chip's CPU running ahead of the
+        // machine clock (RP2_GPIOBank0), arrives at that cycle.
         private ulong ArrivalCycle()
         {
             var now = CurrentCycle;
             var made = CycleAt(SignalTime.Of(machine));
-            if(made >= now) return now;
+            if(made > now) return made;
+            if(made == now) return now;
             if(lateArrival < now || made < lateMade) lateArrival = now;
             else lateArrival += made - lateMade;
             lateMade = made;
@@ -1665,6 +1675,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private readonly bool[] signalState = new bool[10];
         private readonly bool[] synchronizedInput = new bool[32];
         private readonly Queue<InputTransition>[] inputHistory = new Queue<InputTransition>[32];
+        private readonly ulong[] lastInputTick = new ulong[32];
         private readonly Queue<Notification> notifications = new Queue<Notification>();
         private readonly RP2_GPIOBank0 gpio;
         private readonly IRP2ClockSource clocks;

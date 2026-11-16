@@ -6,6 +6,7 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
+using System.Linq;
 using System.Threading;
 
 using Antmicro.Renode.Core;
@@ -24,6 +25,8 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
         {
             this.sio = sio;
             this.rp2350 = rp2350;
+            // Chips register one after another while a platform loads.
+            machine.PeripheralsChanged += (_, __) => sharedMachine = null;
             this.accessControl = accessControl;
             this.securityPinOffset = securityPinOffset;
             registerCount = rp2350 ? 48 : 30;
@@ -597,7 +600,7 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             if(sampled[pin] != input)
             {
                 sampled[pin] = input;
-                notifications.Enqueue(new Notification(NotificationKind.Input, SignalTime.Of(machine), pin, input));
+                notifications.Enqueue(new Notification(NotificationKind.Input, ChangeTime(), pin, input));
             }
             var irqInput = Override(padInput, (control[pin] >> 28) & 3);
             if(irqInput != interruptInput[pin])
@@ -612,17 +615,17 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             if(wire != wireLevel[pin])
             {
                 wireLevel[pin] = wire;
-                notifications.Enqueue(new Notification(NotificationKind.Wire, SignalTime.Of(machine), pin, wire));
+                notifications.Enqueue(new Notification(NotificationKind.Wire, ChangeTime(), pin, wire));
             }
             if(driveChanged)
             {
-                notifications.Enqueue(new Notification(NotificationKind.Drive, SignalTime.Of(machine), pin, value, enabled));
+                notifications.Enqueue(new Notification(NotificationKind.Drive, ChangeTime(), pin, value, enabled));
             }
             var pull = PadPull(pin);
             if(pull != publishedPull[pin])
             {
                 publishedPull[pin] = pull;
-                notifications.Enqueue(new Notification(NotificationKind.Pull, SignalTime.Of(machine), pin, pull == true, pull.HasValue));
+                notifications.Enqueue(new Notification(NotificationKind.Pull, ChangeTime(), pin, pull == true, pull.HasValue));
             }
         }
 
@@ -754,5 +757,26 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
         private readonly uint[] edgeInterrupts;
         private readonly uint[,] interruptEnable;
         private readonly uint[,] interruptForce;
+
+        // The time a pad change happened. A CPU's SIO or register write is
+        // made at that CPU's own time, to the instruction, which leads the
+        // machine clock (the slowest core) by up to a quantum. With one chip in the machine its
+        // receivers meet the CPU there (RP2040_PIO's run-ahead); with several,
+        // a change carries the CPU's time, so another chip's PIO sees a short
+        // pulse (a chip select raised and lowered between two frames) with its
+        // width, after the edges that came before it, instead of both of its
+        // edges at the clock value they were reported at.
+        // A change another peripheral delivers carries its own time (SignalTime)
+        // even when a CPU access set off the delivery.
+        private TimeInterval ChangeTime()
+        {
+            if(SignalTime.TryOf(machine, out var delivered)) return delivered;
+            var time = machine.ClockSource.CurrentValue;
+            if(!sharedMachine.HasValue) sharedMachine = machine.GetPeripheralsOfType<RP2_Chip>().Skip(1).Any();
+            var own = sharedMachine.Value ? RP2CpuTime.InitiatorTime(machine) : null;
+            return own.HasValue && own.Value > time ? own.Value : time;
+        }
+
+        private bool? sharedMachine;
     }
 }

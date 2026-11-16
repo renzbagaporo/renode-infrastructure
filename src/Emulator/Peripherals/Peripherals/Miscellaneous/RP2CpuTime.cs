@@ -9,6 +9,7 @@ using System.Linq;
 
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Peripherals.CPU;
+using Antmicro.Renode.Time;
 
 namespace Antmicro.Renode.Peripherals.Miscellaneous
 {
@@ -54,6 +55,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public static void SyncInitiator(IMachine machine)
         {
             if(TryGetInitiator(machine, out var cpu)) cpu.SyncTime();
+        }
+
+        // The time the CPU making the current bus access has reached, to the
+        // instruction (TranslationCPU.OwnElapsedTime); null without one.
+        public static TimeInterval? InitiatorTime(IMachine machine)
+        {
+            if(!TryGetInitiator(machine, out var cpu) || cpu.TimeHandle == null) return null;
+            return cpu is TranslationCPU translation ? translation.OwnElapsedTime : cpu.TimeHandle.TotalElapsedTime;
         }
 
         // The CPU whose own thread issued the current bus access, unless it is
