@@ -25,10 +25,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             receiveFifos = new[] { new Queue<uint>(), new Queue<uint>() };
             fifoErrors = new uint[CoreCount];
             dividers = new Divider[CoreCount];
+            frequency = DefaultFrequency;
             for(var core = 0; core < CoreCount; core++) for(var i = 0; i < 2; i++) interpolators[core, i] = new RP2_Interpolator(i);
             for(var core = 0; core < CoreCount; core++)
             {
-                dividers[core] = new Divider(this, machine, core);
+                dividers[core] = new Divider(this);
             }
             Core0IRQ = new GPIO();
             Core1IRQ = new GPIO();
@@ -45,7 +46,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         public uint ReadDoubleWord(long offset)
         {
-            SynchronizeTime();
+            SynchronizeTime(offset);
             lock(sync)
             {
                 if(IsSpinlockOffset(offset))
@@ -111,7 +112,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         public void WriteDoubleWord(long offset, uint value)
         {
-            SynchronizeTime();
+            SynchronizeTime(offset);
             lock(sync)
             {
                 if(IsSpinlockOffset(offset))
@@ -224,14 +225,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         public ulong Frequency
         {
-            get => dividers[0].Timer.Frequency;
-            set
-            {
-                foreach(var divider in dividers)
-                {
-                    divider.Timer.Frequency = value;
-                }
-            }
+            get => frequency;
+            set => frequency = Math.Max(1ul, value);
         }
 
         public event Action GPIOChanged;
@@ -258,8 +253,15 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             return result;
         }
 
-        private void SynchronizeTime()
+        // Only the GPIO and FIFO registers (0x04-0x58) connect a core to the
+        // rest of the chip at a time of its own: the CPUID, spinlocks,
+        // divider and interpolators are atomic or banked per core, so bringing
+        // the clock up to the accessing core for them only costs time. The
+        // runtime reaches spinlocks and the divider many times per
+        // millisecond (every critical section and every '/' and '%').
+        private void SynchronizeTime(long offset)
         {
+            if(offset < (long)Registers.GPIOInput || offset > (long)Registers.FifoRead) return;
             // Debug port accesses carry a CPU context but run on the SWD wire's thread.
             if(sysbus.TryGetCurrentContextState<CPU.CortexM.ContextState>(out var _, out var state) && state.DebugAccess) return;
             if(sysbus.TryGetCurrentCPU(out var cpu))
@@ -337,6 +339,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private readonly uint[] fifoErrors;
         private readonly Divider[] dividers;
         private readonly object sync = new object();
+        private ulong frequency;
+        private const ulong DefaultFrequency = 125000000;
         private uint spinlocks;
         private uint gpioOutput;
         private uint gpioOutputEnable;
@@ -356,17 +360,22 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private const uint FifoOverflow = 4;
         private const uint FifoUnderflow = 8;
 
+        // The time the access in progress happens at: the accessing core's
+        // own time to the instruction, or the machine's clock for an access
+        // from outside a core's thread.
+        private TimeInterval Now() => RP2CpuTime.InitiatorTime(machine) ?? machine.LocalTimeSource.ElapsedVirtualTime;
+
+        private TimeInterval Cycles(ulong count) => TimeInterval.FromNanoseconds((count * 1000000000ul + frequency - 1) / frequency);
+
         private sealed class Divider
         {
-            public Divider(RP2040_SIO parent, IMachine machine, int core)
+            public Divider(RP2040_SIO parent)
             {
-                Timer = new LimitTimer(machine.ClockSource, 125000000, parent, $"Divider{core}", limit: 8, workMode: WorkMode.OneShot);
+                this.parent = parent;
             }
 
             public void Calculate(bool signed)
             {
-                Timer.Enabled = false;
-                Timer.ResetValue();
                 Dirty = true;
                 if(Divisor == 0)
                 {
@@ -384,27 +393,26 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     Quotient = Dividend / Divisor;
                     Remainder = Dividend % Divisor;
                 }
-                // Result registers are undefined until the eight-cycle operation completes.
-                Timer.Enabled = true;
+                // Result registers are undefined until the eight-cycle operation
+                // completes, counted on the core that started it.
+                readyAt = parent.Now() + parent.Cycles(8);
             }
 
             public void RestoreResult()
             {
-                Timer.Enabled = false;
+                readyAt = TimeInterval.Empty;
                 Dirty = true;
             }
 
             public void Reset()
             {
-                Timer.Reset();
+                readyAt = TimeInterval.Empty;
                 Dividend = 0;
                 Divisor = 0;
                 Quotient = 0;
                 Remainder = 0;
                 Dirty = false;
             }
-
-            public LimitTimer Timer { get; }
 
             public uint Dividend { get; set; }
 
@@ -416,7 +424,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
             public bool Dirty { get; set; }
 
-            public bool Ready => !Timer.Enabled;
+            public bool Ready => readyAt == TimeInterval.Empty || parent.Now() >= readyAt;
+
+            private TimeInterval readyAt;
+            private readonly RP2040_SIO parent;
         }
 
         private enum Registers : long

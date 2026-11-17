@@ -128,7 +128,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private uint Read(long offset, bool mirror)
         {
-            var bank = Bank(mirror, out var core);
+            var bank = Bank(offset, mirror, out var core);
             try
             {
                 lock(sync)
@@ -179,7 +179,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private void Write(long offset, uint value, bool mirror)
         {
-            var bank = Bank(mirror, out var core);
+            var bank = Bank(offset, mirror, out var core);
             try
             {
                 lock(sync)
@@ -236,7 +236,15 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             finally { Publish(); }
         }
 
-        private int Bank(bool mirror, out int core)
+        // Only the GPIO and FIFO registers (0x04-0x58) and the doorbells and
+        // what follows them (0x180 on) connect a core to the rest of the chip
+        // at a time of its own: the CPUID, spinlocks and interpolators are
+        // atomic or banked per core, so bringing the clock up to the
+        // accessing core for them only costs time, and the runtime takes a
+        // spinlock in every critical section.
+        private static bool NeedsTime(long offset) => (offset >= 0x4 && offset <= 0x58) || offset >= 0x180;
+
+        private int Bank(long offset, bool mirror, out int core)
         {
             core = 0;
             var bus = machine.GetSystemBus(this);
@@ -246,7 +254,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             if(bus.TryGetTransactionInitiator(out var initiator) && initiator is ICPU cpu)
             {
                 core = (int)(cpu.MultiprocessingId & 1);
-                if(!debugAccess) cpu.SyncTime();
+                if(!debugAccess && NeedsTime(offset)) cpu.SyncTime();
                 if(cpu is CortexM cortex && cortex.TrustZoneEnabled) secure = cortex.SecureState;
                 if(cpu is RP2350_Hazard3 riscv)
                     secure = bus.TryGetCurrentContextState<RP2350_Hazard3.ContextState>(out var _, out var riscvState)
