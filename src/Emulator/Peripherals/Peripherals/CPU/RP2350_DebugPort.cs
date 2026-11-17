@@ -8,6 +8,7 @@ using System.Threading;
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Peripherals.Bus;
 using Antmicro.Renode.Peripherals.Miscellaneous;
+using Antmicro.Renode.Time;
 
 namespace Antmicro.Renode.Peripherals.CPU
 {
@@ -105,9 +106,14 @@ namespace Antmicro.Renode.Peripherals.CPU
             value = 0;
             if(!accessPort)
             {
-                if(read) value = ReadDP(address);
+                if(read)
+                {
+                    if(address == 12 && busy) return Acknowledgement.Wait;
+                    value = ReadDP(address);
+                }
                 return Acknowledgement.Ok;
             }
+            if(busy) return Acknowledgement.Wait;
             if((control & 0xa2) != 0) return Acknowledgement.Fault;
             var apAddress = ((ulong)select1 << 32) | (select & 0xfffffff0u) | address;
             // The RP-AP is accessible while the switched core debug domain is powered off.
@@ -119,6 +125,11 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
             if(!read) return Acknowledgement.Ok;
             value = readBuffer;
+            if(ClockHeld && ReachesPeripheral(apAddress))
+            {
+                Defer(() => readBuffer = ReadAP(apAddress));
+                return Acknowledgement.Ok;
+            }
             try
             {
                 readBuffer = ReadAP(apAddress);
@@ -153,8 +164,38 @@ namespace Antmicro.Renode.Peripherals.CPU
                 }
                 return;
             }
-            try { WriteAP(((ulong)select1 << 32) | (select & 0xfffffff0u) | address, value); }
+            var target = ((ulong)select1 << 32) | (select & 0xfffffff0u) | address;
+            if(ClockHeld && ReachesPeripheral(target))
+            {
+                Defer(() => WriteAP(target, value));
+                return;
+            }
+            try { WriteAP(target, value); }
             catch(AccessFault) { control |= 0x20; }
+        }
+
+        // A transfer made while this thread holds the machine clock's lock
+        // (a harness PIO's SWD edge arrives from a timer handler) must not
+        // reach the bus there: a target peripheral's access lock may be held
+        // by a CPU that is itself waiting for the clock, and the machine would
+        // deadlock. Such an access runs at the next synchronized state
+        // instead, and until it has run the AP answers WAIT, as a busy AP
+        // does; probes retry on WAIT.
+        // The core MEM-APs sit at 0x2000 and 0x4000 (ReadAP).
+        private bool ReachesPeripheral(ulong apAddress) =>
+            apAddress >= 0x1000 && apAddress < 0x80000 && aps[apAddress >= 0x4000 ? 1 : 0].ReachesPeripheral((uint)(apAddress & 0xfff));
+
+        private bool ClockHeld => (machine.ClockSource as BaseClockSource)?.HeldByCurrentThread == true;
+
+        private void Defer(Action access)
+        {
+            busy = true;
+            machine.LocalTimeSource.ExecuteInNearestSyncedState(_ =>
+            {
+                try { access(); }
+                catch(AccessFault) { control |= 0x20; }
+                finally { busy = false; }
+            });
         }
 
         protected override void WriteParityError()
@@ -277,6 +318,18 @@ namespace Antmicro.Renode.Peripherals.CPU
 
             public void Reset() { csw = 0x0b800052; tar = 0; }
 
+            // Whether the access a DRW or banked-data offset makes reaches a
+            // peripheral rather than memory (see ClockHeld in the port).
+            public bool ReachesPeripheral(uint offset)
+            {
+                uint address;
+                if(offset == 0x0c) address = tar;
+                else if(offset >= 0x10 && offset <= 0x1c) address = (tar & ~0xfu) | (offset & 0xc);
+                else return false;
+                var peripheral = bus.WhatPeripheralIsAt(address, cpu, TransactionState);
+                return peripheral != null && !(peripheral is IMemory);
+            }
+
             public uint Read(uint offset)
             {
                 switch(offset)
@@ -378,6 +431,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         private readonly CortexM[] cores;
         private readonly MemoryAccessPort[] aps;
         private uint select, select1, control, readBuffer, rpControl, powerOverride;
+        private volatile bool busy;
         private bool appliedRunHold;
         private bool appliedRescueHold;
     }

@@ -108,13 +108,23 @@ namespace Antmicro.Renode.Peripherals.CPU
             value = 0;
             if(!accessPort)
             {
-                if(read) value = ReadDP(port, address);
+                if(read)
+                {
+                    if(address == 12 && port.Busy) return Acknowledgement.Wait;
+                    value = ReadDP(port, address);
+                }
                 return Acknowledgement.Ok;
             }
+            if(port.Busy) return Acknowledgement.Wait;
             if((port.Control & 0xa2) != 0) return Acknowledgement.Fault;
             if((port.Control & 0x20000000) == 0) return Acknowledgement.Wait;
             if(!read) return Acknowledgement.Ok;
             value = port.ReadBuffer;
+            if(ClockHeld && ReachesPeripheral(port, address))
+            {
+                Defer(port, () => port.ReadBuffer = ReadAP(port, address), "read", address);
+                return Acknowledgement.Ok;
+            }
             try
             {
                 port.ReadBuffer = ReadAP(port, address);
@@ -144,12 +154,44 @@ namespace Antmicro.Renode.Peripherals.CPU
                 else if(address == 4 && (port.Select & 0xf) == 0) WriteControl(port, value);
                 return;
             }
+            if(ClockHeld && ReachesPeripheral(port, address))
+            {
+                Defer(port, () => WriteAP(port, address, value), "write", address);
+                return;
+            }
             try { WriteAP(port, address, value); }
             catch(AccessFault fault)
             {
                 this.Log(LogLevel.Debug, "Core {0} AP write of 0x{1:X2} faulted: {2}", port.Instance, (port.Select & 0xf0) | address, fault.Message);
                 port.Control |= 0x20;
             }
+        }
+
+        // A transfer made while this thread holds the machine clock's lock
+        // (a harness PIO's SWD edge arrives from a timer handler) must not
+        // reach the bus there: a target peripheral's access lock may be held
+        // by a CPU that is itself waiting for the clock, and the machine would
+        // deadlock. Such an access runs at the next synchronized state
+        // instead, and until it has run the AP answers WAIT, as a busy AP
+        // does; probes retry on WAIT.
+        private static bool ReachesPeripheral(Port port, byte address) =>
+            port.AccessPort != null && (port.Select >> 24) == 0 && port.AccessPort.ReachesPeripheral((port.Select & 0xf0) | address);
+
+        private bool ClockHeld => (machine.ClockSource as Antmicro.Renode.Time.BaseClockSource)?.HeldByCurrentThread == true;
+
+        private void Defer(Port port, Action access, string kind, byte address)
+        {
+            port.Busy = true;
+            machine.LocalTimeSource.ExecuteInNearestSyncedState(_ =>
+            {
+                try { access(); }
+                catch(AccessFault fault)
+                {
+                    this.Log(LogLevel.Debug, "Core {0} AP {1} of 0x{2:X2} faulted: {3}", port.Instance, kind, (port.Select & 0xf0) | address, fault.Message);
+                    port.Control |= 0x20;
+                }
+                finally { port.Busy = false; }
+            });
         }
 
         protected override void WriteParityError()
@@ -233,6 +275,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             public readonly int Instance;
             public readonly MemoryAccessPort AccessPort;
             public uint Select, Control, ReadBuffer;
+            public volatile bool Busy;
         }
 
         // The Cortex-M0+ AHB-AP: CSW, TAR, DRW, banked data, BASE and IDR.
@@ -245,6 +288,18 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
 
             public void Reset() { csw = 0x03000052; tar = 0; }
+
+            // Whether the access a DRW or banked-data offset makes reaches a
+            // peripheral rather than memory (see ClockHeld in the port).
+            public bool ReachesPeripheral(uint offset)
+            {
+                uint address;
+                if(offset == 0x0c) address = tar;
+                else if(offset >= 0x10 && offset <= 0x1c) address = (tar & ~0xfu) | (offset & 0xc);
+                else return false;
+                var peripheral = bus.WhatPeripheralIsAt(address, cpu, TransactionState);
+                return peripheral != null && !(peripheral is IMemory);
+            }
 
             public uint Read(uint offset)
             {

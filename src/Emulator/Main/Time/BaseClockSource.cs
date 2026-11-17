@@ -30,6 +30,10 @@ namespace Antmicro.Renode.Time
             updateAlreadyInProgress = new ThreadLocal<bool>();
         }
 
+        // Whether this thread holds the clock's lock: inside an update (its
+        // handlers run under it) or an ExecuteInLock action.
+        public bool HeldByCurrentThread => Monitor.IsEntered(sync);
+
         public virtual void ExecuteInLock(Action action)
         {
             lock(sync)
