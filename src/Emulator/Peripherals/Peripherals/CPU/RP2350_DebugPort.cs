@@ -51,6 +51,11 @@ namespace Antmicro.Renode.Peripherals.CPU
             else machine.RequestReset();
         }
 
+        protected override void AssertTarget()
+        {
+            machine.LocalTimeSource.ExecuteInNearestSyncedState(_ => ApplyRunHold());
+        }
+
         protected override void ReleaseTarget()
         {
             // A release can overtake a queued reset, or be followed by another

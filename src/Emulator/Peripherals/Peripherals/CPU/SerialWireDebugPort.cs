@@ -59,6 +59,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         public void OnGPIO(int number, bool value)
         {
             var releaseTarget = false;
+            var assertTarget = false;
             lock(sync)
             {
                 switch(number)
@@ -69,6 +70,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                     if(!value && !resetAsserted)
                     {
                         resetAsserted = true;
+                        assertTarget = true;
                         ResetProtocol(true);
                     }
                     else if(value && resetAsserted)
@@ -85,6 +87,7 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
             // Physical release is independent of accepted protocol work and
             // must never invoke a target callback while owning the monitor.
+            if(assertTarget) AssertTarget();
             if(releaseTarget) ReleaseTarget();
             ProcessPending();
         }
@@ -205,6 +208,9 @@ namespace Antmicro.Renode.Peripherals.CPU
         protected virtual void LineReset() { }
         protected virtual void ResetTarget() { }
         protected virtual void ReleaseTarget() { }
+        // RUN fell: the chip is held from now on, as silicon holds it, even
+        // before the queued target reset (ResetTarget) has been taken.
+        protected virtual void AssertTarget() { }
         protected bool ResetPinAsserted
         {
             get { lock(sync) return resetAsserted; }
