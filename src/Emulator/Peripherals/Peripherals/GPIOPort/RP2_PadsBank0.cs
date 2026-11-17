@@ -32,7 +32,7 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
                     // ISO belongs to the switched-domain isolation control and
                     // is retained across the PADS APB register-block reset.
                     pads[pin] = rp2350 && ResetHeld ? (reset & ~0x100u) | (pads[pin] & 0x100u) : reset;
-                    if(rp2350 && !ResetHeld)
+                    if(rp2350 && !ResetHeld && !retainIsolation)
                     {
                         gpio.ResetPadConfiguration(pin, pads[pin]);
                     }
@@ -42,8 +42,32 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
                     }
                 }
             }
+            retainIsolation = false;
             gpio.PublishPending();
         }
+
+        // The RP2350's isolation latches are in the always-on domain. A reset
+        // of the switched core only (POWMAN's DBG_POW_OVRD reset, the
+        // watchdog's, a power-down, the rescue restart) leaves them, and its
+        // ISO=1 reset value latches each pad as it is driven at that moment,
+        // until software clears ISO; power-on, brown-out and RUN clear them.
+        // Called before such a reset, while the pins are still driven.
+        public void IsolateForSwitchedCoreReset()
+        {
+            if(!rp2350) return;
+            lock(SyncRoot)
+            {
+                for(var pin = 0; pin < pads.Length; pin++)
+                {
+                    pads[pin] |= 0x100u;
+                    gpio.SetPadConfiguration(pin, pads[pin]);
+                }
+                retainIsolation = true;
+            }
+            gpio.PublishPending();
+        }
+
+        private bool retainIsolation;
 
         protected override object SyncRoot => gpio.SynchronizationRoot;
 

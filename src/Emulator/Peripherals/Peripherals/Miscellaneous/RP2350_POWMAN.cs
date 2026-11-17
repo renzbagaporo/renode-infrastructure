@@ -150,7 +150,17 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             var retained = new List<IPeripheral> { this, debugPort, watchdog };
             retained.AddRange(RP2_Chip.OtherChips(machine, this));
             retained.AddRange(machine.GetRegisteredPeripherals().Select(entry => entry.Peripheral).OfType<WinbondW25QFlash>());
-            machine.RequestResetInSafeState(unresetable: retained);
+            // A watchdog reset of the switched core alone keeps the pads'
+            // isolation latches; one that resets POWMAN clears them.
+            machine.RequestResetInSafeState(postReset: null, unresetable: retained, runRegisteredResetEvents: false,
+                preReset: (selected & 0x11) == 0 ? (Action)IsolatePads : null);
+        }
+
+        // Latch every pad of this chip as it is driven before a reset of the
+        // switched core only (RP2_PadsBank0.IsolateForSwitchedCoreReset).
+        private void IsolatePads()
+        {
+            foreach(var pads in RP2_Chip.Own<RP2_PadsBank0>(machine, this)) pads.IsolateForSwitchedCoreReset();
         }
 
         protected override uint ReadRegister(long offset)
@@ -430,6 +440,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             var sleepState = powerState & 0xf;
             machine.RequestResetInSafeState(postReset: ApplyRescueHold, unresetable: retained, runRegisteredResetEvents: true, preReset: () =>
             {
+                IsolatePads();
                 var wake = sleepState & ~SwitchedCoreOff;
                 // HW_PWRUP_SRAMx clear means OFF -> ON across the wakeup.
                 if((sequencerConfiguration & 2) == 0) wake &= ~2u;
@@ -508,6 +519,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             retained.AddRange(machine.GetRegisteredPeripherals().Select(entry => entry.Peripheral).OfType<WinbondW25QFlash>());
             machine.RequestResetInSafeState(postReset: ApplyRescueHold, unresetable: retained, runRegisteredResetEvents: false, preReset: () =>
             {
+                IsolatePads();
                 ApplyRescueHold();
                 var retainedScratch = (uint[])scratch.Clone();
                 var retainedDoubleTap = chipReset & 1;
@@ -559,6 +571,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 ApplyRescueHold();
             }, unresetable: retained, runRegisteredResetEvents: true, preReset: () =>
             {
+                IsolatePads();
                 var poweredDown = (powerState & 0xf) != 0;
                 Reset();
                 // Restores the domains POWMAN switched off, and only those

@@ -83,7 +83,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     .Where(peripheral => peripheral is RP2350_DebugPort || peripheral is RP2350_POWMAN
                         || peripheral is WinbondW25QFlash || peripheral == watchdog
                         || peripheral == ArchitectureSelector).Concat(RP2_Chip.OtherChips(machine, this)).Distinct().ToList();
-                machine.RequestResetInSafeState(unresetable: retained);
+                machine.RequestResetInSafeState(postReset: null, unresetable: retained, runRegisteredResetEvents: false,
+                    preReset: () => { foreach(var pads in RP2_Chip.Own<GPIOPort.RP2_PadsBank0>(machine, this)) pads.IsolateForSwitchedCoreReset(); });
                 return;
             }
             machine.LocalTimeSource.ExecuteInNearestSyncedState(_ =>
