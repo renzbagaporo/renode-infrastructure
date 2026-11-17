@@ -266,7 +266,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 instructions[address] = (ushort)ApplyOperation(0, value, operation, 0xffff);
                 foreach(var sm in stateMachines)
                 {
-                    if(sm.CountLoop && sm.PC == address) { MaterializeCountLoop(sm); Schedule(sm, advance: false); }
+                    if(sm.CountLoop && ((address - sm.PC) & 31) < sm.CountLoopSpan) { MaterializeCountLoop(sm); Schedule(sm, advance: false); }
                     if(sm.JumpLoop && sm.PC == address) { ClearExecution(sm); Schedule(sm); }
                 }
                 return;
@@ -550,11 +550,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                                 sm.CountLoopUsesX = usesX;
                                 sm.CountLoopStart = sm.Edge256;
                                 sm.CountLoopValue = counter;
+                                sm.CountLoopFinal = 0;
+                                sm.CountLoopSpan = 1;
                                 sm.CountLoopCycles = 1 + sm.Delay;
                                 sm.Edge256 += (BigInteger)Divider256(sm) * (ulong)sm.CountLoopCycles * counter;
                                 if(usesX) sm.X = 0; else sm.Y = 0;
                             }
                         }
+                        else if(fetched && !forced) TrySkipCompareLoop(sm, pc, instruction);
                         TraceLoop(sm, step, pc, fetched && !forced);
                         Schedule(sm, advance: false);
                     }
@@ -1405,6 +1408,44 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             sm.StickyMask = 0;
         }
 
+        // pico-sdk's pwm.pio counts Y down to the level in X, 3 cycles a pass,
+        // and only the pass that finds them equal drives the pin:
+        //   countloop: jmp x!=y noset
+        //              jmp skip side 1
+        //   noset:     nop
+        //   skip:      jmp y-- countloop
+        // From the jump back, the passes up to that one (or to Y reaching 0,
+        // when the level is above it) touch nothing but Y, so they are skipped
+        // as a counting loop is: Y is left where they end, the machine resumes
+        // at countloop then, and MaterializeCountLoop rebuilds Y for an access
+        // in between. The skipped instructions carry no delay or side-set.
+        private void TrySkipCompareLoop(StateMachine sm, int pc, ushort instruction)
+        {
+            if((instruction & 0xff00) != 0 || ((instruction >> 5) & 7) != 4) return;
+            var loop = instruction & 31;
+            if(sm.PC != loop || pc != ((loop + 3) & 31)) return;
+            var compare = instructions[loop];
+            var set = instructions[(loop + 1) & 31];
+            var skipped = instructions[(loop + 2) & 31];
+            if(compare != (0x00a0 | ((loop + 2) & 31)) || skipped != 0xa042) return;
+            if((set >> 13) != 0 || ((set >> 5) & 7) != 0 || (set & 31) != ((loop + 3) & 31)) return;
+            if(SideCount(sm) != 0 && (sm.ExecControl & (1u << 30)) == 0) return;
+            var wrapTop = (int)((sm.ExecControl >> 12) & 31);
+            if(wrapTop == loop || wrapTop == ((loop + 2) & 31)) return;
+            var y = sm.Y;
+            var passes = sm.X < y ? y - sm.X : y;
+            if(passes < 2) return;
+            sm.CountLoop = true;
+            sm.CountLoopUsesX = false;
+            sm.CountLoopStart = sm.Edge256;
+            sm.CountLoopValue = passes;
+            sm.CountLoopFinal = y - passes;
+            sm.CountLoopSpan = 4;
+            sm.CountLoopCycles = 3;
+            sm.Edge256 += (BigInteger)Divider256(sm) * 3 * passes;
+            sm.Y = y - passes;
+        }
+
         // Restores the exact counter and next edge of a skipped counting loop at the
         // current cycle, before anything outside the machine changes or reads it.
         private void MaterializeCountLoop(StateMachine sm)
@@ -1416,8 +1457,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             var now = (BigInteger)CurrentCycle * 256 + 255;
             BigInteger done = 0;
             if(now >= sm.CountLoopStart) done = BigInteger.Min(sm.CountLoopValue, (now - sm.CountLoopStart) / period + 1);
-            var remaining = (uint)(sm.CountLoopValue - done);
-            if(sm.CountLoopUsesX) sm.X = remaining; else sm.Y = remaining;
+            var counter = sm.CountLoopFinal + (uint)(sm.CountLoopValue - done);
+            if(sm.CountLoopUsesX) sm.X = counter; else sm.Y = counter;
             sm.Edge256 = sm.CountLoopStart + done * period;
         }
 
@@ -1655,8 +1696,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             // A JMP X--/Y-- to itself skipped to its last iteration; see MaterializeCountLoop.
             public bool CountLoop, CountLoopUsesX;
             public BigInteger CountLoopStart;
-            public uint CountLoopValue;
-            public int CountLoopCycles;
+            public uint CountLoopValue, CountLoopFinal;
+            public int CountLoopCycles, CountLoopSpan;
             // A loop pass being traced, or the parked steady pass; see TraceLoop.
             public bool Recording, RecordingBroken, SteadyCandidate, Steady;
             public int LoopHead;

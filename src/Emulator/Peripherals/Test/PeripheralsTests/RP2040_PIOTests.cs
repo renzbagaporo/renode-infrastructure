@@ -736,6 +736,51 @@ namespace Antmicro.Renode.PeripheralsTests
         }
 
         [Test]
+        public void ShouldSkipThePWMCompareLoopWithTheTimingOfEveryCycle()
+        {
+            // pico-examples pio_pwm: the canonical program skips its counting
+            // passes (TrySkipCompareLoop); the same program with its nop written
+            // as mov x, x runs every cycle. Their pin edges must match, across
+            // a level change and a level above the period.
+            var skipped = RunPWM(0xa042);
+            var stepped = RunPWM(0xa021);
+            Assert.Greater(skipped.Count, 6, "The PWM output did not toggle");
+            CollectionAssert.AreEqual(stepped, skipped);
+        }
+
+        private List<string> RunPWM(ushort nop)
+        {
+            machine.Dispose();
+            machine = new Machine();
+            gpio = new RP2_GPIOBank0(machine);
+            pio = new RP2040_PIO(machine, gpio, frequency: 1000000);
+            gpio.WriteDoubleWord(4, 6); // GPIO0 FUNCSEL = PIO0
+            pio.WriteDoubleWord(0xdc, (2u << 29) | (1u << 26)); // PINCTRL: SIDESET_COUNT 2 (opt), SET_COUNT 1, bases 0
+            pio.WriteDoubleWord(0xcc, (1u << 30) | (6u << 12)); // EXECCTRL: SIDE_EN, wrap 0..6
+            Force(0, 0xe081); // set pindirs, 1
+            // pull noblock side 0; mov x, osr; mov y, isr;
+            // countloop: jmp x!=y noset; jmp skip side 1; noset: nop; skip: jmp y-- countloop
+            Load(0x9080, 0xa027, 0xa046, 0x00a5, 0x1806, nop, 0x0083);
+            pio.WriteDoubleWord(0x10, 40); // period
+            Force(0, 0x80a0); // pull block
+            Force(0, 0xa0c7); // mov isr, osr
+            pio.WriteDoubleWord(0x10, 15); // level
+            pio.WriteDoubleWord(0, 1);
+            var edges = new List<string>();
+            var last = false;
+            for(var t = 1; t <= 900; t++)
+            {
+                if(t == 300) pio.WriteDoubleWord(0x10, 33);
+                if(t == 600) pio.WriteDoubleWord(0x10, 70); // above the period: never high
+                Advance(1);
+                GetOutputState(0, out var value, out _);
+                if(value != last) edges.Add($"{t} {value}");
+                last = value;
+            }
+            return edges;
+        }
+
+        [Test]
         public void ShouldExposeTheExactCounterOfAFastForwardedLoopToAnExecutedInstruction()
         {
             gpio.WriteDoubleWord(4, 6);
