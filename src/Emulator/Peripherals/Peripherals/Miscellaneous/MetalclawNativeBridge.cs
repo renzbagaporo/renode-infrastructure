@@ -73,7 +73,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
     // DUT's own drive on them, never the level the peer's actions put on the
     // line, with "z" when the DUT releases the pin:
     //   {"op":"gpio","pin":N,"level":0|1|"z","t_ns":T} -> {}
-    // Any reply may carry "actions", each at its own virtual time no earlier
+    // Any reply, the hello's included, may carry "actions", each at its own virtual time no earlier
     // than the request's, applied then; one at the request's own time is in
     // place before the DUT executes another instruction: {"t_ns":T,"op":"gpio","pin":N,
     // "level":0|1|"z"} drives or releases a DUT pin's input through GPIO, and
@@ -746,6 +746,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 {
                     try
                     {
+                        JsonArray helloActions = null;
                         if(writer == null)
                         {
                             Open();
@@ -753,7 +754,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                             foreach(var kind in buses) hello[kind.Key] = JsonNode.Parse(kind.Value.ToJsonString());
                             writer.Write(hello.ToJsonString() + "\n");
                             writer.Flush();
-                            if(reader.ReadLine() == null) throw new IOException("the peer closed the connection after the hello");
+                            var helloReply = reader.ReadLine();
+                            if(helloReply == null) throw new IOException("the peer closed the connection after the hello");
+                            // Actions in the hello's reply go with the reply of
+                            // the request that opened the connection.
+                            helloActions = (JsonNode.Parse(helloReply) as JsonObject)?["actions"] as JsonArray;
                         }
                         var text = request.ToJsonString();
                         writer.Write(text + "\n");
@@ -761,7 +766,18 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                         var line = reader.ReadLine();
                         if(line == null) throw new IOException("the peer closed the connection");
                         trace?.WriteLine(text + " -> " + line);
-                        return JsonNode.Parse(line) as JsonObject;
+                        var reply = JsonNode.Parse(line) as JsonObject;
+                        if(helloActions != null && helloActions.Count > 0 && reply != null)
+                        {
+                            var actions = new JsonArray();
+                            foreach(var action in helloActions) actions.Add(action?.DeepClone());
+                            if(reply["actions"] is JsonArray own)
+                            {
+                                foreach(var action in own) actions.Add(action?.DeepClone());
+                            }
+                            reply["actions"] = actions;
+                        }
+                        return reply;
                     }
                     // Any failure to reach the peer (a refused or over-long socket
                     // path among them) leaves it absent rather than ending Renode.
