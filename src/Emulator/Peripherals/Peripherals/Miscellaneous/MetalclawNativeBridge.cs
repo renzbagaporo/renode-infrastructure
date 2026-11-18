@@ -39,7 +39,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
     //   {"op":"i2c","bus":B,"ev":"stop","t_ns":T}                                -> {}
     // A tick every TickMicroseconds of virtual time ({"op":"tick","t_ns":T}
     // -> {}) keeps the peer's clock moving while the buses are idle; 0 turns
-    // it off. Bridges naming the same socket share one connection, so a DUT
+    // it off. A ticking bridge with the DUT's GPIO bank also reports where
+    // the DUT's I2C, SPI and UART blocks are routed, from GPIO_CTRL.FUNCSEL,
+    // first and whenever it changes, so a part that speaks first (a GPS on a
+    // UART) is found on its pins:
+    //   {"op":"route","i2c":[{"bus":0,"sda":4,"scl":5}],"spi":[{"bus":0,
+    //    "sck":18,"mosi":19,"miso":16}],"uart":[{"port":1,"tx":4,"rx":5}],"t_ns":T} -> {} Bridges naming the same socket share one connection, so a DUT
     // with several buses has one bridge per bus, one of them ticking.
     // With a UART the bridge forwards each byte the DUT transmits,
     //   {"op":"uart","port":P,"data":[D],"t_ns":T} -> {}
@@ -125,7 +130,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
                 tick = new LimitTimer(machine.ClockSource, 1000000, this, "native tick", limit: tickMicroseconds,
                     workMode: WorkMode.Periodic, enabled: true, eventEnabled: true);
-                tick.LimitReached += () => Request(new JsonObject { ["op"] = "tick" });
+                tick.LimitReached += () =>
+                {
+                    ReportRouting();
+                    Request(new JsonObject { ["op"] = "tick" });
+                };
             }
         }
 
@@ -341,11 +350,48 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private enum PinState { Idle, Address, Write, Read, Ignore }
 
+        private string lastRouting;
         private PinState pinState;
         private int pinSda = -1, pinScl = -1, pinBits;
         private byte pinShift, pinOut;
         private bool dutSdaLow, ownSdaLow, lastSda = true, lastScl = true;
         private bool pinRepeated, pinAcknowledging, pinControllerAcknowledged, pinReadNext;
+
+        // Sends the blocks' routing when it differs from the last sent.
+        private void ReportRouting()
+        {
+            if(gpio == null) return;
+            var route = new JsonObject
+            {
+                ["op"] = "route",
+                ["i2c"] = Routes(I2CFunction, 2, "bus", pin => (pin / 2) % 2, pin => pin % 2 == 0 ? "sda" : "scl"),
+                ["spi"] = Routes(SPIFunction, 2, "bus", pin => (pin / 8) % 2,
+                    pin => pin % 4 == 0 ? "miso" : pin % 4 == 2 ? "sck" : pin % 4 == 3 ? "mosi" : null),
+                ["uart"] = Routes(UARTFunction, 2, "port", pin => ((pin + 4) / 8) % 2, pin => pin % 4 == 0 ? "tx" : pin % 4 == 1 ? "rx" : null),
+            };
+            var text = route.ToJsonString();
+            if(text == lastRouting) return;
+            lastRouting = text;
+            Request(route);
+        }
+
+        // Each routed block of a function with its pins, the first in each role.
+        private JsonArray Routes(int function, int blocks, string key, Func<int, int> blockOf, Func<int, string> role)
+        {
+            var routes = new JsonArray();
+            for(var block = 0; block < blocks; block++)
+            {
+                var entry = new JsonObject { [key] = block };
+                for(var pin = 0; pin < MaximumPins; pin++)
+                {
+                    if(gpio.GetFunction(pin) != function || blockOf(pin) != block) continue;
+                    var name = role(pin);
+                    if(name != null && !entry.ContainsKey(name)) entry[name] = pin;
+                }
+                if(entry.Count > 1) routes.Add(entry);
+            }
+            return routes;
+        }
 
         // The first pin routed to this block in each role, from FUNCSEL.
         private void AddRoutedPins(JsonObject request, int function, Func<int, bool> ofThisBlock, Func<int, string> role)
