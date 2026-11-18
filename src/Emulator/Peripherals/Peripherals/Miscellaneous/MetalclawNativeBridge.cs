@@ -565,7 +565,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                         if(line == null) throw new IOException("the peer closed the connection");
                         return JsonNode.Parse(line) as JsonObject;
                     }
-                    catch(Exception e) when(e is IOException || e is SocketException || e is System.Text.Json.JsonException)
+                    // Any failure to reach the peer (a refused or over-long socket
+                    // path among them) leaves it absent rather than ending Renode.
+                    catch(Exception e) when(!(e is OutOfMemoryException))
                     {
                         error = e.Message;
                         Close();
