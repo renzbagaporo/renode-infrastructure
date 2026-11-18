@@ -12,6 +12,7 @@ using Antmicro.Renode.Core;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.CPU;
 using Antmicro.Renode.Peripherals.GPIOPort;
+using Antmicro.Renode.Peripherals.Miscellaneous;
 using Antmicro.Renode.Peripherals.Timers;
 using Antmicro.Renode.Time;
 
@@ -168,9 +169,24 @@ namespace Antmicro.Renode.Peripherals.UART
 
         protected override IClockSource AccessClock => machine.ClockSource;
 
-        protected override void OnBeforeAccess() => SynchronizeTime();
+        // A register access is made at the accessing CPU's time, which leads
+        // the machine clock with several chips in one machine. The line changes
+        // the access makes carry that time, as the CPU's own pad changes do
+        // (RP2_GPIOBank0), so a start bit written right after GPIO_FUNCSEL
+        // hands the pad to the UART follows that edge instead of landing
+        // before it.
+        protected override void OnBeforeAccess()
+        {
+            SynchronizeTime();
+            accessTime = RP2CpuTime.InitiatorTime(machine);
+            accessThread = Environment.CurrentManagedThreadId;
+        }
 
-        protected override void OnAccessCompleted() => PublishPending();
+        protected override void OnAccessCompleted()
+        {
+            accessTime = null;
+            PublishPending();
+        }
 
         protected override void OnResetHeldChanged()
         {
@@ -332,6 +348,15 @@ namespace Antmicro.Renode.Peripherals.UART
             }
         }
 
+        // The time of a change made now: the accessing CPU's, during a register
+        // access on its own thread; the machine clock's otherwise, as in a
+        // timer handler.
+        private TimeInterval AccessOrClockTime()
+        {
+            var now = machine.ClockSource.CurrentValue;
+            return accessTime.HasValue && accessThread == Environment.CurrentManagedThreadId && accessTime.Value > now ? accessTime.Value : now;
+        }
+
         private bool[] FrameLevels(byte value)
         {
             var levels = new List<bool> { false };
@@ -384,7 +409,8 @@ namespace Antmicro.Renode.Peripherals.UART
         {
             if(txLevel == level) return;
             txLevel = level;
-            notifications.Enqueue(new Notification(TransmitLine, level ? 1 : 0, generation, machine.ClockSource.CurrentValue));
+            var time = AccessOrClockTime();
+            notifications.Enqueue(new Notification(TransmitLine, level ? 1 : 0, generation, time));
         }
 
         private void OnPinInput(int pin, bool level)
@@ -778,6 +804,8 @@ namespace Antmicro.Renode.Peripherals.UART
         private readonly Dictionary<int, bool> rxLevels;
         private readonly Dictionary<int, List<(TimeInterval, bool)>> receiveEdges = new Dictionary<int, List<(TimeInterval, bool)>>();
         private readonly List<TimeInterval> frameSamples = new List<TimeInterval>();
+        private TimeInterval? accessTime;
+        private int accessThread;
         private readonly LimitTimer bitTimer;
         private readonly LimitTimer sampleTimer;
         private bool[] frameLevels;
