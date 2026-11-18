@@ -49,7 +49,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
     // and is named in the hello by the DUT's SCK, MOSI, MISO and CS pins.
     // With the DUT's GPIO bank given, each frame and each I2C START also
     // names the pins the block is routed to now, as "pins":{"sck":N,
-    // "mosi":N,"miso":N} or "pins":{"sda":N,"scl":N}, read from
+    // "mosi":N,"miso":N} or "pins":{"sda":N,"scl":N}, and each UART byte as
+    // "pins":{"tx":N,"rx":N}, read from
     // GPIO_CTRL.FUNCSEL, since a program may route a block to other pins
     // than the hello's.
     // Watched pins (an SPI bridge's CS, and any a {"op":"watch","pin":N} or
@@ -81,7 +82,15 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             if(uart != null)
             {
                 connection.Register("uart", new JsonObject { ["port"] = bus, ["tx"] = uartTx, ["rx"] = uartRx });
-                uart.CharReceived += value => Request(new JsonObject { ["op"] = "uart", ["port"] = busIndex, ["data"] = new JsonArray(value) });
+                uart.CharReceived += value =>
+                {
+                    var request = new JsonObject { ["op"] = "uart", ["port"] = busIndex, ["data"] = new JsonArray(value) };
+                    // RP2040 UART function: TX on pin % 4 == 0, RX on 1, in
+                    // groups of four that alternate UART0, UART1, UART1, UART0.
+                    AddRoutedPins(request, UARTFunction, pin => ((pin + 4) / 8) % 2 == busIndex,
+                        pin => pin % 4 == 0 ? "tx" : pin % 4 == 1 ? "rx" : null);
+                    Request(request);
+                };
             }
             if(spi != null)
             {
@@ -255,6 +264,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         }
 
         private const int SPIFunction = 1;
+        private const int UARTFunction = 2;
         private const int I2CFunction = 3;
         private const int MaximumPins = 48;
 
