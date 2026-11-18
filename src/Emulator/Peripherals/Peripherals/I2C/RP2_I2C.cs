@@ -47,7 +47,8 @@ namespace Antmicro.Renode.Peripherals.I2C
             phaseTimer.LimitReached += OnPhaseElapsed;
             if(clocks != null) clocks.ClockChanged += OnClockChanged;
             if(this.gpio != null) pins = new RP2_I2CPins(machine, this, this.gpio, index, () => Math.Max(1ul, BitCycles / 2),
-                () => Math.Max(1ul, sdaHold & 0xffff), () => Frequency, () => TargetMode && bus == null);
+                () => Math.Max(1ul, sdaHold & 0xffff), () => Frequency, () => TargetMode && bus == null,
+                () => spikeLength);
             Reset();
         }
 

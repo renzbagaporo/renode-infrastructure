@@ -35,9 +35,11 @@ namespace Antmicro.Renode.Peripherals.I2C
     internal sealed class RP2_I2CPins : IDelayedI2CBusEndpoint
     {
         public RP2_I2CPins(IMachine machine, IDelayedI2CBusEndpoint owner, RP2_GPIOBank0 gpio, int index,
-            Func<ulong> halfPeriodCycles, Func<ulong> holdCycles, Func<ulong> frequency, Func<bool> targetMode)
+            Func<ulong> halfPeriodCycles, Func<ulong> holdCycles, Func<ulong> frequency, Func<bool> targetMode, Func<ulong> spikeCycles)
         {
+            this.spikeCycles = spikeCycles;
             this.holdCycles = holdCycles;
+            this.machine = machine;
             this.owner = owner;
             this.gpio = gpio;
             this.index = index;
@@ -47,6 +49,9 @@ namespace Antmicro.Renode.Peripherals.I2C
             timer = new LimitTimer(machine.ClockSource, Math.Max(1ul, frequency()), this, "I2C pins",
                 limit: 1, workMode: WorkMode.OneShot, eventEnabled: true);
             timer.LimitReached += OnStep;
+            filter = new LimitTimer(machine.ClockSource, Math.Max(1ul, frequency()), this, "I2C spike filter",
+                limit: 1, workMode: WorkMode.OneShot, eventEnabled: true);
+            filter.LimitReached += OnFiltered;
             gpio.InputChanged += OnInput;
         }
 
@@ -59,6 +64,10 @@ namespace Antmicro.Renode.Peripherals.I2C
             lock(sync)
             {
                 timer.Enabled = false;
+                filter.Enabled = false;
+                pendingInputs.Clear();
+                answers.Clear();
+                filteredSda = filteredScl = true;
                 ops.Clear();
                 waitingForScl = false;
                 highPhase = false;
@@ -85,6 +94,10 @@ namespace Antmicro.Renode.Peripherals.I2C
         }
 
         // The owner's events: a controller's requests or a target's answers.
+        // A register access makes them, at the accessing CPU's time, which
+        // leads the clock the block's own timing runs on; the block acts on
+        // them at its next ic_clk cycle, so every pad change it makes is on
+        // that clock and keeps its order against the ones before and after.
         public void OnBusEvent(I2CBusEvent busEvent)
         {
             lock(sync)
@@ -97,12 +110,13 @@ namespace Antmicro.Renode.Peripherals.I2C
                 case I2CBusEventType.Write: QueueWrite(busEvent); break;
                 case I2CBusEventType.Read: QueueRead(busEvent); break;
                 case I2CBusEventType.Stop: QueueStop(); break;
-                case I2CBusEventType.Acknowledge: TargetAcknowledge(busEvent.Acknowledged); break;
-                case I2CBusEventType.Data: TargetData(busEvent.Data); break;
+                case I2CBusEventType.Acknowledge:
+                case I2CBusEventType.Data:
+                    answers.Enqueue(busEvent);
+                    break;
                 }
-                if(!timer.Enabled && !waitingForScl) RunOps();
+                if(!timer.Enabled && !waitingForScl) Schedule(1);
             }
-            Flush();
         }
 
         // Controller -----------------------------------------------------
@@ -223,6 +237,12 @@ namespace Antmicro.Renode.Peripherals.I2C
         {
             lock(sync)
             {
+                while(answers.Count != 0)
+                {
+                    var answer = answers.Dequeue();
+                    if(answer.Type == I2CBusEventType.Acknowledge) TargetAcknowledge(answer.Acknowledged);
+                    else TargetData(answer.Data);
+                }
                 highPhase = false;
                 RunOps();
             }
@@ -283,39 +303,80 @@ namespace Antmicro.Renode.Peripherals.I2C
 
         // Target ---------------------------------------------------------
 
+        // The pads reach the block through its spike suppression (IC_FS_SPKLEN):
+        // a change is taken SPKLEN ic_clk cycles after it, and a pulse shorter
+        // than that, a change undone before it is taken, never is.
         private void OnInput(int pin, bool level)
         {
             lock(sync)
             {
                 FindPins(out var sda, out var scl);
                 if(sda < 0 || (pin != sda && pin != scl)) return;
-                sdaPin = sda;
-                sclPin = scl;
-                if(pin == scl)
+                var undone = -1;
+                for(var i = pendingInputs.Count - 1; i >= 0; i--)
                 {
-                    if(highPhase && !level && !sclLow)
-                    {
-                        // Held low again before the high time ended.
-                        timer.Enabled = false;
-                        highPhase = false;
-                        PushFront(Op.WaitHigh());
-                        PushFront(Op.WaitScl());
-                        waitingForScl = true;
-                    }
-                    else if(waitingForScl && level)
-                    {
-                        waitingForScl = false;
-                        RunOps();
-                    }
-                    if(!controllerHolding && targetMode()) OnTargetClock(level);
+                    if(pendingInputs[i].Pin != pin) continue;
+                    if(pendingInputs[i].Level != level) undone = i;
+                    break;
                 }
-                else if(!controllerHolding && targetMode() && Level(sclPin))
+                if(undone >= 0) pendingInputs.RemoveAt(undone);
+                else pendingInputs.Add((pin, level));
+                if(pendingInputs.Count == 0) filter.Enabled = false;
+                else if(!filter.Enabled)
                 {
-                    if(!level) OnTargetStart();
-                    else OnTargetStop();
+                    filter.Frequency = Math.Max(1ul, frequency());
+                    filter.Limit = Math.Max(1ul, spikeCycles());
+                    filter.ResetValue();
+                    filter.Enabled = true;
                 }
             }
+        }
+
+        private void OnFiltered()
+        {
+            lock(sync)
+            {
+                filter.Enabled = false;
+                var taken = pendingInputs.ToArray();
+                pendingInputs.Clear();
+                foreach(var input in taken) TakeInput(input.Pin, input.Level);
+            }
             Flush();
+        }
+
+        private void TakeInput(int pin, bool level)
+        {
+            FindPins(out var sda, out var scl);
+            if(sda < 0 || (pin != sda && pin != scl)) return;
+            sdaPin = sda;
+            sclPin = scl;
+            // START, STOP and data bits are told from the filtered lines,
+            // which the filter delays alike, so their order holds.
+            if(pin == scl) filteredScl = level;
+            else filteredSda = level;
+            if(pin == scl)
+            {
+                if(highPhase && !level && !sclLow)
+                {
+                    // Held low again before the high time ended.
+                    timer.Enabled = false;
+                    highPhase = false;
+                    PushFront(Op.WaitHigh());
+                    PushFront(Op.WaitScl());
+                    waitingForScl = true;
+                }
+                else if(waitingForScl && level)
+                {
+                    waitingForScl = false;
+                    RunOps();
+                }
+                if(!controllerHolding && targetMode()) OnTargetClock(level);
+            }
+            else if(!controllerHolding && targetMode() && filteredScl)
+            {
+                if(!level) OnTargetStart();
+                else OnTargetStop();
+            }
         }
 
         private void OnTargetStart()
@@ -343,7 +404,7 @@ namespace Antmicro.Renode.Peripherals.I2C
             case TargetState.Receive:
                 if(rising)
                 {
-                    shift = (byte)((shift << 1) | (Level(sdaPin) ? 1 : 0));
+                    shift = (byte)((shift << 1) | (filteredSda ? 1 : 0));
                     bits++;
                 }
                 else if(bits == 8)
@@ -379,7 +440,7 @@ namespace Antmicro.Renode.Peripherals.I2C
                 }
                 break;
             case TargetState.ControllerAcknowledge:
-                if(rising) controllerAcknowledged = !Level(sdaPin);
+                if(rising) controllerAcknowledged = !filteredSda;
                 else if(controllerAcknowledged) RequestRead();
                 else state = TargetState.Ignore;
                 break;
@@ -435,7 +496,15 @@ namespace Antmicro.Renode.Peripherals.I2C
             if(pin < 0) return;
             if(pin == sdaPin) sdaLow = !high;
             else sclLow = !high;
-            actions.Enqueue(() => gpio.SetPeripheralOutput(I2CFunction, pin, false, !high));
+            // The block's pad changes all come from its clock handlers, which may
+            // run inside a CPU access that synced the clock forward; each takes
+            // the clock's time, not that CPU's, so two changes a hold time apart
+            // keep their gap and none goes ahead of the clock.
+            var at = machine.ClockSource.CurrentValue;
+            actions.Enqueue(() =>
+            {
+                using(SignalTime.At(machine, at)) gpio.SetPeripheralOutput(I2CFunction, pin, false, !high);
+            });
         }
 
         private void Release()
@@ -476,6 +545,7 @@ namespace Antmicro.Renode.Peripherals.I2C
             }
         }
 
+        private readonly IMachine machine;
         private readonly IDelayedI2CBusEndpoint owner;
         private readonly RP2_GPIOBank0 gpio;
         private readonly int index;
@@ -484,12 +554,17 @@ namespace Antmicro.Renode.Peripherals.I2C
         private readonly Func<ulong> frequency;
         private readonly Func<bool> targetMode;
         private readonly LimitTimer timer;
+        private readonly LimitTimer filter;
+        private readonly Func<ulong> spikeCycles;
+        private readonly List<(int Pin, bool Level)> pendingInputs = new List<(int Pin, bool Level)>();
         private readonly Queue<Op> ops = new Queue<Op>();
         private readonly Queue<Action> actions = new Queue<Action>();
+        private readonly Queue<I2CBusEvent> answers = new Queue<I2CBusEvent>();
         private readonly object sync = new object();
         private int sdaPin = -1, sclPin = -1;
         private bool sdaLow, sclLow, waitingForScl, highPhase, holdPending, readPending, controllerHolding, acknowledgeSample, flushing;
         private bool repeated, readTransfer, acknowledgedLast, controllerAcknowledged;
+        private bool filteredSda = true, filteredScl = true;
         private TargetState state;
         private ulong transfer;
         private int bits;
