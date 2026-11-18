@@ -114,10 +114,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 uart.CharReceived += value =>
                 {
                     var request = new JsonObject { ["op"] = "uart", ["port"] = busIndex, ["data"] = new JsonArray(value) };
-                    // RP2040 UART function: TX on pin % 4 == 0, RX on 1, in
-                    // groups of four that alternate UART0, UART1, UART1, UART0.
-                    AddRoutedPins(request, UARTFunction, pin => ((pin + 4) / 8) % 2 == busIndex,
-                        pin => pin % 4 == 0 ? "tx" : pin % 4 == 1 ? "rx" : null);
+                    // UART pins come in groups of four that alternate UART0,
+                    // UART1, UART1, UART0 (UARTRole).
+                    AddRoutedPins(request, UARTFunctions, pin => ((pin + 4) / 8) % 2 == busIndex, UARTRole);
                     Request(request);
                 };
             }
@@ -127,7 +126,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 spi.FrameTarget = (mosi, bits, at) =>
                 {
                     var request = new JsonObject { ["op"] = "spi", ["bus"] = busIndex, ["mosi"] = mosi, ["bits"] = bits };
-                    AddRoutedPins(request, SPIFunction, pin => (pin / 8) % 2 == busIndex,
+                    AddRoutedPins(request, new[] { SPIFunction }, pin => (pin / 8) % 2 == busIndex,
                         pin => pin % 4 == 0 ? "miso" : pin % 4 == 2 ? "sck" : pin % 4 == 3 ? "mosi" : null);
                     var reply = Request(request, at);
                     return (ushort)(reply?["miso"]?.GetValue<int>() ?? 0xffff);
@@ -222,7 +221,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 request["addr"] = busEvent.Address;
                 request["read"] = busEvent.IsRead;
                 request["repeated"] = busEvent.Repeated;
-                AddRoutedPins(request, I2CFunction, pin => (pin / 2) % 2 == busIndex, pin => pin % 2 == 0 ? "sda" : "scl");
+                AddRoutedPins(request, new[] { I2CFunction }, pin => (pin / 2) % 2 == busIndex, pin => pin % 2 == 0 ? "sda" : "scl");
                 break;
             case I2CBusEventType.Write:
                 request["ev"] = "write";
@@ -427,10 +426,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             var route = new JsonObject
             {
                 ["op"] = "route",
-                ["i2c"] = Routes(I2CFunction, 2, "bus", pin => (pin / 2) % 2, pin => pin % 2 == 0 ? "sda" : "scl"),
-                ["spi"] = Routes(SPIFunction, 2, "bus", pin => (pin / 8) % 2,
+                ["i2c"] = Routes(new[] { I2CFunction }, 2, "bus", pin => (pin / 2) % 2, pin => pin % 2 == 0 ? "sda" : "scl"),
+                ["spi"] = Routes(new[] { SPIFunction }, 2, "bus", pin => (pin / 8) % 2,
                     pin => pin % 4 == 0 ? "miso" : pin % 4 == 2 ? "sck" : pin % 4 == 3 ? "mosi" : null),
-                ["uart"] = Routes(UARTFunction, 2, "port", pin => ((pin + 4) / 8) % 2, pin => pin % 4 == 0 ? "tx" : pin % 4 == 1 ? "rx" : null),
+                ["uart"] = Routes(UARTFunctions, 2, "port", pin => ((pin + 4) / 8) % 2, UARTRole),
             };
             var text = route.ToJsonString();
             if(text == lastRouting) return;
@@ -439,7 +438,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         }
 
         // Each routed block of a function with its pins, the first in each role.
-        private JsonArray Routes(int function, int blocks, string key, Func<int, int> blockOf, Func<int, string> role)
+        private JsonArray Routes(int[] functions, int blocks, string key, Func<int, int> blockOf, Func<int, string> role)
         {
             var routes = new JsonArray();
             for(var block = 0; block < blocks; block++)
@@ -447,7 +446,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 var entry = new JsonObject { [key] = block };
                 for(var pin = 0; pin < MaximumPins; pin++)
                 {
-                    if(gpio.GetFunction(pin) != function || blockOf(pin) != block) continue;
+                    if(Array.IndexOf(functions, gpio.GetFunction(pin)) < 0 || blockOf(pin) != block) continue;
                     var name = role(pin);
                     if(name != null && !entry.ContainsKey(name)) entry[name] = pin;
                 }
@@ -457,13 +456,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         }
 
         // The first pin routed to this block in each role, from FUNCSEL.
-        private void AddRoutedPins(JsonObject request, int function, Func<int, bool> ofThisBlock, Func<int, string> role)
+        private void AddRoutedPins(JsonObject request, int[] functions, Func<int, bool> ofThisBlock, Func<int, string> role)
         {
             if(gpio == null) return;
             var pins = new JsonObject();
             for(var pin = 0; pin < MaximumPins; pin++)
             {
-                if(gpio.GetFunction(pin) != function || !ofThisBlock(pin)) continue;
+                if(Array.IndexOf(functions, gpio.GetFunction(pin)) < 0 || !ofThisBlock(pin)) continue;
                 var name = role(pin);
                 if(name != null && !pins.ContainsKey(name)) pins[name] = pin;
             }
@@ -596,7 +595,18 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         }
 
         private const int SPIFunction = 1;
-        private const int UARTFunction = 2;
+        // UART's own function (2) puts TX on pin % 4 == 0 and RX on 1; the
+        // RP2350's UART auxiliary function (11) puts them on 2 and 3, the
+        // pins where function 2 has CTS and RTS.
+        private static readonly int[] UARTFunctions = { 2, 11 };
+
+        private string UARTRole(int pin)
+        {
+            var function = gpio.GetFunction(pin);
+            if(function == 2) return pin % 4 == 0 ? "tx" : pin % 4 == 1 ? "rx" : null;
+            if(function == 11) return pin % 4 == 2 ? "tx" : pin % 4 == 3 ? "rx" : null;
+            return null;
+        }
         private const int I2CFunction = 3;
         private const int MaximumPins = 48;
 
