@@ -73,7 +73,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
     // line, with "z" when the DUT releases the pin:
     //   {"op":"gpio","pin":N,"level":0|1|"z","t_ns":T} -> {}
     // Any reply may carry "actions", each at its own virtual time no earlier
-    // than the request's, applied then: {"t_ns":T,"op":"gpio","pin":N,
+    // than the request's, applied then; one at the request's own time is in
+    // place before the DUT executes another instruction: {"t_ns":T,"op":"gpio","pin":N,
     // "level":0|1|"z"} drives or releases a DUT pin's input through GPIO, and
     // {"t_ns":T,"op":"uart","port":P,"data":D} puts a byte in that UART's
     // receive FIFO (the peer paces bytes at the baud rate), and
@@ -429,7 +430,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private JsonObject Request(JsonObject request, TimeInterval? at = null)
         {
             var now = at ?? machine.ClockSource.CurrentValue;
-            request["t_ns"] = (long)(now.TotalMicroseconds * 1000);
+            var requestTime = (long)(now.TotalMicroseconds * 1000);
+            request["t_ns"] = requestTime;
             Interlocked.Increment(ref requests);
             var reply = connection.Exchange(request, out var error);
             if(error != null && errors++ == 0) this.Log(LogLevel.Error, "Native peer: {0}; answering as an absent target", error);
@@ -437,14 +439,19 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
                 foreach(var action in actions)
                 {
-                    if(action is JsonObject entry) Schedule(entry, now);
+                    if(!(action is JsonObject entry)) continue;
+                    // Due by the request's own time: in place before the
+                    // request returns, so the DUT's next instruction sees it
+                    // (a MISO level answering the MOSI edge it just drove).
+                    if((entry["t_ns"]?.GetValue<long>() ?? 0) <= requestTime) Apply(entry);
+                    else Schedule(entry, now);
                 }
             }
             return reply;
         }
 
-        // Applies an action at its virtual time on the DUT machine's clock,
-        // or at once if that time has come.
+        // Applies a later action at its virtual time on the DUT machine's
+        // clock, or at the next synchronized point if that time has come.
         private void Schedule(JsonObject action, TimeInterval now)
         {
             var at = TimeInterval.FromMicroseconds((ulong)Math.Max(0, (action["t_ns"]?.GetValue<long>() ?? 0) / 1000));
