@@ -1070,7 +1070,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         private readonly System.Diagnostics.Stopwatch wfiWaitWatch = new System.Diagnostics.Stopwatch();
         private const long MaxWfiWaitMilliseconds = 50;
 
-        private ulong InstructionsToNearestLimit()
+        protected ulong InstructionsToNearestLimit()
         {
             var nearestLimitIn = ((BaseClockSource)machine.ClockSource).NearestLimitIn;
             var instructionsToNearestLimit = nearestLimitIn.ToCPUCycles(PerformanceInMips, out var unused);
@@ -1173,7 +1173,7 @@ namespace Antmicro.Renode.Peripherals.CPU
         private TimeHandle timeHandle;
 
         private ulong executedResiduum;
-        private ulong instructionsLeftThisRound;
+        protected ulong instructionsLeftThisRound;
         private ulong instructionsExecutedThisRound;
         private bool enterStepModeAfterFinishingTimeInterval;
         private readonly SealableValue<uint> performanceInMips = new SealableValue<uint>();

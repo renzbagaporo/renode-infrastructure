@@ -795,6 +795,32 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         private ulong reportedTotalInstructions;
 
+        // For a register this CPU polls in a tight loop (called on its thread,
+        // from the read): lets the CPU's time run on without executing, up to
+        // `interval` (the time the value cannot change for) but never past
+        // the end of the CPU's current time grant or the machine clock's
+        // nearest event. Interrupts and other devices' changes reach the CPU
+        // only at those points, so the loop reads the same values at the same
+        // virtual times, only fewer times. Returns whether time was skipped.
+        public bool SkipWhilePolling(Antmicro.Renode.Time.TimeInterval interval)
+        {
+            if(!OnPossessedThread || !insideTranslatedCode) return false;
+            var total = TlibGetTotalExecutedInstructions();
+            var unreported = total > reportedTotalInstructions ? total - reportedTotalInstructions : 0;
+            unreported += (ulong)Math.Max(0, TlibGetCurrentBlockProgress());
+            var wanted = interval.ToCPUCycles(PerformanceInMips, out var _);
+            var leftThisRound = instructionsLeftThisRound > unreported ? instructionsLeftThisRound - unreported : 0;
+            var toNearestLimit = InstructionsToNearestLimit();
+            toNearestLimit = toNearestLimit > unreported ? toNearestLimit - unreported : 0;
+            var skip = Math.Min(wanted, Math.Min(leftThisRound, toNearestLimit));
+            // Leave the instructions that finish the loop's current pass.
+            if(skip <= PollingMargin) return false;
+            SkipInstructions += skip - PollingMargin;
+            return true;
+        }
+
+        private const ulong PollingMargin = 2;
+
         private void ReportExecutedInstructions()
         {
             var numberOfExecutedInstructions = TlibGetExecutedInstructions();

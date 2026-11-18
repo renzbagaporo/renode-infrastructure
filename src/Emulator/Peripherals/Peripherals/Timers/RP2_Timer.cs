@@ -195,13 +195,16 @@ namespace Antmicro.Renode.Peripherals.Timers
             case 0xc:
                 var value = CounterValue;
                 latchedHighTime = (uint)(value >> 32);
+                SkipIfPolling(offset, (uint)value);
                 return (uint)value;
             case 0x20:
                 return armed;
             case 0x24:
                 return (uint)(CounterValue >> 32);
             case 0x28:
-                return (uint)CounterValue;
+                var low = (uint)CounterValue;
+                SkipIfPolling(offset, low);
+                return low;
             case 0x2c:
                 return debugPause;
             case 0x30:
@@ -372,6 +375,28 @@ namespace Antmicro.Renode.Peripherals.Timers
                 var elapsed = machine.ClockSource.CurrentValue.Ticks - counterBaseTicks;
                 return counterBase + (ulong)((UInt128)elapsed * counterFrequency / TimeInterval.TicksPerSecond);
             }
+        }
+
+        // A CPU spinning on the counter (busy_wait_us) reads it many times per
+        // microsecond; with SkipPollingTime its time runs on to the next
+        // count instead (RP2CpuTime.SkipIfPolling). Off by default, as the
+        // spinning CPU then executes fewer instructions.
+        public bool SkipPollingTime { get; set; }
+
+        private void SkipIfPolling(long offset, uint value)
+        {
+            if(!SkipPollingTime) return;
+            TimeInterval? stableFor = null;
+            if(counterRunning)
+            {
+                // The next count after the polling CPU's own time, which runs
+                // ahead of the clock source within its round.
+                var now = Math.Max((RP2CpuTime.InitiatorTime(machine) ?? machine.ClockSource.CurrentValue).Ticks, counterBaseTicks);
+                var counts = (UInt128)(now - counterBaseTicks) * counterFrequency / TimeInterval.TicksPerSecond;
+                var next = counterBaseTicks + (ulong)(((counts + 1) * TimeInterval.TicksPerSecond + counterFrequency - 1) / counterFrequency);
+                stableFor = TimeInterval.FromTicks(next > now ? next - now : 0);
+            }
+            RP2CpuTime.SkipIfPolling(machine, this, offset, value, stableFor);
         }
 
         private void SetCounter(ulong value)

@@ -138,6 +138,13 @@ namespace Antmicro.Renode.Peripherals.UART
         // off. Without it, a burst overruns such a program.
         public bool PaceExternalCharacters { get; set; }
 
+        // A program waiting for the transmit FIFO (Zephyr's pl011_poll_out)
+        // reads FR thousands of times per character; with SkipPollingTime
+        // its time runs on instead while FR stays the same
+        // (RP2CpuTime.SkipIfPolling). Off by default, as the spinning CPU
+        // then executes fewer instructions.
+        public bool SkipPollingTime { get; set; }
+
         private void ReceiveIncoming(byte value)
         {
             if(ReceiveEnabled && !Loopback) ReceiveCharacter(value);
@@ -255,9 +262,14 @@ namespace Antmicro.Renode.Peripherals.UART
                 return value;
             case 0x04: return receiveStatus;
             case 0x18:
-                return (tx.Count == 0 ? 0x80u : 0) | (rx.Count >= Capacity ? 0x40u : 0)
+                var flags = (tx.Count == 0 ? 0x80u : 0) | (rx.Count >= Capacity ? 0x40u : 0)
                     | (tx.Count >= Capacity ? 0x20u : 0) | (rx.Count == 0 ? 0x10u : 0)
                     | (shifting || tx.Count != 0 ? 8u : 0) | ModemFlags;
+                // Every change to the flags comes from this UART's frame
+                // timers or from input at a synchronization point, so a spin
+                // on them may skip to the CPU's next one.
+                if(SkipPollingTime) RP2CpuTime.SkipIfPolling(machine, this, offset, flags);
+                return flags;
             case 0x20: return irdaDivisor;
             case 0x24: return integerDivisor;
             case 0x28: return fractionalDivisor;
