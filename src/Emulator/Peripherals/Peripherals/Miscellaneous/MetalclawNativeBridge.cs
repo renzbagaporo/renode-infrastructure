@@ -44,6 +44,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
     // With a UART the bridge forwards each byte the DUT transmits,
     //   {"op":"uart","port":P,"data":[D],"t_ns":T} -> {}
     // and is named in the hello by its port and the DUT's own TX and RX pins.
+    // With an SPI master the bridge answers each frame as it starts,
+    //   {"op":"spi","bus":B,"mosi":W,"bits":N,"t_ns":T} -> {"miso":W}
+    // and is named in the hello by the DUT's SCK, MOSI, MISO and CS pins.
+    // The pins in watchPins (an SPI bridge's CS among them) and any a
+    // {"op":"watch","pins":[...]} action adds are reported at every edge:
+    //   {"op":"gpio","pin":N,"level":0|1,"t_ns":T} -> {}
     // Any reply may carry "actions", each at its own virtual time no earlier
     // than the request's, applied then: {"t_ns":T,"op":"gpio","pin":N,
     // "level":0|1|"z"} drives or releases a DUT pin's input through GPIO, and
@@ -54,7 +60,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // socketPath defaults to $METALCLAW_BRIDGE, the path the native process
         // listens on.
         public MetalclawNativeBridge(IMachine machine, string socketPath = "", int bus = 0, ulong tickMicroseconds = 0,
-            RP2_GPIOBank0 gpio = null, UART.IUART uart = null, int uartTx = -1, int uartRx = -1, int replyTimeoutMilliseconds = 60000)
+            RP2_GPIOBank0 gpio = null, UART.IUART uart = null, int uartTx = -1, int uartRx = -1,
+            SPI.RP2_SPI spi = null, int spiSck = -1, int spiMosi = -1, int spiMiso = -1, int spiCs = -1,
+            int replyTimeoutMilliseconds = 60000)
         {
             this.machine = machine;
             this.busIndex = bus;
@@ -68,6 +76,18 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 connection.Register("uart", new JsonObject { ["port"] = bus, ["tx"] = uartTx, ["rx"] = uartRx });
                 uart.CharReceived += value => Request(new JsonObject { ["op"] = "uart", ["port"] = busIndex, ["data"] = new JsonArray(value) });
             }
+            if(spi != null)
+            {
+                connection.Register("spi", new JsonObject { ["bus"] = bus, ["sck"] = spiSck, ["mosi"] = spiMosi, ["miso"] = spiMiso, ["cs"] = spiCs });
+                spi.FrameTarget = (mosi, bits, at) =>
+                {
+                    var reply = Request(new JsonObject { ["op"] = "spi", ["bus"] = busIndex, ["mosi"] = mosi, ["bits"] = bits }, at);
+                    return (ushort)(reply?["miso"]?.GetValue<int>() ?? 0xffff);
+                };
+                if(spiCs >= 0) connection.Watch(spiCs);
+            }
+            // One bridge per connection reports its watched pins.
+            if(gpio != null && connection.ClaimPinReports()) gpio.InputChanged += OnPinChanged;
             if(tickMicroseconds != 0)
             {
                 tick = new LimitTimer(machine.ClockSource, 1000000, this, "native tick", limit: tickMicroseconds,
@@ -131,9 +151,16 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // Requests sent and answered since the bridge was created.
         public ulong Requests => Interlocked.Read(ref requests);
 
-        private JsonObject Request(JsonObject request)
+        // A watched DUT pin's edge, at the time the GPIO bank delivers it.
+        private void OnPinChanged(int pin, bool level)
         {
-            var now = machine.ClockSource.CurrentValue;
+            if(!connection.Watched(pin)) return;
+            Request(new JsonObject { ["op"] = "gpio", ["pin"] = pin, ["level"] = level ? 1 : 0 }, SignalTime.Of(machine));
+        }
+
+        private JsonObject Request(JsonObject request, TimeInterval? at = null)
+        {
+            var now = at ?? machine.ClockSource.CurrentValue;
             request["t_ns"] = (long)(now.TotalMicroseconds * 1000);
             Interlocked.Increment(ref requests);
             var reply = connection.Exchange(request, out var error);
@@ -183,6 +210,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 else gpio.OnGPIO(pin, (level?.GetValue<int>() ?? 0) != 0);
                 return;
             }
+            if(op == "watch" && action["pins"] is JsonArray pins)
+            {
+                foreach(var entry in pins) connection.Watch(entry.GetValue<int>());
+                return;
+            }
             if(op == "uart" && uart != null && (action["port"]?.GetValue<int>() ?? -1) == busIndex)
             {
                 uart.WriteChar((byte)(action["data"]?.GetValue<int>() ?? 0));
@@ -215,6 +247,26 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                         Shared.Add(path, connection);
                     }
                     return connection;
+                }
+            }
+
+            public void Watch(int pin)
+            {
+                lock(watchedPins) watchedPins.Add(pin);
+            }
+
+            public bool Watched(int pin)
+            {
+                lock(watchedPins) return watchedPins.Contains(pin);
+            }
+
+            public bool ClaimPinReports()
+            {
+                lock(watchedPins)
+                {
+                    if(pinReportsClaimed) return false;
+                    pinReportsClaimed = true;
+                    return true;
                 }
             }
 
@@ -298,6 +350,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             private readonly string path;
             private readonly int timeoutMilliseconds;
             private readonly object sync = new object();
+            private readonly HashSet<int> watchedPins = new HashSet<int>();
+            private bool pinReportsClaimed;
             private readonly Dictionary<string, JsonArray> buses = new Dictionary<string, JsonArray>
             {
                 ["i2c"] = new JsonArray(), ["uart"] = new JsonArray(), ["spi"] = new JsonArray()

@@ -31,6 +31,12 @@ namespace Antmicro.Renode.Peripherals.SPI
     // when that is empty. The TI and Microwire formats are not modeled.
     public sealed class RP2_SPI : RP2APBPeripheral
     {
+        // As a master: called as each frame starts with its transmitted word,
+        // its size in bits and its start time; a word returned is what the
+        // frame receives, in place of the samples of the receive pin. For a
+        // target that is not on the pins, such as a native Metalclaw bridge.
+        public Func<ushort, int, TimeInterval, ushort?> FrameTarget { get; set; }
+
         public RP2_SPI(IMachine machine, IRP2ClockSource clocks = null, ulong frequency = 125000000,
             RP2_GPIOBank0 gpio = null, int index = -1, ulong inputDelayNanoseconds = 0) : base(machine)
         {
@@ -225,6 +231,15 @@ namespace Antmicro.Renode.Peripherals.SPI
             edgeTimer.ResetValue();
             edgeTimer.Enabled = true;
             lineTime = leadCycles != 0 ? start : null;
+            // A frame target answers the whole frame at its start, with the
+            // word the master then receives; the pins still carry the frame.
+            var answer = FrameTarget?.Invoke(frame.Value, frame.Bits, now + lead);
+            if(answer.HasValue)
+            {
+                frame.Answered = true;
+                frame.Received = (ushort)(answer.Value & FrameMask);
+                frame.Sampled = frame.Bits;
+            }
             SetLine(FssLine, false);
             // With SPH=0 the first bit is valid half a clock before the first edge.
             if(!SecondEdgeSamples) SetLine(DataLine, frame.Bit(0));
@@ -356,6 +371,7 @@ namespace Antmicro.Renode.Peripherals.SPI
         // select must not do so with SCK still high.
         private void Store(Frame target, int bit, bool level)
         {
+            if(target.Answered) return;
             if(level) target.Received |= (ushort)(1 << (target.Bits - 1 - bit));
             if(++target.Sampled < target.Bits || !target.Ended) return;
             Receive(target);
@@ -620,6 +636,7 @@ namespace Antmicro.Renode.Peripherals.SPI
             public ushort Received;
             public int Sampled;
             public bool Ended;
+            public bool Answered;
         }
 
         private readonly struct Sample
