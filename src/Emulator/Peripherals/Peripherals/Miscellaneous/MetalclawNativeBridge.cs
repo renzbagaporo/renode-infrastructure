@@ -5,6 +5,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.Json.Nodes;
@@ -83,6 +84,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
     // played by the peer. The frame the block shifted out comes back at once
     // as {"op":"spi_clocked","bus":B,"mosi":W,"miso":W|null,"t_ns":T} -> {},
     // null when the block is not an enabled slave or keeps its output off.
+    // {"t_ns":T,"op":"join","pins":[A,B]} wires two DUT pins together, as a
+    // jumper, until {"t_ns":T,"op":"unjoin","pins":[A,B]}: the DUT's drive
+    // on either becomes the other's input at once ("z" releases it), and two
+    // I2C blocks whose routed SDA and SCL are joined talk to each other
+    // directly, the DUT answering its own target's requests, without
+    // requests to the peer.
     public sealed class MetalclawNativeBridge : IDelayedI2CBusEndpoint
     {
         // socketPath defaults to $METALCLAW_BRIDGE, the path the native process
@@ -153,6 +160,40 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         {
         }
 
+        // Puts a controller's event from a joined bus on this bridge's bus,
+        // to this bus's other blocks, and remembers where its answers go.
+        private void Relay(MetalclawNativeBridge origin, I2CBusEvent busEvent)
+        {
+            lock(relays)
+            {
+                if(busEvent.Type == I2CBusEventType.Stop) relays.Remove(busEvent.Transfer);
+                else relays[busEvent.Transfer] = Tuple.Create(origin, busEvent.Sender);
+            }
+            bus?.Send(this, busEvent);
+        }
+
+        private void ReturnRelayedAnswer(I2CBusEvent answer)
+        {
+            Tuple<MetalclawNativeBridge, IDelayedI2CBusEndpoint> origin;
+            lock(relays)
+            {
+                if(!relays.TryGetValue(answer.Transfer, out origin)) return;
+            }
+            origin.Item1.bus?.Send(origin.Item1, answer, origin.Item2);
+        }
+
+        // The pins this I2C block is routed to now: SDA on even pins, SCL on odd.
+        private List<int> RoutedI2CPins(bool sda)
+        {
+            var pins = new List<int>();
+            if(gpio == null || bus == null) return pins;
+            for(var pin = 0; pin < MaximumPins; pin++)
+            {
+                if(gpio.GetFunction(pin) == I2CFunction && (pin / 2) % 2 == busIndex && (pin % 2 == 0) == sda) pins.Add(pin);
+            }
+            return pins;
+        }
+
         public void AttachToBus(DelayedI2CBus bus, int sdaPin, int sclPin)
         {
             if(this.bus != null) throw new Exceptions.RecoverableException("A native bridge serves one bus; add another bridge for each further bus");
@@ -162,6 +203,17 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         public void OnBusEvent(I2CBusEvent busEvent)
         {
+            if(busEvent.Type == I2CBusEventType.Acknowledge || busEvent.Type == I2CBusEventType.Data)
+            {
+                ReturnRelayedAnswer(busEvent);
+                return;
+            }
+            var peer = connection.JoinedI2CPeer(this);
+            if(peer != null)
+            {
+                peer.Relay(this, busEvent);
+                return;
+            }
             var request = new JsonObject { ["op"] = "i2c", ["bus"] = busIndex };
             switch(busEvent.Type)
             {
@@ -422,6 +474,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // bank delivers it.
         private void OnDriveChanged(int pin, bool value, bool enabled)
         {
+            foreach(var partner in connection.JoinedTo(pin))
+            {
+                if(enabled) gpio.OnGPIO(partner, value);
+                else gpio.ReleaseInput(partner);
+            }
             if(!connection.Watched(pin)) return;
             JsonNode level = enabled ? (JsonNode)(value ? 1 : 0) : "z";
             Request(new JsonObject { ["op"] = "gpio", ["pin"] = pin, ["level"] = level }, SignalTime.Of(machine));
@@ -502,6 +559,23 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 }
                 return true;
             }
+            if(op == "join" || op == "unjoin")
+            {
+                if(!(action["pins"] is JsonArray pair) || pair.Count != 2) return false;
+                var a = pair[0].GetValue<int>();
+                var b = pair[1].GetValue<int>();
+                connection.SetJoined(a, b, op == "join");
+                if(gpio == null) return true;
+                // A new jumper carries each pin's present drive to the other;
+                // a removed one releases the inputs it was driving.
+                foreach(var (from, to) in new[] { (a, b), (b, a) })
+                {
+                    gpio.GetOutputState(from, out var level, out var enabled);
+                    if(op == "join" && enabled) gpio.OnGPIO(to, level);
+                    else gpio.ReleaseInput(to);
+                }
+                return true;
+            }
             if(op == "spi_clock" && spi != null && (action["bus"]?.GetValue<int>() ?? -1) == busIndex)
             {
                 var mosi = action["mosi"]?.GetValue<int>() ?? 0;
@@ -531,6 +605,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private readonly RP2_GPIOBank0 gpio;
         private readonly UART.IUART uart;
         private readonly SPI.RP2_SPI spi;
+        private readonly Dictionary<ulong, Tuple<MetalclawNativeBridge, IDelayedI2CBusEndpoint>> relays =
+            new Dictionary<ulong, Tuple<MetalclawNativeBridge, IDelayedI2CBusEndpoint>>();
         private ulong unsupported;
         private readonly Connection connection;
         private readonly LimitTimer tick;
@@ -569,6 +645,48 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 }
                 return false;
             }
+
+            public void SetJoined(int a, int b, bool joined)
+            {
+                lock(joins)
+                {
+                    var key = Tuple.Create(Math.Min(a, b), Math.Max(a, b));
+                    if(joined) joins.Add(key);
+                    else joins.Remove(key);
+                }
+            }
+
+            public List<int> JoinedTo(int pin)
+            {
+                lock(joins)
+                {
+                    return joins.Where(j => j.Item1 == pin || j.Item2 == pin)
+                        .Select(j => j.Item1 == pin ? j.Item2 : j.Item1).ToList();
+                }
+            }
+
+            // The other I2C bridge whose block's routed SDA and SCL are joined
+            // to this one's, if any.
+            public MetalclawNativeBridge JoinedI2CPeer(MetalclawNativeBridge from)
+            {
+                lock(joins)
+                {
+                    if(joins.Count == 0) return null;
+                }
+                MetalclawNativeBridge[] others;
+                lock(members) others = members.ToArray();
+                var sda = from.RoutedI2CPins(true);
+                var scl = from.RoutedI2CPins(false);
+                if(sda.Count == 0 || scl.Count == 0) return null;
+                foreach(var other in others)
+                {
+                    if(other == from || other.bus == null) continue;
+                    if(Linked(sda, other.RoutedI2CPins(true)) && Linked(scl, other.RoutedI2CPins(false))) return other;
+                }
+                return null;
+            }
+
+            private bool Linked(List<int> ours, List<int> theirs) => ours.Any(pin => JoinedTo(pin).Any(theirs.Contains));
 
             public void Watch(int pin)
             {
@@ -674,6 +792,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             private readonly object sync = new object();
             private readonly HashSet<int> watchedPins = new HashSet<int>();
             private readonly List<MetalclawNativeBridge> members = new List<MetalclawNativeBridge>();
+            private readonly HashSet<Tuple<int, int>> joins = new HashSet<Tuple<int, int>>();
             private bool pinReportsClaimed;
             private readonly Dictionary<string, JsonArray> buses = new Dictionary<string, JsonArray>
             {
