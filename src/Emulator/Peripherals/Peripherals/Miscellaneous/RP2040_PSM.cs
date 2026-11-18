@@ -29,14 +29,18 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // Input 0 is the physical active-low RUN pin. SRAM retains its contents
         // across RUN on RP2040; externally powered NOR retains its own state,
         // and VREG_AND_CHIP_RESET records the reset.
-        // Inputs 1 and 2 are the cores' NVIC SYSRESETREQ outputs; the request
-        // may come from a debugger on another machine's thread, so the reset
-        // waits for every processor to stop at a safe point.
+        // Inputs 1 and 2 are the cores' NVIC SYSRESETREQ outputs. RP2040
+        // datasheet 2.4.2: "The NVIC only resets the Cortex-M0+ processor core
+        // (not the Debug or PMU)", so the request resets that core and its
+        // NVIC only: the other core and the peripherals run on, and a UART
+        // finishes sending what its FIFO holds. The request may come from a
+        // debugger on another thread, so the reset runs at a synchronized
+        // point.
         public void OnGPIO(int number, bool value)
         {
             if(number == 1 || number == 2)
             {
-                if(value) RequestSystemReset();
+                if(value) ResetCore(number - 1);
                 return;
             }
             if(number != 0 || runHeld == !value) return;
@@ -59,16 +63,36 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         }
 
         // External flash and VREG_AND_CHIP_RESET keep their state across the
-        // resets below power-on: RUN, the rescue restart and SYSRESETREQ.
+        // chip resets below power-on: RUN and the rescue restart.
         // Another chip in the same machine is not reset at all.
         internal static List<IPeripheral> RetainedAcrossChipReset(IMachine machine, IPeripheral member) =>
             machine.GetRegisteredPeripherals().Select(entry => entry.Peripheral)
                 .Where(peripheral => peripheral is WinbondW25QFlash || peripheral is RP2040_VregAndChipReset)
                 .Concat(RP2_Chip.OtherChips(machine, member)).Distinct().ToList();
 
-        private void RequestSystemReset()
+        private void ResetCore(int core)
         {
-            machine.RequestResetInSafeState(postReset: ApplyRunHold, unresetable: RetainedAcrossChipReset(machine, this), runRegisteredResetEvents: true, preReset: ApplyRunHold);
+            int generation;
+            lock(SyncRoot) generation = resetGeneration;
+            var processor = cores[core];
+            var resume = !processor.IsHalted && !processor.CpuWaitSignal.IsSet && !processor.HaltedByDebugger
+                && (!processor.IsPaused || machine.IsPaused);
+            machine.LocalTimeSource.ExecuteInNearestSyncedState(_ =>
+            {
+                if(generation != Volatile.Read(ref resetGeneration)) return;
+                var paused = cores.Select(entry => entry.IsPaused && !machine.IsPaused).ToArray();
+                using(machine.ObtainPausedState(true))
+                {
+                    nvics[core].Reset();
+                    processor.Reset();
+                    if(resume || processor.HasAnyHaltingCondition) processor.Resume();
+                }
+                // Restore explicit host pauses the machine's pause lifted.
+                for(var index = 0; index < cores.Length; index++)
+                {
+                    if(paused[index]) cores[index].Pause();
+                }
+            });
         }
 
         private void ApplyRunHold()
