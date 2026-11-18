@@ -53,6 +53,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
     // "pins":{"tx":N,"rx":N}, read from
     // GPIO_CTRL.FUNCSEL, since a program may route a block to other pins
     // than the hello's.
+    // Given pinSda and pinScl instead of a bus, the bridge is an I2C target on
+    // those DUT pins, for a bus a program drives itself (a PIO I2C master):
+    // it follows the DUT's own drive on them, released lines high through
+    // the pads' pull-ups, sends the same i2c requests as on a bus, and drives
+    // SDA low through GPIO for an ACK and for the 0 bits it sends; it never
+    // stretches SCL, since each answer comes before the DUT's clock moves.
     // Watched pins (an SPI bridge's CS, and any a {"op":"watch","pin":N} or
     // {"op":"watch","pins":[...]} action adds) report every change of the
     // DUT's own drive on them, never the level the peer's actions put on the
@@ -70,7 +76,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public MetalclawNativeBridge(IMachine machine, string socketPath = "", int bus = 0, ulong tickMicroseconds = 0,
             RP2_GPIOBank0 gpio = null, UART.IUART uart = null, int uartTx = -1, int uartRx = -1,
             SPI.RP2_SPI spi = null, int spiSck = -1, int spiMosi = -1, int spiMiso = -1, int spiCs = -1,
-            int replyTimeoutMilliseconds = 60000)
+            int pinSda = -1, int pinScl = -1, int replyTimeoutMilliseconds = 60000)
         {
             this.machine = machine;
             this.busIndex = bus;
@@ -104,6 +110,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     return (ushort)(reply?["miso"]?.GetValue<int>() ?? 0xffff);
                 };
                 if(spiCs >= 0) connection.Watch(spiCs);
+            }
+            if(pinSda >= 0 && pinScl >= 0)
+            {
+                if(gpio == null) throw new Exceptions.ConstructionException("A pin-level I2C target needs the DUT's gpio");
+                this.pinSda = pinSda;
+                this.pinScl = pinScl;
+                connection.Register("i2c", new JsonObject { ["bus"] = bus, ["sda"] = pinSda, ["scl"] = pinScl });
+                gpio.DriveChanged += OnPinI2CDrive;
             }
             // One bridge per connection reports its watched pins.
             if(gpio != null && connection.ClaimPinReports()) gpio.DriveChanged += OnDriveChanged;
@@ -170,6 +184,168 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         // Requests sent and answered since the bridge was created.
         public ulong Requests => Interlocked.Read(ref requests);
+
+        // Pin-level I2C target ----------------------------------------------
+
+        private void OnPinI2CDrive(int pin, bool value, bool enabled)
+        {
+            if(pin != pinSda && pin != pinScl) return;
+            var low = enabled && !value;
+            if(pin == pinSda)
+            {
+                dutSdaLow = low;
+                var sda = SdaLevel;
+                if(sda == lastSda) return;
+                lastSda = sda;
+                // Only the controller changes SDA while SCL is high.
+                if(lastScl)
+                {
+                    if(!sda) PinStart();
+                    else PinStop();
+                }
+                return;
+            }
+            var scl = !low;
+            if(scl == lastScl) return;
+            lastScl = scl;
+            if(scl) PinClockRises();
+            else PinClockFalls();
+        }
+
+        private bool SdaLevel => !(dutSdaLow || ownSdaLow);
+
+        private void DriveSda(bool levelLow)
+        {
+            if(ownSdaLow == levelLow) return;
+            ownSdaLow = levelLow;
+            lastSda = SdaLevel;
+            if(levelLow) gpio.OnGPIO(pinSda, false);
+            else gpio.ReleaseInput(pinSda);
+        }
+
+        private JsonObject PinRequest(string ev)
+        {
+            return new JsonObject { ["op"] = "i2c", ["bus"] = busIndex, ["ev"] = ev, ["pins"] = new JsonObject { ["sda"] = pinSda, ["scl"] = pinScl } };
+        }
+
+        private void PinStart()
+        {
+            pinRepeated = pinState != PinState.Idle;
+            pinState = PinState.Address;
+            pinBits = 0;
+            pinShift = 0;
+            pinAcknowledging = false;
+            DriveSda(false);
+        }
+
+        private void PinStop()
+        {
+            DriveSda(false);
+            if(pinState == PinState.Idle) return;
+            pinState = PinState.Idle;
+            Request(PinRequest("stop"));
+        }
+
+        private void PinClockRises()
+        {
+            switch(pinState)
+            {
+            case PinState.Address:
+            case PinState.Write:
+                if(pinAcknowledging) return;
+                pinShift = (byte)((pinShift << 1) | (SdaLevel ? 1 : 0));
+                pinBits++;
+                break;
+            case PinState.Read:
+                if(pinBits == 9) pinControllerAcknowledged = !SdaLevel;
+                break;
+            }
+        }
+
+        private void PinClockFalls()
+        {
+            switch(pinState)
+            {
+            case PinState.Address:
+            case PinState.Write:
+                if(pinAcknowledging)
+                {
+                    // The ninth clock ends: release the ACK.
+                    pinAcknowledging = false;
+                    DriveSda(false);
+                    pinBits = 0;
+                    pinShift = 0;
+                    if(pinReadNext)
+                    {
+                        pinReadNext = false;
+                        pinState = PinState.Read;
+                        PinSendNextByte();
+                    }
+                    else pinState = PinState.Write;
+                    return;
+                }
+                if(pinBits < 8) return;
+                bool acknowledged;
+                if(pinState == PinState.Address)
+                {
+                    var request = PinRequest("start");
+                    request["addr"] = pinShift >> 1;
+                    request["read"] = (pinShift & 1) != 0;
+                    request["repeated"] = pinRepeated;
+                    acknowledged = Request(request)?["ack"]?.GetValue<bool>() ?? false;
+                    pinReadNext = acknowledged && (pinShift & 1) != 0;
+                }
+                else
+                {
+                    var request = PinRequest("write");
+                    request["data"] = pinShift;
+                    acknowledged = Request(request)?["ack"]?.GetValue<bool>() ?? false;
+                }
+                if(!acknowledged)
+                {
+                    pinState = PinState.Ignore;
+                    return;
+                }
+                pinAcknowledging = true;
+                DriveSda(true);
+                break;
+            case PinState.Read:
+                if(pinBits < 8)
+                {
+                    DriveSda(((pinOut >> (7 - pinBits)) & 1) == 0);
+                    pinBits++;
+                }
+                else if(pinBits == 8)
+                {
+                    // The controller's ACK or NACK clock.
+                    DriveSda(false);
+                    pinBits = 9;
+                }
+                else if(pinControllerAcknowledged) PinSendNextByte();
+                else
+                {
+                    DriveSda(false);
+                    pinState = PinState.Ignore;
+                }
+                break;
+            }
+        }
+
+        // The next byte to send: its first bit goes out now, on SCL low.
+        private void PinSendNextByte()
+        {
+            pinOut = (byte)(Request(PinRequest("read"))?["data"]?.GetValue<int>() ?? 0xff);
+            DriveSda(((pinOut >> 7) & 1) == 0);
+            pinBits = 1;
+        }
+
+        private enum PinState { Idle, Address, Write, Read, Ignore }
+
+        private PinState pinState;
+        private int pinSda = -1, pinScl = -1, pinBits;
+        private byte pinShift, pinOut;
+        private bool dutSdaLow, ownSdaLow, lastSda = true, lastScl = true;
+        private bool pinRepeated, pinAcknowledging, pinControllerAcknowledged, pinReadNext;
 
         // The first pin routed to this block in each role, from FUNCSEL.
         private void AddRoutedPins(JsonObject request, int function, Func<int, bool> ofThisBlock, Func<int, string> role)
