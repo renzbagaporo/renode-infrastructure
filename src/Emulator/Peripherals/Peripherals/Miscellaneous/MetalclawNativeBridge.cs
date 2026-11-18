@@ -740,10 +740,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                             writer.Flush();
                             if(reader.ReadLine() == null) throw new IOException("the peer closed the connection after the hello");
                         }
-                        writer.Write(request.ToJsonString() + "\n");
+                        var text = request.ToJsonString();
+                        writer.Write(text + "\n");
                         writer.Flush();
                         var line = reader.ReadLine();
                         if(line == null) throw new IOException("the peer closed the connection");
+                        trace?.WriteLine(text + " -> " + line);
                         return JsonNode.Parse(line) as JsonObject;
                     }
                     // Any failure to reach the peer (a refused or over-long socket
@@ -761,7 +763,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             {
                 this.path = path;
                 this.timeoutMilliseconds = timeoutMilliseconds;
+                // METALCLAW_BRIDGE_TRACE names a file that gets every request
+                // and its reply, one exchange per line.
+                var tracePath = Environment.GetEnvironmentVariable("METALCLAW_BRIDGE_TRACE");
+                if(!string.IsNullOrEmpty(tracePath)) trace = new StreamWriter(tracePath, append: true) { AutoFlush = true };
             }
+
+            private readonly StreamWriter trace;
 
             // The peer may start after the DUT; wait for it up to the timeout.
             private void Open()
