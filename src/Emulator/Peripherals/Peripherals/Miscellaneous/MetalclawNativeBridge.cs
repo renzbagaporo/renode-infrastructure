@@ -41,22 +41,33 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
     // -> {}) keeps the peer's clock moving while the buses are idle; 0 turns
     // it off. Bridges naming the same socket share one connection, so a DUT
     // with several buses has one bridge per bus, one of them ticking.
+    // With a UART the bridge forwards each byte the DUT transmits,
+    //   {"op":"uart","port":P,"data":[D],"t_ns":T} -> {}
+    // and is named in the hello by its port and the DUT's own TX and RX pins.
     // Any reply may carry "actions", each at its own virtual time no earlier
     // than the request's, applied then: {"t_ns":T,"op":"gpio","pin":N,
-    // "level":0|1|"z"} drives or releases a DUT pin's input through GPIO.
+    // "level":0|1|"z"} drives or releases a DUT pin's input through GPIO, and
+    // {"t_ns":T,"op":"uart","port":P,"data":D} puts a byte in that UART's
+    // receive FIFO (the peer paces bytes at the baud rate).
     public sealed class MetalclawNativeBridge : IDelayedI2CBusEndpoint
     {
         // socketPath defaults to $METALCLAW_BRIDGE, the path the native process
         // listens on.
         public MetalclawNativeBridge(IMachine machine, string socketPath = "", int bus = 0, ulong tickMicroseconds = 0,
-            RP2_GPIOBank0 gpio = null, int replyTimeoutMilliseconds = 60000)
+            RP2_GPIOBank0 gpio = null, UART.IUART uart = null, int uartTx = -1, int uartRx = -1, int replyTimeoutMilliseconds = 60000)
         {
             this.machine = machine;
             this.busIndex = bus;
             this.gpio = gpio;
+            this.uart = uart;
             if(string.IsNullOrEmpty(socketPath)) socketPath = Environment.GetEnvironmentVariable("METALCLAW_BRIDGE");
             if(string.IsNullOrEmpty(socketPath)) throw new Exceptions.ConstructionException("Set socketPath or METALCLAW_BRIDGE to the native peer's socket");
             connection = Connection.For(socketPath, replyTimeoutMilliseconds);
+            if(uart != null)
+            {
+                connection.Register("uart", new JsonObject { ["port"] = bus, ["tx"] = uartTx, ["rx"] = uartRx });
+                uart.CharReceived += value => Request(new JsonObject { ["op"] = "uart", ["port"] = busIndex, ["data"] = new JsonArray(value) });
+            }
             if(tickMicroseconds != 0)
             {
                 tick = new LimitTimer(machine.ClockSource, 1000000, this, "native tick", limit: tickMicroseconds,
@@ -172,12 +183,18 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 else gpio.OnGPIO(pin, (level?.GetValue<int>() ?? 0) != 0);
                 return;
             }
+            if(op == "uart" && uart != null && (action["port"]?.GetValue<int>() ?? -1) == busIndex)
+            {
+                uart.WriteChar((byte)(action["data"]?.GetValue<int>() ?? 0));
+                return;
+            }
             if(unsupported++ == 0) this.Log(LogLevel.Warning, "Native peer action {0} is not supported here", action.ToJsonString());
         }
 
         private readonly IMachine machine;
         private readonly int busIndex;
         private readonly RP2_GPIOBank0 gpio;
+        private readonly UART.IUART uart;
         private ulong unsupported;
         private readonly Connection connection;
         private readonly LimitTimer tick;
