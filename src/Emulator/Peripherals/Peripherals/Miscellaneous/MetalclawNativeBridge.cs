@@ -492,7 +492,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private JsonObject Request(JsonObject request, TimeInterval? at = null)
         {
             var now = at ?? machine.ClockSource.CurrentValue;
-            var requestTime = (long)(now.TotalMicroseconds * 1000);
+            var requestTime = (long)now.TotalNanoseconds;
             request["t_ns"] = requestTime;
             Interlocked.Increment(ref requests);
             var reply = connection.Exchange(request, out var error);
@@ -516,7 +516,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // clock, or at the next synchronized point if that time has come.
         private void Schedule(JsonObject action, TimeInterval now)
         {
-            var at = TimeInterval.FromMicroseconds((ulong)Math.Max(0, (action["t_ns"]?.GetValue<long>() ?? 0) / 1000));
+            // To the nanosecond: a bit-level peer's edges sit between microseconds.
+            var at = TimeInterval.FromNanoseconds((ulong)Math.Max(0, action["t_ns"]?.GetValue<long>() ?? 0));
             machine.LocalTimeSource.ExecuteInNearestSyncedState(_ =>
             {
                 var current = machine.ClockSource.CurrentValue;
