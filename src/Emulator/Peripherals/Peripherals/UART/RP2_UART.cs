@@ -71,10 +71,14 @@ namespace Antmicro.Renode.Peripherals.UART
                 limit: 1, workMode: WorkMode.Periodic, eventEnabled: true);
             sampleTimer = new LimitTimer(machine.ClockSource, Math.Max(1ul, frequency * 4), this, "receive sample",
                 limit: 1, workMode: WorkMode.Periodic, eventEnabled: true);
+            incomingTimer = new LimitTimer(machine.ClockSource, Math.Max(1ul, frequency * 4), this, "receive frame",
+                limit: 1, workMode: WorkMode.OneShot, eventEnabled: true);
+            incoming = new Queue<byte>();
             txTimer.LimitReached += CompleteTransmit;
             timeoutTimer.LimitReached += ReceiveTimeout;
             bitTimer.LimitReached += TransmitNextBit;
             sampleTimer.LimitReached += SampleReceiveBit;
+            incomingTimer.LimitReached += ReceiveNextIncoming;
             if(clocks != null) clocks.ClockChanged += OnClockChanged;
             Reset();
         }
@@ -89,6 +93,9 @@ namespace Antmicro.Renode.Peripherals.UART
                     timeoutTimer.Reset();
                     bitTimer.Reset();
                     sampleTimer.Reset();
+                    incomingTimer.Reset();
+                    incoming.Clear();
+                    incomingFrame = false;
                     receiving = awaitingIdle = false;
                     txLevel = false;
                     tx.Clear();
@@ -108,6 +115,8 @@ namespace Antmicro.Renode.Peripherals.UART
             PublishPending();
         }
 
+        // A character from outside the pins (a terminal, a native peer) is
+        // received whole, at once.
         public void WriteChar(byte value)
         {
             SynchronizeTime();
@@ -115,9 +124,37 @@ namespace Antmicro.Renode.Peripherals.UART
             {
                 lock(SyncRoot)
                 {
-                    if(ReceiveEnabled && !Loopback) ReceiveCharacter(value);
+                    if(incomingFrame) incoming.Enqueue(value);
+                    else ReceiveIncoming(value);
                 }
             });
+            PublishPending();
+        }
+
+        // With pacing, characters from outside the pins that come faster than
+        // the line carries them at the programmed baud rate wait their turn,
+        // one frame apart, as they would on the wire: a terminal's burst then
+        // reaches a program that reads one character at a time with the FIFO
+        // off. Without it, a burst overruns such a program.
+        public bool PaceExternalCharacters { get; set; }
+
+        private void ReceiveIncoming(byte value)
+        {
+            if(ReceiveEnabled && !Loopback) ReceiveCharacter(value);
+            incomingFrame = PaceExternalCharacters && activeDivisor != 0 && Frequency != 0;
+            if(!incomingFrame) return;
+            incomingTimer.Limit = activeDivisor * (ulong)FrameBits;
+            incomingTimer.ResetValue();
+            incomingTimer.Enabled = true;
+        }
+
+        private void ReceiveNextIncoming()
+        {
+            lock(SyncRoot)
+            {
+                incomingFrame = false;
+                if(incoming.Count != 0) ReceiveIncoming(incoming.Dequeue());
+            }
             PublishPending();
         }
 
@@ -656,6 +693,7 @@ namespace Antmicro.Renode.Peripherals.UART
                 timeoutTimer.Frequency = frequency * 4;
                 bitTimer.Frequency = frequency * 4;
                 sampleTimer.Frequency = frequency * 4;
+                incomingTimer.Frequency = frequency * 4;
             }
             txTimer.Enabled = !ResetHeld && frequency != 0 && shifting;
             timeoutTimer.Enabled = frequency != 0 && timeoutPending && ReceiveEnabled;
@@ -808,6 +846,9 @@ namespace Antmicro.Renode.Peripherals.UART
         private int accessThread;
         private readonly LimitTimer bitTimer;
         private readonly LimitTimer sampleTimer;
+        private readonly LimitTimer incomingTimer;
+        private readonly Queue<byte> incoming;
+        private bool incomingFrame;
         private bool[] frameLevels;
         private int frameBit;
         private bool txLevel, receiving, awaitingIdle;

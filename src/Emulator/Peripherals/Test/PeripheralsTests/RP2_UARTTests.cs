@@ -324,6 +324,33 @@ namespace Antmicro.Renode.PeripheralsTests
         }
 
         [Test]
+        public void ShouldPaceAnExternalBurstOneFrameApartWhenAsked()
+        {
+            Configure(false);
+            uart.PaceExternalCharacters = true;
+            uart.WriteChar(0x48);
+            uart.WriteChar(0x41);
+            uart.WriteChar(0x4c);
+            Assert.AreEqual(0x48u, uart.ReadDoubleWord(0));
+            Assert.AreEqual(0x10u, uart.ReadDoubleWord(0x18) & 0x10);
+            Advance(99);
+            Assert.AreEqual(0x10u, uart.ReadDoubleWord(0x18) & 0x10);
+            Advance(1);
+            Assert.AreEqual(0x41u, uart.ReadDoubleWord(0));
+            Advance(100);
+            Assert.AreEqual(0x4cu, uart.ReadDoubleWord(0));
+            Assert.AreEqual(0u, uart.ReadDoubleWord(4));
+            Assert.AreEqual(0ul, uart.ReceiveOverruns);
+            uart.WriteChar(0x21);
+            uart.WriteChar(0x22);
+            uart.ResetHeld = true;
+            uart.ResetHeld = false;
+            Configure(false);
+            Advance(1000);
+            Assert.AreEqual(0x10u, uart.ReadDoubleWord(0x18) & 0x10);
+        }
+
+        [Test]
         public void ShouldLoopBackOnlyAfterFrameCompletesAndWithoutExternalTransmission()
         {
             Configure(false);
