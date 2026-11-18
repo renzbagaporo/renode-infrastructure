@@ -76,7 +76,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
     // than the request's, applied then: {"t_ns":T,"op":"gpio","pin":N,
     // "level":0|1|"z"} drives or releases a DUT pin's input through GPIO, and
     // {"t_ns":T,"op":"uart","port":P,"data":D} puts a byte in that UART's
-    // receive FIFO (the peer paces bytes at the baud rate).
+    // receive FIFO (the peer paces bytes at the baud rate), and
+    // {"t_ns":T,"op":"spi_clock","bus":B,"mosi":W} clocks one frame into an
+    // SPI block the DUT runs as a slave, CSn framing it, for a controller
+    // played by the peer. The frame the block shifted out comes back at once
+    // as {"op":"spi_clocked","bus":B,"mosi":W,"miso":W|null,"t_ns":T} -> {},
+    // null when the block is not an enabled slave or keeps its output off.
     public sealed class MetalclawNativeBridge : IDelayedI2CBusEndpoint
     {
         // socketPath defaults to $METALCLAW_BRIDGE, the path the native process
@@ -90,6 +95,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             this.busIndex = bus;
             this.gpio = gpio;
             this.uart = uart;
+            this.spi = spi;
             if(string.IsNullOrEmpty(socketPath)) socketPath = Environment.GetEnvironmentVariable("METALCLAW_BRIDGE");
             if(string.IsNullOrEmpty(socketPath)) throw new Exceptions.ConstructionException("Set socketPath or METALCLAW_BRIDGE to the native peer's socket");
             connection = Connection.For(socketPath, replyTimeoutMilliseconds);
@@ -489,6 +495,17 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 }
                 return true;
             }
+            if(op == "spi_clock" && spi != null && (action["bus"]?.GetValue<int>() ?? -1) == busIndex)
+            {
+                var mosi = action["mosi"]?.GetValue<int>() ?? 0;
+                var miso = spi.ClockSlaveFrame((ushort)mosi);
+                Request(new JsonObject
+                {
+                    ["op"] = "spi_clocked", ["bus"] = busIndex, ["mosi"] = mosi,
+                    ["miso"] = miso is ushort word ? JsonValue.Create((int)word) : null
+                });
+                return true;
+            }
             if(op == "uart" && uart != null && (action["port"]?.GetValue<int>() ?? -1) == busIndex)
             {
                 uart.WriteChar((byte)(action["data"]?.GetValue<int>() ?? 0));
@@ -506,6 +523,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private readonly int busIndex;
         private readonly RP2_GPIOBank0 gpio;
         private readonly UART.IUART uart;
+        private readonly SPI.RP2_SPI spi;
         private ulong unsupported;
         private readonly Connection connection;
         private readonly LimitTimer tick;

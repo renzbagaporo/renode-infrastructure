@@ -72,6 +72,27 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.IsFalse(txDriven);
         }
 
+        [Test]
+        public void ShouldExchangeWholeFramesClockedInAsASlave()
+        {
+            spi.WriteDoubleWord(0x00, 7);
+            spi.WriteDoubleWord(0x10, 2);
+            Assert.IsNull(spi.ClockSlaveFrame(0x41), "A disabled block takes no frame");
+            spi.WriteDoubleWord(0x04, 2); // SSE as a master
+            Assert.IsNull(spi.ClockSlaveFrame(0x41), "A master takes no frame clocked in");
+            spi.WriteDoubleWord(0x04, 2 | 4); // SSE, MS
+            spi.WriteDoubleWord(0x08, 0xa5);
+            Assert.AreEqual((ushort)0xa5, spi.ClockSlaveFrame(0x3c), "The transmit FIFO's frame shifted out");
+            Assert.AreEqual((ushort)0, spi.ClockSlaveFrame(0x1c3), "An empty FIFO shifts out zeros");
+            Assert.AreEqual(0x3cu, spi.ReadDoubleWord(0x08));
+            Assert.AreEqual(0xc3u, spi.ReadDoubleWord(0x08), "Only the frame's bits are received");
+            Assert.AreEqual(0u, spi.ReadDoubleWord(0x0c) & 4, "RNE");
+            for(var frame = 0; frame < 9; frame++) spi.ClockSlaveFrame((ushort)frame);
+            Assert.AreEqual(1u, spi.ReadDoubleWord(0x18) & 1, "A ninth unread frame overruns");
+            spi.WriteDoubleWord(0x04, 2 | 4 | 8); // SOD
+            Assert.IsNull(spi.ClockSlaveFrame(0), "SOD keeps the output off");
+        }
+
         [TestCase(false)]
         [TestCase(true)]
         public void ShouldSendEachFrameOnceAcrossChipSelectPulses(bool pulse)

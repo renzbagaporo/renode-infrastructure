@@ -434,6 +434,34 @@ namespace Antmicro.Renode.Peripherals.SPI
 
         // Slave ----------------------------------------------------------
 
+        // As a slave: one whole frame clocked in at once by a controller that
+        // is not on the DUT's pins, CSn falling before it and rising after.
+        // The block receives the word as if sampled from its receive pin and
+        // the frame it shifts out is returned: the next transmit FIFO entry,
+        // or zeros when that is empty. Null when the block is not an enabled
+        // slave, or SOD keeps its output off.
+        public ushort? ClockSlaveFrame(ushort word)
+        {
+            ushort? shiftedOut = null;
+            machine.ClockSource.ExecuteInLock(() =>
+            {
+                lock(SyncRoot)
+                {
+                    if(!Enabled || !SlaveMode) return;
+                    LoadSlaveFrame();
+                    var output = (ushort)(slaveOut & FrameMask);
+                    slaveLoaded = false;
+                    if(rx.Count >= Capacity) rawInterrupts |= OverrunInterrupt;
+                    else rx.Enqueue((ushort)(word & FrameMask));
+                    RestartTimeout();
+                    UpdateSignals();
+                    if((control1 & 8) == 0) shiftedOut = output;
+                }
+            });
+            PublishPending();
+            return shiftedOut;
+        }
+
         private void OnSlaveSelect(bool selected)
         {
             if(slaveSelected == selected) return;
