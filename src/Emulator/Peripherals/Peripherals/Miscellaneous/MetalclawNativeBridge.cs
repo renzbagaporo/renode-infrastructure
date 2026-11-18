@@ -47,6 +47,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
     // With an SPI master the bridge answers each frame as it starts,
     //   {"op":"spi","bus":B,"mosi":W,"bits":N,"t_ns":T} -> {"miso":W}
     // and is named in the hello by the DUT's SCK, MOSI, MISO and CS pins.
+    // With the DUT's GPIO bank given, each frame and each I2C START also
+    // names the pins the block is routed to now, as "pins":{"sck":N,
+    // "mosi":N,"miso":N} or "pins":{"sda":N,"scl":N}, read from
+    // GPIO_CTRL.FUNCSEL, since a program may route a block to other pins
+    // than the hello's.
     // Watched pins (an SPI bridge's CS, and any a {"op":"watch","pin":N} or
     // {"op":"watch","pins":[...]} action adds) report every change of the
     // DUT's own drive on them, never the level the peer's actions put on the
@@ -83,7 +88,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 connection.Register("spi", new JsonObject { ["bus"] = bus, ["sck"] = spiSck, ["mosi"] = spiMosi, ["miso"] = spiMiso, ["cs"] = spiCs });
                 spi.FrameTarget = (mosi, bits, at) =>
                 {
-                    var reply = Request(new JsonObject { ["op"] = "spi", ["bus"] = busIndex, ["mosi"] = mosi, ["bits"] = bits }, at);
+                    var request = new JsonObject { ["op"] = "spi", ["bus"] = busIndex, ["mosi"] = mosi, ["bits"] = bits };
+                    AddRoutedPins(request, SPIFunction, pin => (pin / 8) % 2 == busIndex,
+                        pin => pin % 4 == 0 ? "miso" : pin % 4 == 2 ? "sck" : pin % 4 == 3 ? "mosi" : null);
+                    var reply = Request(request, at);
                     return (ushort)(reply?["miso"]?.GetValue<int>() ?? 0xffff);
                 };
                 if(spiCs >= 0) connection.Watch(spiCs);
@@ -119,6 +127,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 request["addr"] = busEvent.Address;
                 request["read"] = busEvent.IsRead;
                 request["repeated"] = busEvent.Repeated;
+                AddRoutedPins(request, I2CFunction, pin => (pin / 2) % 2 == busIndex, pin => pin % 2 == 0 ? "sda" : "scl");
                 break;
             case I2CBusEventType.Write:
                 request["ev"] = "write";
@@ -152,6 +161,20 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         // Requests sent and answered since the bridge was created.
         public ulong Requests => Interlocked.Read(ref requests);
+
+        // The first pin routed to this block in each role, from FUNCSEL.
+        private void AddRoutedPins(JsonObject request, int function, Func<int, bool> ofThisBlock, Func<int, string> role)
+        {
+            if(gpio == null) return;
+            var pins = new JsonObject();
+            for(var pin = 0; pin < MaximumPins; pin++)
+            {
+                if(gpio.GetFunction(pin) != function || !ofThisBlock(pin)) continue;
+                var name = role(pin);
+                if(name != null && !pins.ContainsKey(name)) pins[name] = pin;
+            }
+            request["pins"] = pins;
+        }
 
         // A change of the DUT's drive on a watched pin, at the time the GPIO
         // bank delivers it.
@@ -230,6 +253,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
             if(unsupported++ == 0) this.Log(LogLevel.Warning, "Native peer action {0} is not supported here", action.ToJsonString());
         }
+
+        private const int SPIFunction = 1;
+        private const int I2CFunction = 3;
+        private const int MaximumPins = 48;
 
         private readonly IMachine machine;
         private readonly int busIndex;
