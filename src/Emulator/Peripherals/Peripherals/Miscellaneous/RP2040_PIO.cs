@@ -1163,6 +1163,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 if(now + 2 < lastInputTick[pin]) now = lastInputTick[pin] - 2;
                 lastInputTick[pin] = now + 2;
                 inputHistory[pin].Enqueue(new InputTransition { Tick = now + 2, Value = level });
+                this.DebugLog("Input {0} (GPIO {1}) -> {2}, reaching the state machines at cycle {3}; the block is at cycle {4}, {5}",
+                    pin, pin + gpioBase, level ? 1 : 0, now + 2, CurrentCycle, SignalTime.Of(machine));
                 var visibleTick = now + ((inputSyncBypass & (1u << pin)) != 0 ? 1ul : 2ul);
                 foreach(var sm in stateMachines)
                 {

@@ -84,6 +84,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
     // played by the peer. The frame the block shifted out comes back at once
     // as {"op":"spi_clocked","bus":B,"mosi":W,"miso":W|null,"t_ns":T} -> {},
     // null when the block is not an enabled slave or keeps its output off.
+    // {"t_ns":T,"op":"wake"} asks for a request at T: the bridge sends
+    // {"op":"wake","t_ns":T} then, so the peer can act at a time no DUT
+    // edge or tick falls on.
     // {"t_ns":T,"op":"pull","pin":N,"level":1|0|"none"} puts a pull on a DUT
     // pin's line outside the chip (a board's pull-up resistor): weaker than
     // any drive, stronger than the pad's own pulls; "none" removes it.
@@ -559,6 +562,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 {
                     foreach(var entry in pins) connection.Watch(entry.GetValue<int>());
                 }
+                return true;
+            }
+            if(op == "wake")
+            {
+                Request(new JsonObject { ["op"] = "wake" });
                 return true;
             }
             if(op == "pull" && gpio != null)
