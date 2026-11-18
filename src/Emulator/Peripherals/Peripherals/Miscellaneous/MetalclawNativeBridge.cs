@@ -44,8 +44,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
     // first and whenever it changes, so a part that speaks first (a GPS on a
     // UART) is found on its pins:
     //   {"op":"route","i2c":[{"bus":0,"sda":4,"scl":5}],"spi":[{"bus":0,
-    //    "sck":18,"mosi":19,"miso":16}],"uart":[{"port":1,"tx":4,"rx":5}],"t_ns":T} -> {} Bridges naming the same socket share one connection, so a DUT
-    // with several buses has one bridge per bus, one of them ticking.
+    //    "sck":18,"mosi":19,"miso":16}],"uart":[{"port":1,"tx":4,"rx":5}],"t_ns":T} -> {}
+    // Bridges naming the same socket share one connection, so a DUT with
+    // several buses has one bridge per bus, one of them ticking. An action
+    // in any reply goes to the bridge on that connection that owns its UART
+    // port or the GPIO bank.
     // With a UART the bridge forwards each byte the DUT transmits,
     //   {"op":"uart","port":P,"data":[D],"t_ns":T} -> {}
     // and is named in the hello by its port and the DUT's own TX and RX pins.
@@ -90,6 +93,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             if(string.IsNullOrEmpty(socketPath)) socketPath = Environment.GetEnvironmentVariable("METALCLAW_BRIDGE");
             if(string.IsNullOrEmpty(socketPath)) throw new Exceptions.ConstructionException("Set socketPath or METALCLAW_BRIDGE to the native peer's socket");
             connection = Connection.For(socketPath, replyTimeoutMilliseconds);
+            connection.Join(this);
             if(uart != null)
             {
                 connection.Register("uart", new JsonObject { ["port"] = bus, ["tx"] = uartTx, ["rx"] = uartRx });
@@ -457,7 +461,15 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             });
         }
 
+        // An action may ride on any bridge's reply (the ticking bridge gets
+        // most); the bridge that owns its port or pin applies it.
         private void Apply(JsonObject action)
+        {
+            if(TryApply(action) || connection.TryApplyElsewhere(this, action)) return;
+            if(unsupported++ == 0) this.Log(LogLevel.Warning, "Native peer action {0} has no bridge to apply it", action.ToJsonString());
+        }
+
+        private bool TryApply(JsonObject action)
         {
             var op = action["op"]?.GetValue<string>();
             if(op == "gpio" && gpio != null)
@@ -466,7 +478,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 var level = action["level"];
                 if(level is JsonValue value && value.TryGetValue<string>(out var text) && text == "z") gpio.ReleaseInput(pin);
                 else gpio.OnGPIO(pin, (level?.GetValue<int>() ?? 0) != 0);
-                return;
+                return true;
             }
             if(op == "watch")
             {
@@ -475,14 +487,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 {
                     foreach(var entry in pins) connection.Watch(entry.GetValue<int>());
                 }
-                return;
+                return true;
             }
             if(op == "uart" && uart != null && (action["port"]?.GetValue<int>() ?? -1) == busIndex)
             {
                 uart.WriteChar((byte)(action["data"]?.GetValue<int>() ?? 0));
-                return;
+                return true;
             }
-            if(unsupported++ == 0) this.Log(LogLevel.Warning, "Native peer action {0} is not supported here", action.ToJsonString());
+            return false;
         }
 
         private const int SPIFunction = 1;
@@ -515,6 +527,22 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     }
                     return connection;
                 }
+            }
+
+            public void Join(MetalclawNativeBridge bridge)
+            {
+                lock(members) members.Add(bridge);
+            }
+
+            public bool TryApplyElsewhere(MetalclawNativeBridge from, JsonObject action)
+            {
+                MetalclawNativeBridge[] others;
+                lock(members) others = members.ToArray();
+                foreach(var bridge in others)
+                {
+                    if(bridge != from && bridge.TryApply(action)) return true;
+                }
+                return false;
             }
 
             public void Watch(int pin)
@@ -620,6 +648,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             private readonly int timeoutMilliseconds;
             private readonly object sync = new object();
             private readonly HashSet<int> watchedPins = new HashSet<int>();
+            private readonly List<MetalclawNativeBridge> members = new List<MetalclawNativeBridge>();
             private bool pinReportsClaimed;
             private readonly Dictionary<string, JsonArray> buses = new Dictionary<string, JsonArray>
             {
