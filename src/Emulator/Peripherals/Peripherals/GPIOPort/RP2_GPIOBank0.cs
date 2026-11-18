@@ -48,6 +48,7 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             isolatedOutput = new bool[registerCount];
             isolatedEnable = new bool[registerCount];
             external = new bool?[registerCount];
+            linePull = new bool?[registerCount];
             sampled = new bool[registerCount];
             interruptInput = new bool[registerCount];
             drivenValue = new bool[registerCount];
@@ -116,6 +117,22 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
                 if(at.HasValue && (!earliest.HasValue || at.Value < earliest.Value)) earliest = at;
             }
             return earliest;
+        }
+
+        // A pull on the line outside the chip (a board's pull-up resistor):
+        // weaker than any drive, the chip's own or an external one, and
+        // stronger than the pad's pull resistors, so it sets the level while
+        // nothing drives the line. Null removes it. A board reset keeps it.
+        public void SetLinePull(int pin, bool? level)
+        {
+            if(!IsBondedPin(pin)) return;
+            lock(SyncRoot)
+            {
+                linePull[pin] = level;
+                UpdatePin(pin);
+                UpdateInterrupts();
+            }
+            PublishPending();
         }
 
         public void ReleaseInput(int pin)
@@ -229,7 +246,7 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             lock(SyncRoot)
             {
                 if(!IsBondedPin(pin)) return null;
-                if(!external[pin].HasValue && !drivenEnable[pin] && (pads[pin] & 0xc) == 0) return null;
+                if(!external[pin].HasValue && !drivenEnable[pin] && !linePull[pin].HasValue && (pads[pin] & 0xc) == 0) return null;
                 return ReadWireLevel(pin);
             }
         }
@@ -650,6 +667,10 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             {
                 return drivenValue[pin];
             }
+            if(linePull[pin].HasValue)
+            {
+                return linePull[pin].Value;
+            }
             var pulls = pads[pin] & 0xc;
             return pulls == 0xc ? sampled[pin] : pulls == 8;
         }
@@ -747,6 +768,7 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
         private readonly uint[] pads;
         private readonly bool?[] publishedPull;
         private readonly bool?[] external;
+        private readonly bool?[] linePull;
         private readonly bool[] sampled;
         private readonly bool[] interruptInput;
         private readonly bool[] drivenValue;

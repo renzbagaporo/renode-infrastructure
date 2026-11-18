@@ -84,6 +84,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
     // played by the peer. The frame the block shifted out comes back at once
     // as {"op":"spi_clocked","bus":B,"mosi":W,"miso":W|null,"t_ns":T} -> {},
     // null when the block is not an enabled slave or keeps its output off.
+    // {"t_ns":T,"op":"pull","pin":N,"level":1|0|"none"} puts a pull on a DUT
+    // pin's line outside the chip (a board's pull-up resistor): weaker than
+    // any drive, stronger than the pad's own pulls; "none" removes it.
     // {"t_ns":T,"op":"join","pins":[A,B]} wires two DUT pins together, as a
     // jumper, until {"t_ns":T,"op":"unjoin","pins":[A,B]}: the DUT's drive
     // on either becomes the other's input at once ("z" releases it), and two
@@ -556,6 +559,18 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 {
                     foreach(var entry in pins) connection.Watch(entry.GetValue<int>());
                 }
+                return true;
+            }
+            if(op == "pull" && gpio != null)
+            {
+                var pin = action["pin"]?.GetValue<int>() ?? -1;
+                var level = action["level"];
+                bool? pull = null;
+                if(!(level is JsonValue text && text.TryGetValue<string>(out var name) && name == "none"))
+                {
+                    pull = (level?.GetValue<int>() ?? 1) != 0;
+                }
+                gpio.SetLinePull(pin, pull);
                 return true;
             }
             if(op == "join" || op == "unjoin")

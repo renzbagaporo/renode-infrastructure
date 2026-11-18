@@ -100,6 +100,27 @@ namespace Antmicro.Renode.PeripheralsTests
         }
 
         [Test]
+        public void ShouldLetALinePullOutpullThePadButNotADrive()
+        {
+            var gpio = new RP2_GPIOBank0(machine);
+            gpio.SetPadConfiguration(4, 0x56); // IE, pull-down
+            gpio.WriteDoubleWord(4 * 8 + 4, 5); // FUNCSEL SIO
+            Assert.IsFalse(gpio.GetInput(4), "the pad's pull-down");
+            gpio.SetLinePull(4, true);
+            Assert.IsTrue(gpio.GetInput(4), "a board's pull-up outpulls the pad");
+            gpio.SetPeripheralOutput(5, 4, false, true);
+            Assert.IsFalse(gpio.GetInput(4), "the chip's own drive wins");
+            gpio.SetPeripheralOutput(5, 4, false, false);
+            Assert.IsTrue(gpio.GetInput(4));
+            gpio.OnGPIO(4, false);
+            Assert.IsFalse(gpio.GetInput(4), "an external drive wins");
+            gpio.ReleaseInput(4);
+            Assert.IsTrue(gpio.GetInput(4));
+            gpio.SetLinePull(4, null);
+            Assert.IsFalse(gpio.GetInput(4));
+        }
+
+        [Test]
         public void ShouldGatePeripheralOutputByFunctionEnableAndPadControl()
         {
             var gpio = new RP2_GPIOBank0(machine, rp2350: true);
