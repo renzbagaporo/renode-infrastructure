@@ -47,9 +47,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
     // With an SPI master the bridge answers each frame as it starts,
     //   {"op":"spi","bus":B,"mosi":W,"bits":N,"t_ns":T} -> {"miso":W}
     // and is named in the hello by the DUT's SCK, MOSI, MISO and CS pins.
-    // The pins in watchPins (an SPI bridge's CS among them) and any a
-    // {"op":"watch","pins":[...]} action adds are reported at every edge:
-    //   {"op":"gpio","pin":N,"level":0|1,"t_ns":T} -> {}
+    // Watched pins (an SPI bridge's CS, and any a {"op":"watch","pin":N} or
+    // {"op":"watch","pins":[...]} action adds) report every change of the
+    // DUT's own drive on them, never the level the peer's actions put on the
+    // line, with "z" when the DUT releases the pin:
+    //   {"op":"gpio","pin":N,"level":0|1|"z","t_ns":T} -> {}
     // Any reply may carry "actions", each at its own virtual time no earlier
     // than the request's, applied then: {"t_ns":T,"op":"gpio","pin":N,
     // "level":0|1|"z"} drives or releases a DUT pin's input through GPIO, and
@@ -87,7 +89,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 if(spiCs >= 0) connection.Watch(spiCs);
             }
             // One bridge per connection reports its watched pins.
-            if(gpio != null && connection.ClaimPinReports()) gpio.InputChanged += OnPinChanged;
+            if(gpio != null && connection.ClaimPinReports()) gpio.DriveChanged += OnDriveChanged;
             if(tickMicroseconds != 0)
             {
                 tick = new LimitTimer(machine.ClockSource, 1000000, this, "native tick", limit: tickMicroseconds,
@@ -151,11 +153,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // Requests sent and answered since the bridge was created.
         public ulong Requests => Interlocked.Read(ref requests);
 
-        // A watched DUT pin's edge, at the time the GPIO bank delivers it.
-        private void OnPinChanged(int pin, bool level)
+        // A change of the DUT's drive on a watched pin, at the time the GPIO
+        // bank delivers it.
+        private void OnDriveChanged(int pin, bool value, bool enabled)
         {
             if(!connection.Watched(pin)) return;
-            Request(new JsonObject { ["op"] = "gpio", ["pin"] = pin, ["level"] = level ? 1 : 0 }, SignalTime.Of(machine));
+            JsonNode level = enabled ? (JsonNode)(value ? 1 : 0) : "z";
+            Request(new JsonObject { ["op"] = "gpio", ["pin"] = pin, ["level"] = level }, SignalTime.Of(machine));
         }
 
         private JsonObject Request(JsonObject request, TimeInterval? at = null)
@@ -210,9 +214,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 else gpio.OnGPIO(pin, (level?.GetValue<int>() ?? 0) != 0);
                 return;
             }
-            if(op == "watch" && action["pins"] is JsonArray pins)
+            if(op == "watch")
             {
-                foreach(var entry in pins) connection.Watch(entry.GetValue<int>());
+                if(action["pin"] is JsonValue single) connection.Watch(single.GetValue<int>());
+                if(action["pins"] is JsonArray pins)
+                {
+                    foreach(var entry in pins) connection.Watch(entry.GetValue<int>());
+                }
                 return;
             }
             if(op == "uart" && uart != null && (action["port"]?.GetValue<int>() ?? -1) == busIndex)
