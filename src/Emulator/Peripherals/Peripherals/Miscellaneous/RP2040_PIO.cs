@@ -425,6 +425,15 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             if(bus.TryGetCurrentContextState<CortexM.ContextState>(out var _, out var state) && state.DebugAccess) return;
             if(!bus.TryGetTransactionInitiator(out var initiator) || !(initiator is BaseCPU cpu) || !cpu.OnPossessedThread || cpu.TimeHandle == null) return;
             var target = cpu.TimeHandle.TotalElapsedTime.Ticks;
+            // Up to the clock's next event outside this block at most: that
+            // event (a UART's next bit, another block's step) can change an
+            // input, and a change made at a cycle the block has already run
+            // reaches it late.
+            if(target > machine.ClockSource.CurrentValue.Ticks && machine.ClockSource is BaseClockSource clockSource)
+            {
+                var foreign = clockSource.NearestLimitAtExcept(this);
+                if(foreign.Ticks < target) target = foreign.Ticks;
+            }
             if(dma == null) dma = RP2_Chip.Own<RP2040_DMA>(machine, this).FirstOrDefault();
             while(true)
             {

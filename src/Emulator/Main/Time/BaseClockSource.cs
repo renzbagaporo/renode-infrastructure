@@ -265,6 +265,28 @@ namespace Antmicro.Renode.Time
             }
         }
 
+        // Absolute time of the nearest limit among the entries `owner` does not
+        // own, or Maximal: until then nothing else scheduled on this clock runs.
+        public TimeInterval NearestLimitAtExcept(IEmulationElement owner)
+        {
+            lock(sync)
+            {
+                var nearestIn = TimeInterval.Maximal;
+                for(var i = 0; i < clockEntries.Count; i++)
+                {
+                    var entry = clockEntries[i];
+                    var handler = clockEntriesUpdateHandlers[i];
+                    if(!entry.Clocked || !entry.Enabled || handler == null || ReferenceEquals(entry.Owner, owner))
+                    {
+                        continue;
+                    }
+                    // On a copy: only the time to its limit is wanted.
+                    handler(ref entry, unaccountedTimes[i], ref nearestIn);
+                }
+                return nearestIn.Ticks > TimeInterval.Maximal.Ticks - totalElapsed.Ticks ? TimeInterval.Maximal : totalElapsed + nearestIn;
+            }
+        }
+
         public TimeInterval NearestLimitIn
         {
             get
