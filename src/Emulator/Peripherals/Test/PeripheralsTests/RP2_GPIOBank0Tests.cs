@@ -56,6 +56,30 @@ namespace Antmicro.Renode.PeripheralsTests
         }
 
         [Test]
+        public void ShouldCarryAJoinedPinsDriveToItsPartnerBeforeReportingTheDrive()
+        {
+            var gpio = new RP2_GPIOBank0(machine);
+            var order = new List<string>();
+            gpio.InputChanged += (pin, value) =>
+            {
+                if(pin == 3) order.Add($"input 3 {(value ? 1 : 0)}");
+            };
+            gpio.DriveChanged += (pin, value, enabled) =>
+            {
+                if(pin == 4) order.Add(enabled ? $"drive 4 {(value ? 1 : 0)}" : "drive 4 z");
+            };
+            gpio.SetJoined(4, 3, true);
+            gpio.WriteDoubleWord(4 * 8 + 4, 0x1f | (3u << 8) | (3u << 12)); // GP4 driven high
+            gpio.WriteDoubleWord(4 * 8 + 4, 0x1f | (2u << 8) | (3u << 12)); // then low
+            CollectionAssert.AreEqual(new[] { "input 3 1", "drive 4 1", "input 3 0", "drive 4 0" }, order);
+            gpio.WriteDoubleWord(4 * 8 + 4, 0x1f | (3u << 8) | (3u << 12));
+            order.Clear();
+            gpio.SetJoined(4, 3, false);
+            // Released, GP3 reads its pad's default pull-down.
+            CollectionAssert.AreEqual(new[] { "input 3 0" }, order, "the removed wire releases GP3's input");
+        }
+
+        [Test]
         public void ShouldDeliverReciprocalTransitionsWithoutLockingTheOtherBank()
         {
             var other = new RP2_GPIOBank0(machine);

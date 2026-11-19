@@ -476,11 +476,6 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // bank delivers it.
         private void OnDriveChanged(int pin, bool value, bool enabled)
         {
-            foreach(var partner in connection.JoinedTo(pin))
-            {
-                if(enabled) gpio.OnGPIO(partner, value);
-                else gpio.ReleaseInput(partner);
-            }
             if(!connection.Watched(pin)) return;
             JsonNode level = enabled ? (JsonNode)(value ? 1 : 0) : "z";
             Request(new JsonObject { ["op"] = "gpio", ["pin"] = pin, ["level"] = level }, SignalTime.Of(machine));
@@ -594,15 +589,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 var a = pair[0].GetValue<int>();
                 var b = pair[1].GetValue<int>();
                 connection.SetJoined(a, b, op == "join");
-                if(gpio == null) return true;
-                // A new jumper carries each pin's present drive to the other;
-                // a removed one releases the inputs it was driving.
-                foreach(var (from, to) in new[] { (a, b), (b, a) })
-                {
-                    gpio.GetOutputState(from, out var level, out var enabled);
-                    if(op == "join" && enabled) gpio.OnGPIO(to, level);
-                    else gpio.ReleaseInput(to);
-                }
+                // The bank carries each pin's drive to the other, in the same
+                // update, so the partner's input reaches its readers on time.
+                gpio?.SetJoined(a, b, op == "join");
                 return true;
             }
             if(op == "spi_clock" && spi != null && (action["bus"]?.GetValue<int>() ?? -1) == busIndex)

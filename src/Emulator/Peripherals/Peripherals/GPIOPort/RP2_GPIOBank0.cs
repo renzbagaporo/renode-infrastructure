@@ -135,6 +135,31 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             PublishPending();
         }
 
+        // Wires two pins together outside the chip, as a jumper, or removes
+        // that wire: each pin's drive becomes the other's input ("z" releases
+        // it). The partner's input changes in the same update as the drive,
+        // so both reach their readers together (a PIO receiving on one pin
+        // what a UART sends on the other).
+        public void SetJoined(int a, int b, bool joined)
+        {
+            if(!IsBondedPin(a) || !IsBondedPin(b) || a == b) return;
+            lock(SyncRoot)
+            {
+                var wire = Tuple.Create(Math.Min(a, b), Math.Max(a, b));
+                if(joined) joins.Add(wire);
+                else joins.Remove(wire);
+                // A new wire carries each pin's present drive to the other; a
+                // removed one releases the inputs it was driving.
+                foreach(var (from, to) in new[] { (a, b), (b, a) })
+                {
+                    external[to] = joined && drivenEnable[from] ? drivenValue[from] : (bool?)null;
+                    UpdatePin(to);
+                }
+                UpdateInterrupts();
+            }
+            PublishPending();
+        }
+
         public void ReleaseInput(int pin)
         {
             if(!IsBondedPin(pin)) return;
@@ -612,6 +637,16 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             var driveChanged = value != drivenValue[pin] || enabled != drivenEnable[pin];
             drivenValue[pin] = value;
             drivenEnable[pin] = enabled;
+            if(driveChanged && joins.Count != 0)
+            {
+                foreach(var jumper in joins)
+                {
+                    var partner = jumper.Item1 == pin ? jumper.Item2 : jumper.Item2 == pin ? jumper.Item1 : -1;
+                    if(partner < 0) continue;
+                    external[partner] = enabled ? value : (bool?)null;
+                    UpdatePin(partner);
+                }
+            }
             var padInput = ReadPadInput(pin);
             var input = Override(padInput, (control[pin] >> 16) & 3);
             if(sampled[pin] != input)
@@ -768,6 +803,7 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
         private readonly uint[] pads;
         private readonly bool?[] publishedPull;
         private readonly bool?[] external;
+        private readonly HashSet<Tuple<int, int>> joins = new HashSet<Tuple<int, int>>();
         private readonly bool?[] linePull;
         private readonly bool[] sampled;
         private readonly bool[] interruptInput;
