@@ -380,8 +380,15 @@ namespace Antmicro.Renode.Peripherals.UART
             {
                 interruptStatus |= TransmitInterrupt;
             }
+            // A frame started by a register access starts at the accessing
+            // CPU's time (AccessOrClockTime), which may lead the clock by up
+            // to a quantum, longer than a bit at high baud rates. Its timers
+            // start that much later too, so its bits follow its start bit
+            // instead of being stamped before it.
+            var lead = AccessOrClockTime() - machine.ClockSource.CurrentValue;
+            var leadCycles = (ulong)((UInt128)lead.Ticks * txTimer.Frequency / TimeInterval.TicksPerSecond);
             txTimer.Enabled = false;
-            txTimer.Limit = activeDivisor * (ulong)FrameBits;
+            txTimer.Limit = activeDivisor * (ulong)FrameBits + leadCycles;
             txTimer.ResetValue();
             txTimer.Enabled = true;
             if(txPins.Length != 0 && !shiftLoopback)
@@ -390,7 +397,7 @@ namespace Antmicro.Renode.Peripherals.UART
                 frameLevels = FrameLevels(shiftByte);
                 frameBit = 1;
                 bitTimer.Enabled = false;
-                bitTimer.Limit = activeDivisor;
+                bitTimer.Limit = activeDivisor + leadCycles;
                 bitTimer.ResetValue();
                 bitTimer.Enabled = true;
                 SetTransmitLine(false);
@@ -439,6 +446,9 @@ namespace Antmicro.Renode.Peripherals.UART
                     return;
                 }
                 SetTransmitLine(frameLevels[frameBit]);
+                // After a start bit that began ahead of the clock, the
+                // following bits come a bit time apart.
+                if(bitTimer.Limit != activeDivisor) bitTimer.Limit = activeDivisor;
                 // The stop level holds until the frame timer starts the next frame.
                 if(++frameBit >= frameLevels.Length) bitTimer.Enabled = false;
             }
