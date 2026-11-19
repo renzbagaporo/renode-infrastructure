@@ -418,7 +418,6 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private enum PinState { Idle, Address, Write, Read, Ignore }
 
-        private string lastRouting;
         private PinState pinState;
         private int pinSda = -1, pinScl = -1, pinBits;
         private byte pinShift, pinOut;
@@ -437,9 +436,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     pin => pin % 4 == 0 ? "miso" : pin % 4 == 2 ? "sck" : pin % 4 == 3 ? "mosi" : null),
                 ["uart"] = Routes(UARTFunctions, 2, "port", pin => ((pin + 4) / 8) % 2, UARTRole),
             };
-            var text = route.ToJsonString();
-            if(text == lastRouting) return;
-            lastRouting = text;
+            if(!connection.RoutingChanged(route.ToJsonString())) return;
             Request(route);
         }
 
@@ -491,6 +488,15 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private JsonObject Request(JsonObject request, TimeInterval? at = null)
         {
+            if(request["op"]?.GetValue<string>() != "route")
+            {
+                // Requests follow the program's order: pin changes an earlier
+                // instruction made (a chip select through SIO) go out before
+                // a bus event, and so does a routing change (FUNCSEL handing a
+                // pin to a block), instead of waiting for the next tick.
+                gpio?.PublishPending();
+                ReportRouting();
+            }
             var now = at ?? machine.ClockSource.CurrentValue;
             var requestTime = (long)now.TotalNanoseconds;
             request["t_ns"] = requestTime;
@@ -722,6 +728,18 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
             private bool Linked(List<int> ours, List<int> theirs) => ours.Any(pin => JoinedTo(pin).Any(theirs.Contains));
 
+            // Whether the routing differs from the last one reported, which it
+            // then becomes; any bridge on the connection may report it.
+            public bool RoutingChanged(string routing)
+            {
+                lock(sync)
+                {
+                    if(routing == lastRouting) return false;
+                    lastRouting = routing;
+                    return true;
+                }
+            }
+
             public void Watch(int pin)
             {
                 lock(watchedPins) watchedPins.Add(pin);
@@ -849,6 +867,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             private readonly int timeoutMilliseconds;
             private readonly object sync = new object();
             private readonly HashSet<int> watchedPins = new HashSet<int>();
+            private string lastRouting;
             private readonly List<MetalclawNativeBridge> members = new List<MetalclawNativeBridge>();
             private readonly HashSet<Tuple<int, int>> joins = new HashSet<Tuple<int, int>>();
             private bool pinReportsClaimed;
