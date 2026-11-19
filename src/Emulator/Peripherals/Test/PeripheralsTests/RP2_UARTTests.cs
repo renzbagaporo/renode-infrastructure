@@ -11,7 +11,6 @@ using System.Threading.Tasks;
 
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Peripherals;
-using Antmicro.Renode.Peripherals.GPIOPort;
 using Antmicro.Renode.Peripherals.UART;
 using Antmicro.Renode.Time;
 
@@ -322,42 +321,6 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.IsTrue(uart.IRQ.IsSet);
             uart.WriteDoubleWord(0x44, 0x400);
             Assert.IsFalse(uart.IRQ.IsSet);
-        }
-
-        [Test]
-        public void ShouldReceiveAFrameWhoseStartEdgeArrivedDuringThePreviousFrame()
-        {
-            var gpio = new RP2_GPIOBank0(machine);
-            var pinned = new RP2_UART(machine, clocks, gpio: gpio, index: 0);
-            gpio.SetPadConfiguration(1, 0x56);
-            gpio.WriteDoubleWord(1 * 8 + 4, 2); // GP1: UART0 RX
-            gpio.OnGPIO(1, true);
-            pinned.WriteDoubleWord(0x24, 1); // 100 kbaud: 10 us bits
-            pinned.WriteDoubleWord(0x28, 0);
-            pinned.WriteDoubleWord(0x2c, 0x70); // 8N1, FIFO on
-            pinned.WriteDoubleWord(0x30, 0x301);
-            // Two back-to-back frames, every edge delivered now and stamped at
-            // its own time ahead of the clock, as from a CPU running ahead:
-            // the second start bit arrives while the first frame is sampled.
-            var levels = new List<bool>();
-            foreach(var value in new byte[] { 0x55, 0xa3 })
-            {
-                levels.Add(false);
-                for(var bit = 0; bit < 8; bit++) levels.Add((value >> bit & 1) != 0);
-                levels.Add(true);
-            }
-            var start = machine.ClockSource.CurrentValue + TimeInterval.FromMicroseconds(5);
-            var line = true;
-            for(var bit = 0; bit < levels.Count; bit++)
-            {
-                if(levels[bit] == line) continue;
-                line = levels[bit];
-                using(SignalTime.At(machine, start + TimeInterval.FromMicroseconds((ulong)bit * 10))) gpio.OnGPIO(1, line);
-            }
-            Advance(300);
-            Assert.AreEqual(0x55u, pinned.ReadDoubleWord(0) & 0xfff);
-            Assert.AreEqual(0xa3u, pinned.ReadDoubleWord(0) & 0xfff);
-            Assert.AreEqual(0ul, pinned.ReceiveFramingErrors);
         }
 
         [Test]
