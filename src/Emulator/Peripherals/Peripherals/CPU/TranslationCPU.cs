@@ -805,6 +805,10 @@ namespace Antmicro.Renode.Peripherals.CPU
         public bool SkipWhilePolling(Antmicro.Renode.Time.TimeInterval interval)
         {
             if(!OnPossessedThread || !insideTranslatedCode) return false;
+            // A skip takes effect once the current translation block ends, so
+            // the loop may poll again before it does; that poll is already
+            // covered, and skipping again would run past the time asked for.
+            if(SkipInstructions > 0) return false;
             var total = TlibGetTotalExecutedInstructions();
             var unreported = total > reportedTotalInstructions ? total - reportedTotalInstructions : 0;
             unreported += (ulong)Math.Max(0, TlibGetCurrentBlockProgress());

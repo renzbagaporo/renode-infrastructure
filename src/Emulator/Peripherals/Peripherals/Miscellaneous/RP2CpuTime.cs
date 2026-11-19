@@ -84,9 +84,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // in a tight loop: its time skips ahead without executing, up to
         // `stableFor` (how long the value cannot change; null when the
         // peripheral cannot tell) and never past the CPU's next
-        // synchronization point (TranslationCPU.SkipWhilePolling). A register
-        // that changes on its own schedule (a counter, with `stableFor` until
-        // its next count) is polled whatever value each read returned.
+        // synchronization point (TranslationCPU.SkipWhilePolling). A read
+        // that returns a new value (a counter's next count) skips nothing,
+        // since that value is what ends the loop, and a skip then would land
+        // on the code after it.
         public static void SkipIfPolling(IMachine machine, IPeripheral peripheral, long offset, uint value, TimeInterval? stableFor = null)
         {
             if(!TryGetInitiator(machine, out var initiator) || !(initiator is TranslationCPU cpu)) return;
@@ -94,7 +95,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             var pc = (ulong)cpu.PC;
             var poll = polls.GetOrCreateValue(cpu);
             var spinning = ReferenceEquals(poll.Peripheral, peripheral) && poll.Offset == offset
-                && (stableFor.HasValue || poll.Value == value) && poll.PC == pc && executed - poll.Executed <= SpinInstructions;
+                && poll.Value == value && poll.PC == pc && executed - poll.Executed <= SpinInstructions;
             poll.Peripheral = peripheral;
             poll.Offset = offset;
             poll.Value = value;
