@@ -494,29 +494,43 @@ namespace Antmicro.Renode.Peripherals.UART
                         return;
                     }
                     if(receiving || awaitingIdle || !ReceiveEnabled || Loopback) return;
-                    // A falling edge starts the frame; check the start bit at its
-                    // centre, half a bit from the time of the edge.
-                    receiving = true;
-                    receivePin = pin;
-                    receiveBit = -1;
-                    receiveValue = 0;
-                    receiveOnes = 0;
-                    receiveErrors = 0;
-                    frameSamples.Clear();
-                    var half = (long)(activeDivisor / 2);
-                    if(made.HasValue)
-                    {
-                        var now = machine.ClockSource.CurrentValue;
-                        var offset = made.Value > now ? (long)TimerCycles(made.Value - now) : -(long)TimerCycles(now - made.Value);
-                        half += offset;
-                    }
-                    sampleTimer.Enabled = false;
-                    sampleTimer.Limit = (ulong)Math.Max(1L, half);
-                    sampleTimer.ResetValue();
-                    sampleTimer.Enabled = true;
+                    StartFrame(pin, made ?? machine.ClockSource.CurrentValue);
                 }
             });
             PublishPending();
+        }
+
+        // A falling edge at `edge` starts a frame; its start bit is checked at
+        // its centre, half a bit from the time of the edge.
+        private void StartFrame(int pin, TimeInterval edge)
+        {
+            receiving = true;
+            receivePin = pin;
+            receiveBit = -1;
+            receiveValue = 0;
+            receiveOnes = 0;
+            receiveErrors = 0;
+            frameSamples.Clear();
+            var half = (long)(activeDivisor / 2);
+            var now = machine.ClockSource.CurrentValue;
+            half += edge > now ? (long)TimerCycles(edge - now) : -(long)TimerCycles(now - edge);
+            sampleTimer.Enabled = false;
+            sampleTimer.Limit = (ulong)Math.Max(1L, half);
+            sampleTimer.ResetValue();
+            sampleTimer.Enabled = true;
+        }
+
+        // A delivery can bring the next frame's start edge while this frame
+        // is still being sampled (a CPU ahead of the clock stamps it ahead),
+        // when it cannot start a frame; the frame's end looks for it.
+        private TimeInterval? FallingEdgeAfter(int pin, TimeInterval time)
+        {
+            if(!receiveEdges.TryGetValue(pin, out var edges)) return null;
+            for(var i = 0; i < edges.Count; i++)
+            {
+                if(edges[i].Item1 > time && !edges[i].Item2) return edges[i].Item1;
+            }
+            return null;
         }
 
         // A delivery can bring an edge after the machine clock has passed it
@@ -624,6 +638,13 @@ namespace Antmicro.Renode.Peripherals.UART
                         awaitingIdle = true;
                     }
                     if(ReceiveEnabled && !Loopback) ReceiveCharacter((byte)receiveValue, receiveErrors);
+                    // A start edge that arrived during this frame starts the next
+                    // (StartFrame sets its own bit count).
+                    if(!awaitingIdle && ReceiveEnabled && !Loopback && FallingEdgeAfter(receivePin, now) is TimeInterval next)
+                    {
+                        StartFrame(receivePin, next);
+                        receiveBit--;
+                    }
                 }
                 if(receiving) receiveBit++;
             }
