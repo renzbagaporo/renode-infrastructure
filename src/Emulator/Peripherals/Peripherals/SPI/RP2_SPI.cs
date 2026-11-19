@@ -102,6 +102,7 @@ namespace Antmicro.Renode.Peripherals.SPI
                     samples.Clear();
                     frames.Clear();
                     notifications.Clear();
+                    targets.Clear();
                     generation++;
                     shifting = false;
                     pulseHalves = 0;
@@ -231,21 +232,18 @@ namespace Antmicro.Renode.Peripherals.SPI
             edgeTimer.ResetValue();
             edgeTimer.Enabled = true;
             lineTime = leadCycles != 0 ? start : null;
-            // A frame target answers the whole frame at its start, with the
-            // word the master then receives; the pins still carry the frame.
-            // In loopback (SSPCR1.LBM) the block receives its own frame and
-            // drives no pins, so no target sees it.
-            var answer = Loopback ? null : FrameTarget?.Invoke(frame.Value, frame.Bits, now + lead);
-            if(answer.HasValue)
-            {
-                frame.Answered = true;
-                frame.Received = (ushort)(answer.Value & FrameMask);
-                frame.Sampled = frame.Bits;
-            }
             SetLine(FssLine, false);
             // With SPH=0 the first bit is valid half a clock before the first edge.
             if(!SecondEdgeSamples) SetLine(DataLine, frame.Bit(0));
             lineTime = null;
+            // A frame target answers the whole frame at its start, with the
+            // word the master then receives; the pins still carry the frame.
+            // It is asked once the select and first bit are published
+            // (PublishPending), so it sees the frame after its select, and
+            // answers before the first sampling edge half a clock later. In
+            // loopback (SSPCR1.LBM) the block receives its own frame and
+            // drives no pins, so no target sees it.
+            if(!Loopback && FrameTarget != null) targets.Enqueue(Tuple.Create(frame, now + lead));
         }
 
         // The time of the CPU making the current access, in a machine holding
@@ -599,15 +597,29 @@ namespace Antmicro.Renode.Peripherals.SPI
                 while(true)
                 {
                     Notification notification;
+                    Tuple<Frame, TimeInterval> target = null;
                     lock(SyncRoot)
                     {
-                        if(notifications.Count == 0)
+                        if(notifications.Count == 0 && targets.Count == 0)
                         {
                             publishing = false;
                             return;
                         }
-                        notification = notifications.Dequeue();
-                        if(notification.Generation != generation) continue;
+                        if(notifications.Count == 0) target = targets.Dequeue();
+                        notification = target == null ? notifications.Dequeue() : default(Notification);
+                        if(target == null && notification.Generation != generation) continue;
+                    }
+                    if(target != null)
+                    {
+                        var answer = FrameTarget?.Invoke(target.Item1.Value, target.Item1.Bits, target.Item2);
+                        if(!answer.HasValue) continue;
+                        lock(SyncRoot)
+                        {
+                            target.Item1.Answered = true;
+                            target.Item1.Received = (ushort)(answer.Value & FrameMask);
+                            target.Item1.Sampled = target.Item1.Bits;
+                        }
+                        continue;
                     }
                     switch(notification.Target)
                     {
@@ -732,6 +744,7 @@ namespace Antmicro.Renode.Peripherals.SPI
         private const int MaximumPins = 48;
         private const int SpiFunction = 1;
         private const int ClockLine = 0;
+        private readonly Queue<Tuple<Frame, TimeInterval>> targets = new Queue<Tuple<Frame, TimeInterval>>();
         private const int DataLine = 1;
         private const int FssLine = 2;
         private const int SignalBase = 3;

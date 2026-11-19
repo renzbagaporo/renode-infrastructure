@@ -3,6 +3,8 @@
 // Full license text is available in 'licenses/MIT.txt'.
 //
 
+using System.Collections.Generic;
+
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Peripherals.GPIOPort;
 using Antmicro.Renode.Peripherals.SPI;
@@ -18,6 +20,8 @@ namespace Antmicro.Renode.PeripheralsTests
         public void SetUp()
         {
             machine = new Machine();
+            txLevel = false;
+            txDriven = false;
             gpio = new RP2_GPIOBank0(machine);
             spi = new RP2_SPI(machine, gpio: gpio, index: 0);
             for(var pin = Rx; pin <= Tx; pin++) gpio.WriteDoubleWord(pin * 8 + 4, 1); // FUNCSEL SPI
@@ -70,6 +74,25 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.AreEqual((uint)received, spi.ReadDoubleWord(0x08));
             gpio.OnGPIO(Select, true);
             Assert.IsFalse(txDriven);
+        }
+
+        [Test]
+        public void ShouldAskItsTargetAfterTheFrameSelectGoesLow()
+        {
+            var order = new List<string>();
+            gpio.DriveChanged += (pin, value, enabled) =>
+            {
+                if(pin == Select && enabled) order.Add(value ? "select high" : "select low");
+            };
+            spi.FrameTarget = (mosi, bits, at) => { order.Add("frame"); return 0x5a; };
+            spi.WriteDoubleWord(0x00, 7); // 8 bits
+            spi.WriteDoubleWord(0x10, 2);
+            spi.WriteDoubleWord(0x04, 2); // SSE, master
+            order.Clear();
+            spi.WriteDoubleWord(0x08, 0xa5);
+            CollectionAssert.AreEqual(new[] { "select low", "frame" }, order);
+            AdvanceMicroseconds(100);
+            Assert.AreEqual(0x5au, spi.ReadDoubleWord(0x08), "the target's answer is received");
         }
 
         [Test]
