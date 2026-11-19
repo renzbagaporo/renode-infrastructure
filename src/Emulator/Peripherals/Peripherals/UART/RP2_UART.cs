@@ -213,6 +213,12 @@ namespace Antmicro.Renode.Peripherals.UART
 
         protected override IClockSource AccessClock => machine.ClockSource;
 
+        // A frame a CPU's write starts begins at the clock's time; published
+        // before the clock moves on, its start bit reaches a receiver on this
+        // chip (a PIO) at that time, not after another core has run the clock
+        // up to the writer's own time.
+        protected override bool PublishUnderAccessClock => true;
+
         protected override void OnBeforeAccess() => SynchronizeTime();
 
         protected override void OnAccessCompleted() => PublishPending();

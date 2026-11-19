@@ -106,6 +106,13 @@ namespace Antmicro.Renode.Peripherals
         // accesses and reset-domain transitions as well as SystemBus accesses.
         protected virtual IClockSource AccessClock => null;
 
+        // Whether an access under AccessClock publishes its queued signal
+        // changes (OnAccessCompleted) before releasing that clock: the clock
+        // cannot then run on, with a receiver clocked by it, between the time
+        // a change is stamped with and its delivery. Publishing still happens
+        // outside the state monitor.
+        protected virtual bool PublishUnderAccessClock => false;
+
         // Clock synchronization may dispatch bus transfers back into this device;
         // perform it before taking the register/reset state monitor.
         protected virtual void OnBeforeAccess()
@@ -163,7 +170,11 @@ namespace Antmicro.Renode.Peripherals
         private uint ReadClockState(IClockSource clock, long offset)
         {
             uint result = 0;
-            clock.ExecuteInLock(() => result = ReadState(offset));
+            clock.ExecuteInLock(() =>
+            {
+                result = ReadState(offset);
+                if(PublishUnderAccessClock) OnAccessCompleted();
+            });
             return result;
         }
 
@@ -177,7 +188,11 @@ namespace Antmicro.Renode.Peripherals
 
         private void WriteClockState(IClockSource clock, long offset, uint value)
         {
-            clock.ExecuteInLock(() => WriteState(offset, value));
+            clock.ExecuteInLock(() =>
+            {
+                WriteState(offset, value);
+                if(PublishUnderAccessClock) OnAccessCompleted();
+            });
         }
 
         private void SetResetState(bool value)
@@ -193,7 +208,11 @@ namespace Antmicro.Renode.Peripherals
 
         private void SetClockResetState(IClockSource clock, bool value)
         {
-            clock.ExecuteInLock(() => SetResetState(value));
+            clock.ExecuteInLock(() =>
+            {
+                SetResetState(value);
+                if(PublishUnderAccessClock) OnAccessCompleted();
+            });
         }
 
         private bool resetHeld;
