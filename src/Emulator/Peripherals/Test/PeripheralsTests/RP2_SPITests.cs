@@ -73,6 +73,20 @@ namespace Antmicro.Renode.PeripheralsTests
         }
 
         [Test]
+        public void ShouldLoopAFrameBackInsideTheBlockWithoutAskingItsTarget()
+        {
+            var asked = 0;
+            spi.FrameTarget = (mosi, bits, at) => { asked++; return 0x00; };
+            spi.WriteDoubleWord(0x00, 7); // 8 bits
+            spi.WriteDoubleWord(0x10, 2);
+            spi.WriteDoubleWord(0x04, 2 | 1); // SSE, LBM
+            spi.WriteDoubleWord(0x08, 0xa5);
+            AdvanceMicroseconds(100);
+            Assert.AreEqual(0, asked, "a loopback frame reaches no target");
+            Assert.AreEqual(0xa5u, spi.ReadDoubleWord(0x08), "the block receives its own frame");
+        }
+
+        [Test]
         public void ShouldExchangeWholeFramesClockedInAsASlave()
         {
             spi.WriteDoubleWord(0x00, 7);

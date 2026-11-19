@@ -233,7 +233,9 @@ namespace Antmicro.Renode.Peripherals.SPI
             lineTime = leadCycles != 0 ? start : null;
             // A frame target answers the whole frame at its start, with the
             // word the master then receives; the pins still carry the frame.
-            var answer = FrameTarget?.Invoke(frame.Value, frame.Bits, now + lead);
+            // In loopback (SSPCR1.LBM) the block receives its own frame and
+            // drives no pins, so no target sees it.
+            var answer = Loopback ? null : FrameTarget?.Invoke(frame.Value, frame.Bits, now + lead);
             if(answer.HasValue)
             {
                 frame.Answered = true;
