@@ -368,7 +368,45 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             }
         }
 
-        protected override void OnAccessCompleted() => PublishPending();
+        // An access from outside the emulation (the monitor, a debugger) that
+        // queued no change of its own publishes nothing. As the publisher it
+        // would deliver the changes the cores keep queueing, and wait for the
+        // clock lock (a PIO receiving an input takes it) that a core running
+        // clock events, PWM edges among them, holds most of the time: a read
+        // of a register would not return.
+        protected override void OnBeforeAccess()
+        {
+            if(RP2CpuTime.TryGetInitiator(machine, out var _)) return;
+            lock(SyncRoot)
+            {
+                externalAccessThread = Environment.CurrentManagedThreadId;
+                externalAccessQueued = false;
+            }
+        }
+
+        protected override void OnAccessCompleted()
+        {
+            if(Volatile.Read(ref externalAccessThread) == Environment.CurrentManagedThreadId)
+            {
+                bool queued;
+                lock(SyncRoot)
+                {
+                    queued = externalAccessQueued;
+                    externalAccessThread = 0;
+                }
+                if(!queued) return;
+            }
+            PublishPending();
+        }
+
+        private void Enqueue(Notification notification)
+        {
+            notifications.Enqueue(notification);
+            if(externalAccessThread == Environment.CurrentManagedThreadId) externalAccessQueued = true;
+        }
+
+        private int externalAccessThread;
+        private bool externalAccessQueued;
 
         public IReadOnlyDictionary<int, IGPIO> Connections { get; }
 
@@ -652,7 +690,7 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             if(sampled[pin] != input)
             {
                 sampled[pin] = input;
-                notifications.Enqueue(new Notification(NotificationKind.Input, ChangeTime(), pin, input));
+                Enqueue(new Notification(NotificationKind.Input, ChangeTime(), pin, input));
             }
             var irqInput = Override(padInput, (control[pin] >> 28) & 3);
             if(irqInput != interruptInput[pin])
@@ -667,17 +705,17 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
             if(wire != wireLevel[pin])
             {
                 wireLevel[pin] = wire;
-                notifications.Enqueue(new Notification(NotificationKind.Wire, ChangeTime(), pin, wire));
+                Enqueue(new Notification(NotificationKind.Wire, ChangeTime(), pin, wire));
             }
             if(driveChanged)
             {
-                notifications.Enqueue(new Notification(NotificationKind.Drive, ChangeTime(), pin, value, enabled));
+                Enqueue(new Notification(NotificationKind.Drive, ChangeTime(), pin, value, enabled));
             }
             var pull = PadPull(pin);
             if(pull != publishedPull[pin])
             {
                 publishedPull[pin] = pull;
-                notifications.Enqueue(new Notification(NotificationKind.Pull, ChangeTime(), pin, pull == true, pull.HasValue));
+                Enqueue(new Notification(NotificationKind.Pull, ChangeTime(), pin, pull == true, pull.HasValue));
             }
         }
 
@@ -736,7 +774,7 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
                 if(state != interruptState[target])
                 {
                     interruptState[target] = state;
-                    notifications.Enqueue(new Notification(NotificationKind.Interrupt, SignalTime.Of(machine), target, state));
+                    Enqueue(new Notification(NotificationKind.Interrupt, SignalTime.Of(machine), target, state));
                 }
             }
         }
