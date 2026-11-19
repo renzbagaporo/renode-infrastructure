@@ -193,16 +193,16 @@ namespace Antmicro.Renode.Peripherals.Timers
             case 0x8:
                 return latchedHighTime;
             case 0xc:
-                var value = CounterValue;
+                var value = ReadCounter();
                 latchedHighTime = (uint)(value >> 32);
                 SkipIfPolling(offset, (uint)value);
                 return (uint)value;
             case 0x20:
                 return armed;
             case 0x24:
-                return (uint)(CounterValue >> 32);
+                return (uint)(ReadCounter() >> 32);
             case 0x28:
-                var low = (uint)CounterValue;
+                var low = (uint)ReadCounter();
                 SkipIfPolling(offset, low);
                 return low;
             case 0x2c:
@@ -367,14 +367,25 @@ namespace Antmicro.Renode.Peripherals.Timers
         // The counter is anchored at a value and a clock-source time, and read
         // from the clock source's current time without a clock entry, as a CPU
         // polling it reads it millions of times each virtual second.
-        private ulong CounterValue
+        private ulong CounterValue => CounterAt(machine.ClockSource.CurrentValue.Ticks);
+
+        // The count a CPU reads: at its own time, which runs ahead of the
+        // clock source within its round. The clock source holds the time
+        // every core has reached, so a core running ahead of the other
+        // (spinning on the counter, or skipping its polls) would read a count
+        // that stands still until the other core caught up, and then jumps.
+        private ulong ReadCounter()
         {
-            get
-            {
-                if(!counterRunning) return counterBase;
-                var elapsed = machine.ClockSource.CurrentValue.Ticks - counterBaseTicks;
-                return counterBase + (ulong)((UInt128)elapsed * counterFrequency / TimeInterval.TicksPerSecond);
-            }
+            var clock = machine.ClockSource.CurrentValue.Ticks;
+            var own = RP2CpuTime.InitiatorTime(machine)?.Ticks ?? clock;
+            return CounterAt(Math.Max(own, clock));
+        }
+
+        private ulong CounterAt(ulong ticks)
+        {
+            if(!counterRunning) return counterBase;
+            var elapsed = ticks > counterBaseTicks ? ticks - counterBaseTicks : 0;
+            return counterBase + (ulong)((UInt128)elapsed * counterFrequency / TimeInterval.TicksPerSecond);
         }
 
         // A CPU spinning on the counter (busy_wait_us) reads it many times per
