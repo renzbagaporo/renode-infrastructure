@@ -100,6 +100,17 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
     // {"t_ns":T,"op":"pull","pin":N,"level":1|0|"none"} puts a pull on a DUT
     // pin's line outside the chip (a board's pull-up resistor): weaker than
     // any drive, stronger than the pad's own pulls; "none" removes it.
+    // {"t_ns":T,"op":"latch_capture","clock":C,"latch":L,"enable":E,"pins":[...]}
+    // arms one look at a latched shift wire (a HUB75 panel's row), decoded
+    // here from the DUT's drive (a released pin reads 0): from the latch's
+    // next fall, each clock rise samples the levels into a word (bit n is
+    // GPIOn for each named pin, the clock's bit set); the latch's next rise
+    // takes one more with the clock's bit cleared; then the time the enable
+    // is low from that latch's fall to the latch's next rise is summed. The
+    // look comes back at that rise as {"op":"latched","clock":C,"samples":
+    // [...],"enabled_ns":N,"t_ns":T} -> {}, with "overflow":true and only the
+    // first 512 samples past those. An arm replaces an unfinished look on
+    // the same clock.
     // {"t_ns":T,"op":"join","pins":[A,B]} wires two DUT pins together, as a
     // jumper, until {"t_ns":T,"op":"unjoin","pins":[A,B]}: the DUT's drive
     // on either becomes the other's input at once ("z" releases it), and two
@@ -173,7 +184,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 gpio.DriveChanged += OnPinSpiDrive;
             }
             // One bridge per connection reports its watched pins.
-            if(gpio != null && connection.ClaimPinReports()) gpio.DriveChanged += OnDriveChanged;
+            if(gpio != null && connection.ClaimPinReports())
+            {
+                reportsPins = true;
+                gpio.DriveChanged += OnDriveChanged;
+            }
             if(tickMicroseconds != 0)
             {
                 tick = new LimitTimer(machine.ClockSource, 1000000, this, "native tick", limit: tickMicroseconds,
@@ -588,11 +603,136 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // bank delivers it.
         private void OnDriveChanged(int pin, bool value, bool enabled)
         {
+            if(pin >= 0 && pin < 64)
+            {
+                if(enabled && value) driveLevels |= 1ul << pin;
+                else driveLevels &= ~(1ul << pin);
+            }
+            if(looks.Count != 0) AdvanceLooks(pin, enabled && value);
             if(!connection.Watched(pin)) return;
             JsonNode level = enabled ? (JsonNode)(value ? 1 : 0) : "z";
             var reply = Request(new JsonObject { ["op"] = "gpio", ["pin"] = pin, ["level"] = level }, SignalTime.Of(machine));
             connection.ChipSelectTarget(pin)?.OnChipSelect(enabled && !value, reply);
         }
+
+        // Latched wire capture -----------------------------------------------
+
+        private void ArmLook(JsonObject action)
+        {
+            var look = new LatchLook
+            {
+                Clock = action["clock"]?.GetValue<int>() ?? -1,
+                Latch = action["latch"]?.GetValue<int>() ?? -1,
+                Enable = action["enable"]?.GetValue<int>() ?? -1,
+            };
+            if(action["pins"] is JsonArray pins)
+            {
+                foreach(var entry in pins)
+                {
+                    var pin = entry.GetValue<int>();
+                    if(pin >= 0 && pin < 64) look.Mask |= 1ul << pin;
+                }
+            }
+            if(look.Clock < 0 || look.Clock >= 64 || look.Latch < 0 || look.Enable < 0) return;
+            looks.RemoveAll(other => other.Clock == look.Clock);
+            looks.Add(look);
+        }
+
+        private void AdvanceLooks(int pin, bool high)
+        {
+            List<LatchLook> done = null;
+            foreach(var look in looks)
+            {
+                if(pin == look.Clock && high && look.Phase == LookPhase.Shifting) Sample(look, true);
+                else if(pin == look.Latch)
+                {
+                    switch(look.Phase)
+                    {
+                    case LookPhase.Armed:
+                        if(!high) look.Phase = LookPhase.Shifting;
+                        break;
+                    case LookPhase.Shifting:
+                        if(high)
+                        {
+                            Sample(look, false);
+                            look.Phase = LookPhase.Latched;
+                        }
+                        break;
+                    case LookPhase.Latched:
+                        if(!high)
+                        {
+                            look.Phase = LookPhase.Lit;
+                            look.LowSince = (driveLevels & (1ul << look.Enable)) == 0 ? SignalNanoseconds() : -1;
+                        }
+                        break;
+                    case LookPhase.Lit:
+                        if(high)
+                        {
+                            EndLow(look);
+                            (done = done ?? new List<LatchLook>()).Add(look);
+                        }
+                        break;
+                    }
+                }
+                else if(pin == look.Enable && look.Phase == LookPhase.Lit)
+                {
+                    if(!high && look.LowSince < 0) look.LowSince = SignalNanoseconds();
+                    else if(high) EndLow(look);
+                }
+            }
+            if(done == null) return;
+            foreach(var look in done)
+            {
+                looks.Remove(look);
+                var samples = new JsonArray();
+                foreach(var word in look.Samples) samples.Add(word);
+                var request = new JsonObject
+                {
+                    ["op"] = "latched", ["clock"] = look.Clock, ["samples"] = samples, ["enabled_ns"] = look.EnabledNanoseconds,
+                };
+                if(look.Overflow) request["overflow"] = true;
+                Request(request, SignalTime.Of(machine));
+            }
+        }
+
+        private void Sample(LatchLook look, bool clock)
+        {
+            if(look.Samples.Count >= MaximumLookSamples)
+            {
+                look.Overflow = true;
+                return;
+            }
+            var word = driveLevels & look.Mask;
+            if(clock) word |= 1ul << look.Clock;
+            else word &= ~(1ul << look.Clock);
+            look.Samples.Add(word);
+        }
+
+        private void EndLow(LatchLook look)
+        {
+            if(look.LowSince < 0) return;
+            look.EnabledNanoseconds += SignalNanoseconds() - look.LowSince;
+            look.LowSince = -1;
+        }
+
+        private long SignalNanoseconds() => (long)SignalTime.Of(machine).TotalNanoseconds;
+
+        private enum LookPhase { Armed, Shifting, Latched, Lit }
+
+        private sealed class LatchLook
+        {
+            public int Clock, Latch, Enable;
+            public ulong Mask;
+            public LookPhase Phase;
+            public readonly List<ulong> Samples = new List<ulong>();
+            public bool Overflow;
+            public long LowSince = -1, EnabledNanoseconds;
+        }
+
+        private const int MaximumLookSamples = 512;
+        private readonly List<LatchLook> looks = new List<LatchLook>();
+        private ulong driveLevels;
+        private bool reportsPins;
 
         private JsonObject Request(JsonObject request, TimeInterval? at = null)
         {
@@ -677,6 +817,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 {
                     foreach(var entry in pins) connection.Watch(entry.GetValue<int>());
                 }
+                return true;
+            }
+            if(op == "latch_capture" && reportsPins)
+            {
+                ArmLook(action);
                 return true;
             }
             if(op == "wake")
