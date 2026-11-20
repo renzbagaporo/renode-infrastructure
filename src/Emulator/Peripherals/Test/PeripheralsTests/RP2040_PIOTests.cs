@@ -203,6 +203,28 @@ namespace Antmicro.Renode.PeripheralsTests
         }
 
         [Test]
+        public void ShouldExecuteTheRewrittenSlotOfAStalledFetchedInstruction()
+        {
+            // Only SMx_INSTR and EXEC'd instructions are latched while they stall;
+            // a stalled fetched one is read from instruction memory every cycle.
+            // pio/hub75 rewrites its data program's `out null, n` while the
+            // machine waits there for autopull.
+            pio.WriteDoubleWord(0xd0, 0xc0000 | (1u << 17)); // autopull at 32, shifting right
+            Load(0x6024, 0x0001); // out x, 4; jmp 1
+            pio.WriteDoubleWord(0, 1);
+            Advance(4);
+            Assert.AreEqual(0u, pio.ReadDoubleWord(0xd4), "The OUT stalls on the empty TX FIFO");
+            Load(0x6028); // out x, 8
+            Assert.AreEqual(0x6028u, pio.ReadDoubleWord(0xd8), "SM0_INSTR shows the rewritten slot");
+            pio.WriteDoubleWord(0x10, 0x12345678);
+            Advance(4);
+            Assert.AreEqual(1u, pio.ReadDoubleWord(0xd4));
+            Force(0, 0xa0c1); // mov isr, x
+            Force(0, 0x8020); // push
+            Assert.AreEqual(0x78u, pio.ReadDoubleWord(0x20), "The machine shifted by the rewritten count");
+        }
+
+        [Test]
         public void ShouldWaitForRealPinAndPreserveDividerPhaseAcrossStall()
         {
             // wait 1 gpio 4; set x, 19; mov isr, x; push; pull block

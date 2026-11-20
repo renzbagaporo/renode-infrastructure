@@ -273,7 +273,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 foreach(var sm in stateMachines)
                 {
                     if(sm.CountLoop && ((address - sm.PC) & 31) < sm.CountLoopSpan) { MaterializeCountLoop(sm); Schedule(sm, advance: false); }
-                    if(sm.JumpLoop && sm.PC == address) { ClearExecution(sm); Schedule(sm); }
+                    // Only SMx_INSTR and EXEC'd instructions are latched while they
+                    // stall: a stalled fetched one is read from this memory every
+                    // cycle, so its next attempt runs the new word.
+                    if(sm.PC == address && (sm.JumpLoop || (sm.Stalled && !sm.Forced && !sm.Injected && sm.Instruction != instructions[address])))
+                    {
+                        ClearExecution(sm);
+                        Schedule(sm);
+                    }
                 }
                 return;
             }
