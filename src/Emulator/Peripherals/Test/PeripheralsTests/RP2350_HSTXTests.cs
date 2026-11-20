@@ -197,6 +197,28 @@ namespace Antmicro.Renode.PeripheralsTests
             Assert.AreEqual(0u, fifo.ReadDoubleWord(0) & (1u << 10), "The DMA never overran the FIFO");
         }
 
+        [Test]
+        public void ShouldChangeDREQUnderTheClockLockAsTheDMATakesIt()
+        {
+            // The DMA takes the clock lock on each DREQ change and the timer
+            // changes DREQ under it; a change from a FIFO write made without
+            // it deadlocked a core writing the FIFO against one running the
+            // timer (hstx/spi_lcd).
+            var dreq = new ClockLockProbe((BaseClockSource)machine.ClockSource);
+            hstx.DREQ.Connect(dreq, 0);
+            Assert.IsTrue(hstx.DREQ.IsSet, "An empty FIFO requests data");
+            dreq.Changes.Clear(); // the level Connect passed on
+            hstx.WriteDoubleWord(0x00, 0x10050600); // configured, not enabled
+            for(uint i = 0; i < 8; i++) fifo.WriteDoubleWord(4, i); // full: the request falls
+            hstx.WriteDoubleWord(0x00, 0x10050601); // enabled: the first pop raises it
+            Advance(15);
+            fifo.WriteDoubleWord(4, 8); // full again
+            Advance(50); // the timer raises it at the next pop
+            Assert.AreEqual(new[] { false, true, false, true }, dreq.Changes.Select(change => change.Value).ToArray());
+            Assert.AreEqual(new[] { true, true, true, true }, dreq.Changes.Select(change => change.UnderClockLock).ToArray(),
+                "Every DREQ change came under the clock lock");
+        }
+
         // The word shifted out LSB first on BIT0, two bits a cycle.
         private static uint Word(byte[] halves) => Lane(halves, 0, 32);
 
@@ -240,6 +262,25 @@ namespace Antmicro.Renode.PeripheralsTests
             public void OnGPIO(int number, bool value) => State = value;
             public void Reset() => State = false;
             public bool State { get; private set; }
+        }
+
+        // Records each change and whether its thread held the clock lock.
+        private sealed class ClockLockProbe : IGPIOReceiver
+        {
+            public ClockLockProbe(BaseClockSource clock)
+            {
+                this.clock = clock;
+            }
+
+            public void OnGPIO(int number, bool value) => Changes.Add((value, clock.HeldByCurrentThread));
+
+            public void Reset()
+            {
+            }
+
+            public List<(bool Value, bool UnderClockLock)> Changes { get; } = new List<(bool, bool)>();
+
+            private readonly BaseClockSource clock;
         }
     }
 }

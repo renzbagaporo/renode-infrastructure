@@ -468,12 +468,23 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private void QueueRequest() => requestPending = !ResetHeld && fifo.Count < FifoDepth;
 
+        // DREQ is set under the clock lock, outside the model's lock, as the
+        // timer sets it: the DMA takes the clock lock on every DREQ change, so
+        // a bus access setting it without that lock would wait for the clock
+        // while holding the line, and a timer setting it under the clock
+        // would wait for the line.
         private void PublishPending()
         {
-            var level = requestPending;
-            if(level == publishedRequest) return;
-            publishedRequest = level;
-            DREQ.Set(level);
+            machine.ClockSource.ExecuteInLock(() =>
+            {
+                bool level;
+                lock(SyncRoot)
+                {
+                    if(requestPending == publishedRequest) return;
+                    level = publishedRequest = requestPending;
+                }
+                DREQ.Set(level);
+            });
         }
 
         private bool Enabled => (csr & 1) != 0;
