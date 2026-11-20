@@ -279,14 +279,28 @@ namespace Antmicro.Renode.Peripherals.MemoryControllers
             streamRequest = streamFifo.Count != 0;
         }
 
-        // Outside the state monitor: a DMA channel answers synchronously.
+        // Outside the state monitor, as a DMA channel answers synchronously,
+        // and under the clock lock, which the DMA takes on each change: a bus
+        // access changing it without that lock would hold the line while it
+        // waited for the clock, against a DMA transfer under the clock
+        // popping the FIFO. An access that changes nothing takes no clock lock.
         private void PublishStreamRequest()
         {
-            bool level;
-            lock(SyncRoot) level = streamRequest;
-            if(level == publishedStreamRequest) return;
-            publishedStreamRequest = level;
-            StreamDMA.Set(level);
+            lock(SyncRoot)
+            {
+                if(streamRequest == publishedStreamRequest) return;
+            }
+            machine.ClockSource.ExecuteInLock(() =>
+            {
+                bool level;
+                lock(SyncRoot)
+                {
+                    level = streamRequest;
+                    if(level == publishedStreamRequest) return;
+                    publishedStreamRequest = level;
+                }
+                StreamDMA.Set(level);
+            });
         }
 
         private uint streamAddress;

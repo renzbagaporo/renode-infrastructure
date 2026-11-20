@@ -487,14 +487,22 @@ namespace Antmicro.Renode.Peripherals.Timers
                 IRQ.Set(state0 != 0);
                 IRQ1.Set(state1 != 0);
             }
-            for(var i = 0; i < wraps.Length; i++)
+            // Under the clock lock, as a slice's timer pulses them: the DMA
+            // takes it on each pulse, so a bus access pulsing without it would
+            // hold the line while it waited for the clock, against a timer
+            // holding the clock while it waited for the line.
+            if(Array.TrueForAll(wraps, count => count == 0)) return;
+            machine.ClockSource.ExecuteInLock(() =>
             {
-                for(var pulse = 0; pulse < wraps[i]; pulse++)
+                for(var i = 0; i < wraps.Length; i++)
                 {
-                    Connections[i].Set(true);
-                    Connections[i].Set(false);
+                    for(var pulse = 0; pulse < wraps[i]; pulse++)
+                    {
+                        Connections[i].Set(true);
+                        Connections[i].Set(false);
+                    }
                 }
-            }
+            });
         }
 
         private int SliceOfPin(int pin) => pin < 32 ? (pin >> 1) & 7 : 8 + (((pin - 32) >> 1) & 3);
