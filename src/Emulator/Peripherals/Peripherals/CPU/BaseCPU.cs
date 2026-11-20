@@ -552,7 +552,21 @@ namespace Antmicro.Renode.Peripherals.CPU
                 {
                     singleStepSynchronizer.Enabled = false;
                     this.NoisyLog("Waiting for thread to pause.");
-                    cpuThreadCopy?.Join();
+                    const int startPauseDeadlockResolveTimeoutMs = 100;
+                    while(cpuThreadCopy != null && !cpuThreadCopy.Join(startPauseDeadlockResolveTimeoutMs))
+                    {
+                        if(pauseLockTimeHandleMarker)
+                        {
+                            /// The time source got the handle's lock after <see cref="InnerPause"/> interrupted it and
+                            /// waits for <see cref="pauseLock"/> in <see cref="StartCPUThreadTimeHandle"/>, while the
+                            /// interrupted cpu thread needs that handle's lock to return and end. Let it take the
+                            /// short path there, as <see cref="InnerPause"/> does, and wait for the thread again.
+                            pauseLockTimeHandleMarker = false;
+                            Monitor.Wait(pauseLock);
+                            DebugHelper.Assert(pauseLockTimeHandleMarker);
+                            pauseLockTimeHandleMarker = false;
+                        }
+                    }
                     this.NoisyLog("Paused.");
                 }
 
