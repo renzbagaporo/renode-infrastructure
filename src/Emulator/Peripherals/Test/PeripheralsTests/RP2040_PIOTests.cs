@@ -822,6 +822,19 @@ namespace Antmicro.Renode.PeripheralsTests
         }
 
         [Test]
+        public void ShouldParkTheSubstepEncoderIdleLoopAndKeepItsCycleCount()
+        {
+            // pico-examples quadrature_encoder_substep.pio: its idle pass
+            // counts cycles in X with `jmp x--` to the next step, polls
+            // `mov pc, ~status` (RX level < 2) and samples the pins.
+            var parked = RunSteadyLoopScenario(true, ConfigureSubstepEncoder, SubstepEncoderStimulus, out var parkedWhileIdle);
+            var running = RunSteadyLoopScenario(false, ConfigureSubstepEncoder, SubstepEncoderStimulus, out _);
+            Assert.Greater(parked.Count(e => e.StartsWith("word ")), 20, "The CPU did not read any counts");
+            CollectionAssert.AreEqual(running, parked);
+            Assert.IsTrue(parkedWhileIdle, "The encoder's idle loop was not parked while its pins held");
+        }
+
+        [Test]
         public void ShouldCarryAPA102WordsFromTheExampleToTheMetalclawClockedCapture([Values(false, true)] bool rp2350)
         {
             // SM0: pico-examples apa102_mini (CLK side-set GPIO2, DIN OUT GPIO3,
@@ -1069,6 +1082,60 @@ namespace Antmicro.Renode.PeripheralsTests
             benchPio.WriteDoubleWord(0xcc, (1u << 29) | ((uint)a << 24) | (9u << 12)); // side pindir, JMP_PIN A, wrap 0 to 9
             benchPio.WriteDoubleWord(0xdc, (1u << 29) | (1u << 26) | ((uint)b << 15) | ((uint)a << 10) | ((uint)b << 5));
             benchPio.WriteDoubleWord(0, 1);
+        }
+
+        private static void ConfigureSubstepEncoder(RP2_GPIOBank0 benchGpio, RP2040_PIO benchPio)
+        {
+            const int a = 2;
+            benchGpio.OnGPIO(a, true);
+            benchGpio.OnGPIO(a + 1, true);
+            Load(benchPio, 0x4020, 0x4040, 0x60c2, 0x4002, 0xa0ee, 0xa0a7, 0x0087, 0xe021,
+                0xa031, 0x004a, 0xa0ad, 0xa04a, 0x008d, 0xa04a, 0xe020, 0x0002,
+                0x000f, 0x000b, 0x0106, 0x0409, 0x0106, 0x000f, 0x0409, 0x000b,
+                0x000b, 0x0409, 0x000f, 0x0106, 0x0409, 0x0106, 0x000b, 0x0102);
+            benchPio.WriteDoubleWord(0xcc, (14u << 12) | (9u << 7) | 0x12); // wrap 9 to 14, STATUS = RX level < 2
+            benchPio.WriteDoubleWord(0xd0, (1u << 19) | (1u << 16)); // OUT right, IN left with autopush 32
+            benchPio.WriteDoubleWord(0xdc, (uint)a << 15); // IN_BASE A
+            // As quadrature_encoder_substep_program_init with both pins high.
+            benchPio.WriteDoubleWord(0xd8, 0xe05c); // set y, ~3
+            benchPio.WriteDoubleWord(0xd8, 0xa0e2); // mov osr, y
+            benchPio.WriteDoubleWord(0xd8, 0xe042); // set y, 2
+            benchPio.WriteDoubleWord(0, 1);
+        }
+
+        // Quadrature steps either way and long holds, with the CPU taking
+        // counts as quadrature_encoder_substep_get_counts does.
+        private static void SubstepEncoderStimulus(RP2_GPIOBank0 benchGpio, RP2040_PIO benchPio, Action<ulong> run, List<string> log)
+        {
+            var random = new Random(23);
+            var gray = new[] { 0, 1, 3, 2 };
+            var phase = 2; // both pins high
+            for(var i = 0; i < 80; i++)
+            {
+                run((ulong)random.Next(1, 200));
+                switch(random.Next(5))
+                {
+                case 0:
+                case 1:
+                    phase = (phase + (random.Next(2) == 0 ? 1 : 3)) & 3;
+                    benchGpio.OnGPIO(2, (gray[phase] & 1) != 0);
+                    benchGpio.OnGPIO(3, (gray[phase] & 2) != 0);
+                    break;
+                case 2:
+                case 3:
+                    var pairs = ((benchPio.ReadDoubleWord(0x0c) >> 4) & 0xf) >> 1;
+                    for(var pair = 0; pair < pairs + 1; pair++)
+                    {
+                        for(var word = 0; word < 2; word++)
+                        {
+                            for(var wait = 0; wait < 100 && (benchPio.ReadDoubleWord(0x04) & (1u << 8)) != 0; wait++) run(1);
+                            log.Add($"word {i} {benchPio.ReadDoubleWord(0x20)}");
+                        }
+                    }
+                    break;
+                default: run((ulong)random.Next(500, 3000)); break;
+                }
+            }
         }
 
         private static void JoinStimulus(RP2_GPIOBank0 benchGpio, RP2040_PIO benchPio, Action<ulong> run, List<string> log)

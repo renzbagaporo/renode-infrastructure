@@ -1496,7 +1496,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         }
 
         // A pass of a loop is traced from the step a jump back or a wrap
-        // reaches. If it returns there with the machine's state unchanged, with
+        // reaches. If it returns there with the machine's state unchanged (or
+        // X or Y only counted down by JMPs whose outcome is irrelevant), with
         // no FIFO, IRQ or STATUS access, with the pins it read unchanged and its
         // pin writes leaving the latch as it was, every later pass repeats it
         // until one of those inputs changes. The machine is then parked:
@@ -1528,10 +1529,63 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             sm.TraceWriteMask |= sm.WriteMask | sm.DirectionMask;
             if(sm.PC == sm.LoopHead)
             {
-                if(!sm.RecordingBroken && SameState(sm, sm.Trace[0])) sm.SteadyCandidate = true;
+                if(!sm.RecordingBroken && (SameState(sm, sm.Trace[0]) || OnlyCountersDrift(sm))) sm.SteadyCandidate = true;
                 else StartRecording(sm);
             }
             else if(sm.Trace.Count >= MaxLoopSteps) sm.Recording = false;
+        }
+
+        // The pass returned to its head with only X and/or Y changed, and its
+        // only references to them are JMP X--/Y-- whose target is the step that
+        // follows anyway: every later pass runs the same steps, and the counters
+        // drift by the same amount each time (as quadrature_encoder_substep.pio
+        // counts its idle cycles in X).
+        private bool OnlyCountersDrift(StateMachine sm)
+        {
+            var head = sm.Trace[0];
+            if(sm.PC != head.PC || sm.OSR != head.OSR || sm.ISR != head.ISR
+                || sm.InputCount != head.InputCount || sm.OutputCount != head.OutputCount
+                || sm.StickyMask != head.StickyMask || sm.StickyValue != head.StickyValue)
+            {
+                return false;
+            }
+            uint xCount = 0, yCount = 0;
+            foreach(var step in sm.Trace)
+            {
+                var instruction = instructions[step.PC];
+                var opcode = instruction >> 13;
+                var field = (instruction >> 5) & 7;
+                var source = instruction & 7;
+                bool readsX, readsY;
+                switch(opcode)
+                {
+                case 0:
+                    var wrapTop = (int)((sm.ExecControl >> 12) & 31);
+                    var next = step.PC == wrapTop ? (int)((sm.ExecControl >> 7) & 31) : (step.PC + 1) & 31;
+                    if((field == 2 || field == 4) && (instruction & 31) == next)
+                    {
+                        if(field == 2) xCount++; else yCount++;
+                        continue;
+                    }
+                    readsX = field == 1 || field == 2 || field == 5;
+                    readsY = field == 3 || field == 4 || field == 5;
+                    break;
+                case 1:
+                case 6:
+                    continue;
+                case 2: readsX = source == 1; readsY = source == 2; break;
+                // PULL noblock copies X; RP2350's RX FIFO MOVs index by Y.
+                case 4: readsX = readsY = true; break;
+                case 5: readsX = source == 1 || field == 1; readsY = source == 2 || field == 2; break;
+                default: readsX = field == 1; readsY = field == 2; break;
+                }
+                if(readsX && sm.X != head.X) return false;
+                if(readsY && sm.Y != head.Y) return false;
+                if(readsX) xCount = uint.MaxValue;
+                if(readsY) yCount = uint.MaxValue;
+            }
+            return (sm.X == head.X || (xCount != uint.MaxValue && sm.X == head.X - xCount))
+                && (sm.Y == head.Y || (yCount != uint.MaxValue && sm.Y == head.Y - yCount));
         }
 
         private static void StartRecording(StateMachine sm)
@@ -1583,6 +1637,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             sm.SteadyPeriod = period;
             sm.SteadyReadMask = sm.TraceReadMask;
             sm.SteadyWriteMask = sm.TraceWriteMask;
+            sm.SteadyXDrift = sm.X - sm.Trace[0].X;
+            sm.SteadyYDrift = sm.Y - sm.Trace[0].Y;
             sm.Steady = true;
             sm.Timer.Enabled = false;
             sm.Scheduled = false;
@@ -1605,8 +1661,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             var step = sm.SteadySteps[index];
             ClearExecution(sm);
             sm.PC = step.PC;
-            sm.X = step.X;
-            sm.Y = step.Y;
+            var wrapped = (uint)(passes & uint.MaxValue);
+            sm.X = step.X + wrapped * sm.SteadyXDrift;
+            sm.Y = step.Y + wrapped * sm.SteadyYDrift;
             sm.OSR = step.OSR;
             sm.ISR = step.ISR;
             sm.InputCount = step.InputCount;
@@ -1739,6 +1796,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             // Steps with Edge256 relative to SteadyBase, the head of the parked pass.
             public LoopStep[] SteadySteps;
             public BigInteger SteadyBase, SteadyPeriod;
+            // How much X and Y change over each parked pass.
+            public uint SteadyXDrift, SteadyYDrift;
         }
 
         // The machine state before a step of a traced loop, and its clock edge.
