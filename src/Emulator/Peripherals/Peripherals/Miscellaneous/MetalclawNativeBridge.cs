@@ -68,6 +68,16 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
     // the pads' pull-ups, sends the same i2c requests as on a bus, and drives
     // SDA low through GPIO for an ACK and for the 0 bits it sends; it never
     // stretches SCL, since each answer comes before the DUT's clock moves.
+    // Given pinSck, pinMosi, pinMiso and pinCs, the bridge is a mode 0 SPI
+    // target on those DUT pins, for a bus a program clocks itself (a PIO SPI
+    // master), named in the hello like an SPI master's bus. While the chip
+    // select is low and SCK is driven by SIO or a PIO, it samples MOSI on
+    // each SCK rise and sends each eighth bit's byte as an spi request with
+    // "bits":8. A frame's MISO goes out while its MOSI comes in, so the reply
+    // to the chip select's fall and each spi reply carry "miso_next", the
+    // next frame's MISO; the bridge drives its first bit then and the next
+    // on each SCK fall, and releases MISO to the line's pull when a reply has
+    // none or the chip select rises. A partial frame at that rise is dropped.
     // Watched pins (an SPI bridge's CS, and any a {"op":"watch","pin":N} or
     // {"op":"watch","pins":[...]} action adds) report every change of the
     // DUT's own drive on them, never the level the peer's actions put on the
@@ -103,7 +113,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public MetalclawNativeBridge(IMachine machine, string socketPath = "", int bus = 0, ulong tickMicroseconds = 0,
             RP2_GPIOBank0 gpio = null, UART.IUART uart = null, int uartTx = -1, int uartRx = -1,
             SPI.RP2_SPI spi = null, int spiSck = -1, int spiMosi = -1, int spiMiso = -1, int spiCs = -1,
-            int pinSda = -1, int pinScl = -1, int replyTimeoutMilliseconds = 60000)
+            int pinSda = -1, int pinScl = -1, int pinSck = -1, int pinMosi = -1, int pinMiso = -1, int pinCs = -1,
+            int replyTimeoutMilliseconds = 60000)
         {
             this.machine = machine;
             this.busIndex = bus;
@@ -146,6 +157,20 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 this.pinScl = pinScl;
                 connection.Register("i2c", new JsonObject { ["bus"] = bus, ["sda"] = pinSda, ["scl"] = pinScl });
                 gpio.DriveChanged += OnPinI2CDrive;
+            }
+            if(pinSck >= 0 && pinMosi >= 0 && pinMiso >= 0 && pinCs >= 0)
+            {
+                if(gpio == null) throw new Exceptions.ConstructionException("A pin-level SPI target needs the DUT's gpio");
+                spiPinSck = pinSck;
+                spiPinMosi = pinMosi;
+                spiPinMiso = pinMiso;
+                spiPinCs = pinCs;
+                connection.Register("spi", new JsonObject { ["bus"] = bus, ["sck"] = pinSck, ["mosi"] = pinMosi, ["miso"] = pinMiso, ["cs"] = pinCs });
+                // The chip select's gpio report, from whichever bridge reports
+                // pins, hands its reply here.
+                connection.Watch(pinCs);
+                connection.SetChipSelectTarget(pinCs, this);
+                gpio.DriveChanged += OnPinSpiDrive;
             }
             // One bridge per connection reports its watched pins.
             if(gpio != null && connection.ClaimPinReports()) gpio.DriveChanged += OnDriveChanged;
@@ -418,6 +443,93 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private enum PinState { Idle, Address, Write, Read, Ignore }
 
+        // Pin-level SPI target ----------------------------------------------
+
+        // A hardware block on the same pins (SPI with its own frames, HSTX
+        // clocking an LCD) is not this target's to decode.
+        private bool PinSpiActive
+        {
+            get
+            {
+                if(!pinSpiSelected) return false;
+                var function = gpio.GetFunction(spiPinSck);
+                return function == SIOFunction || (function >= FirstPIOFunction && function <= LastPIOFunction);
+            }
+        }
+
+        private void OnPinSpiDrive(int pin, bool value, bool enabled)
+        {
+            if(pin == spiPinMosi)
+            {
+                pinSpiMosi = !enabled || value;
+                return;
+            }
+            if(pin != spiPinSck) return;
+            var sck = enabled && value;
+            if(sck == pinSpiSck) return;
+            pinSpiSck = sck;
+            if(!PinSpiActive) return;
+            if(!sck)
+            {
+                DriveMisoBit(7 - pinSpiBits);
+                return;
+            }
+            pinSpiShift = (pinSpiShift << 1) | (pinSpiMosi ? 1 : 0);
+            if(++pinSpiBits < 8) return;
+            var request = new JsonObject
+            {
+                ["op"] = "spi", ["bus"] = busIndex, ["mosi"] = pinSpiShift & 0xff, ["bits"] = 8,
+                ["pins"] = new JsonObject { ["sck"] = spiPinSck, ["mosi"] = spiPinMosi, ["miso"] = spiPinMiso },
+            };
+            pinSpiBits = 0;
+            pinSpiShift = 0;
+            pinSpiOut = MisoNext(Request(request, SignalTime.Of(machine)));
+        }
+
+        // The reply to a change of the chip select's drive, at that change.
+        private void OnChipSelect(bool low, JsonObject reply)
+        {
+            if(low == pinSpiSelected) return;
+            pinSpiSelected = low;
+            pinSpiBits = 0;
+            pinSpiShift = 0;
+            if(low && PinSpiActive)
+            {
+                pinSpiOut = MisoNext(reply);
+                DriveMisoBit(7);
+            }
+            else ReleaseMiso();
+        }
+
+        private static int? MisoNext(JsonObject reply)
+        {
+            return reply?["miso_next"] is JsonValue value && value.TryGetValue<int>(out var word) ? word : (int?)null;
+        }
+
+        private void DriveMisoBit(int bit)
+        {
+            if(pinSpiOut is int word)
+            {
+                var level = ((word >> bit) & 1) != 0;
+                if(pinSpiMisoDriven && pinSpiMisoLevel == level) return;
+                pinSpiMisoDriven = true;
+                pinSpiMisoLevel = level;
+                gpio.OnGPIO(spiPinMiso, level);
+            }
+            else ReleaseMiso();
+        }
+
+        private void ReleaseMiso()
+        {
+            if(!pinSpiMisoDriven) return;
+            pinSpiMisoDriven = false;
+            gpio.ReleaseInput(spiPinMiso);
+        }
+
+        private int spiPinSck = -1, spiPinMosi = -1, spiPinMiso = -1, spiPinCs = -1, pinSpiBits, pinSpiShift;
+        private int? pinSpiOut;
+        private bool pinSpiSelected, pinSpiSck, pinSpiMosi = true, pinSpiMisoDriven, pinSpiMisoLevel;
+
         private PinState pinState;
         private int pinSda = -1, pinScl = -1, pinBits;
         private byte pinShift, pinOut;
@@ -478,7 +590,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         {
             if(!connection.Watched(pin)) return;
             JsonNode level = enabled ? (JsonNode)(value ? 1 : 0) : "z";
-            Request(new JsonObject { ["op"] = "gpio", ["pin"] = pin, ["level"] = level }, SignalTime.Of(machine));
+            var reply = Request(new JsonObject { ["op"] = "gpio", ["pin"] = pin, ["level"] = level }, SignalTime.Of(machine));
+            connection.ChipSelectTarget(pin)?.OnChipSelect(enabled && !value, reply);
         }
 
         private JsonObject Request(JsonObject request, TimeInterval? at = null)
@@ -614,6 +727,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         }
 
         private const int SPIFunction = 1;
+        private const int SIOFunction = 5;
+        // PIO0, PIO1 and, on the RP2350, PIO2.
+        private const int FirstPIOFunction = 6;
+        private const int LastPIOFunction = 8;
         // UART's own function (2) puts TX on pin % 4 == 0 and RX on 1; the
         // RP2350's UART auxiliary function (11) puts them on 2 and 3, the
         // pins where function 2 has CTS and RTS.
@@ -739,6 +856,17 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 lock(watchedPins) return watchedPins.Contains(pin);
             }
 
+            // The pin-level SPI target a chip select pin's reports belong to.
+            public void SetChipSelectTarget(int pin, MetalclawNativeBridge target)
+            {
+                lock(watchedPins) chipSelectTargets[pin] = target;
+            }
+
+            public MetalclawNativeBridge ChipSelectTarget(int pin)
+            {
+                lock(watchedPins) return chipSelectTargets.TryGetValue(pin, out var target) ? target : null;
+            }
+
             public bool ClaimPinReports()
             {
                 lock(watchedPins)
@@ -856,6 +984,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             private readonly int timeoutMilliseconds;
             private readonly object sync = new object();
             private readonly HashSet<int> watchedPins = new HashSet<int>();
+            private readonly Dictionary<int, MetalclawNativeBridge> chipSelectTargets = new Dictionary<int, MetalclawNativeBridge>();
             private string lastRouting;
             private readonly List<MetalclawNativeBridge> members = new List<MetalclawNativeBridge>();
             private readonly HashSet<Tuple<int, int>> joins = new HashSet<Tuple<int, int>>();
