@@ -162,6 +162,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     debug |= 1u << (8 + sm.Index);
                     return sm.LastRx;
                 }
+                // A parked loop may read this FIFO's level or drop pushes into
+                // it: bring it to the current cycle before the level changes.
+                ResumeSteadyLoop(sm);
                 sm.LastRx = sm.Rx.Dequeue();
                 Wake(sm);
                 UpdateSignals();
@@ -228,8 +231,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         protected override void WriteRegister(long offset, uint value, AtomicOperation operation)
         {
-            // A steady loop has no FIFO effects, so only TXF writes leave it be.
-            // Anything else may change what it executes, so resume and retrace.
+            // A steady loop has no FIFO effects, so only TXF writes leave the
+            // other machines' loops be (the written machine's own loop resumes
+            // below, as its FIFO level changes). Anything else may change what
+            // they execute, so resume and retrace.
             if(offset < 0x10 || offset >= 0x20)
             {
                 ResumeSteadyLoops();
@@ -253,6 +258,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             if(offset >= 0x10 && offset < 0x20)
             {
                 var sm = stateMachines[(offset - 0x10) / 4];
+                ResumeSteadyLoop(sm);
                 if(sm.Tx.Count >= TxCapacity(sm)) debug |= 1u << (16 + sm.Index);
                 else sm.Tx.Enqueue(ApplyOperation(0, value, operation));
                 Wake(sm);
@@ -358,7 +364,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 break;
             case 8:
                 debug &= ~value;
-                foreach(var sm in stateMachines) if(sm.Stalled) Reschedule(sm);
+                // A parked loop's dropped pushes set RXSTALL again once it runs.
+                foreach(var sm in stateMachines)
+                {
+                    if(sm.Steady) ResumeSteadyLoop(sm);
+                    else if(sm.Stalled) Reschedule(sm);
+                }
                 break;
             case 0x30: irqFlags &= ~(value & 0xff); WakeAll(); break;
             case 0x34: irqFlags |= value & 0xff; WakeAll(); break;
@@ -817,7 +828,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             case 2: return sm.Y;
             case 3: return 0;
             case 5:
-                stepEffect = true;
+                // A FIFO level changes only by this machine's own pushes and
+                // pulls or a FIFO access, which resumes a parked loop; an IRQ
+                // flag (RP2350's STATUS_SEL 2) changes without that.
+                if(rp2350 && ((sm.ExecControl >> 5) & 3) == 2) stepEffect = true;
                 if(rp2350)
                 {
                     // EXECCTRL.STATUS_SEL (6:5): TX level, RX level or IRQ flag STATUS_N (4:0).
@@ -836,13 +850,21 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private bool Push(StateMachine sm, bool block)
         {
-            stepEffect = true;
             if(sm.Rx.Count >= RxCapacity(sm))
             {
+                // A non-blocking push into a full FIFO whose RXSTALL is already
+                // set changes nothing outside the machine, so a loop of such
+                // pushes (quadrature_encoder.pio's, once the CPU stops reading)
+                // can still be parked; a CPU or DMA read wakes it.
+                if(block || (debug & (1u << sm.Index)) == 0) stepEffect = true;
                 debug |= 1u << sm.Index;
                 if(block) return false;
             }
-            else sm.Rx.Enqueue(sm.ISR);
+            else
+            {
+                stepEffect = true;
+                sm.Rx.Enqueue(sm.ISR);
+            }
             sm.ISR = 0;
             sm.InputCount = 0;
             return true;
